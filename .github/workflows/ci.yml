@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Deno (same series as the runtime-kit pin of the hosts)
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.8.1
+      - name: Format
+        run: deno fmt --check
+      - name: Lint
+        run: deno lint
+      - name: Type check (vendored dependencies only)
+        run: deno task check
+      - name: Tests (classifier, redaction, framing, tickets, network rendering, hostile SSH device, RouterOS API mock)
+        run: deno task test
+      - name: Syntax check
+        run: bash -n scripts/*.sh scripts/lib/*.sh
+      - name: ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -x scripts/*.sh scripts/lib/*.sh
+      - name: Secret guard (no committed key material, vendored packages included)
+        run: |
+          ! grep -RInE '^\s*-----BEGIN [A-Z ]*PRIVATE KEY-----\s*$' . --exclude-dir=.git
+
+  security:
+    # Shared pinned scanners (mnscloud-runtime-kit): Gitleaks, Trivy and Opengrep (new findings
+    # of a pull request fail; main only reports).
+    uses: manaoscloud/mnscloud-runtime-kit/.github/workflows/security-scan.yml@main
+    with:
+      opengrep_rules: 'typescript javascript bash'
+      opengrep_exclude: 'tests node_modules'

@@ -1,0 +1,199 @@
+{
+  "dialect": "routeros",
+  "description": "MikroTik RouterOS 6/7 CLI. Commands are classified with the current menu path (navigation such as `/ip firewall filter` changes the context of relative commands).",
+  "syntax": "routeros",
+  "clearKeys": [
+    "\u0003"
+  ],
+  "untrackable": [
+    "?"
+  ],
+  "cancelLine": "\u0003",
+  "macros": {
+    "W": "(?:add|set|remove|enable|disable|move|unset|edit|reset|reset-counters|reset-counters-all|comment|clear|flush|release|renew|make-static|cancel|import|run|upgrade|install|uninstall|downgrade|apply-changes|sign|start|stop|save|load)"
+  },
+  "rules": [
+    {
+      "id": "ros-show-sensitive",
+      "class": "secret_read",
+      "pattern": "(?:^| )show-sensitive(?: |$)",
+      "hint": "Export without show-sensitive; secrets are never shown in the console."
+    },
+    {
+      "id": "ros-ssh-private-key",
+      "class": "secret_read",
+      "pattern": "^/user ssh-keys private\\b",
+      "hint": "Private keys are never shown in the console."
+    },
+    {
+      "id": "ros-file-contents",
+      "class": "secret_read",
+      "pattern": "^/file (?:get|print)\\b.*\\bcontents?\\b",
+      "hint": "File contents can hold exported secrets; download the file through the device page instead."
+    },
+    {
+      "id": "ros-secret-lists-safe",
+      "class": "read",
+      "pattern": "^/(?:ppp secret|interface wireless security-profiles|interface wifi security|ip ipsec (?:peer|identity)|radius|snmp community|ip hotspot user|user-manager user) print\\b(?=.*\\bproplist=)(?!.*proplist=\\S*(?:password|secret|key|passphrase))"
+    },
+    {
+      "id": "ros-secret-lists",
+      "class": "secret_read",
+      "pattern": "^/(?:ppp secret|interface wireless security-profiles|interface wifi security|ip ipsec (?:peer|identity)|radius|snmp community|ip hotspot user|user-manager user) (?:print|export|get)\\b",
+      "hint": "Use print proplist=<fields> without password, secret or key fields."
+    },
+    {
+      "id": "ros-reset-configuration",
+      "class": "destructive",
+      "pattern": "^/system reset-configuration\\b"
+    },
+    {
+      "id": "ros-shutdown",
+      "class": "destructive",
+      "pattern": "^/system shutdown\\b"
+    },
+    {
+      "id": "ros-file-remove",
+      "class": "destructive",
+      "pattern": "^/file remove\\b"
+    },
+    {
+      "id": "ros-disk-format",
+      "class": "destructive",
+      "pattern": "^/disk (?:format|format-drive|wipe)\\b"
+    },
+    {
+      "id": "ros-package-uninstall",
+      "class": "destructive",
+      "pattern": "^/system package uninstall\\b"
+    },
+    {
+      "id": "ros-remove-all",
+      "class": "destructive",
+      "pattern": " remove \\[ *find *\\]$"
+    },
+    {
+      "id": "ros-fetch",
+      "class": "pivot",
+      "pattern": "^/tool fetch\\b"
+    },
+    {
+      "id": "ros-outbound-sessions",
+      "class": "pivot",
+      "pattern": "^/(?:system (?:ssh|ssh-exec|telnet)|tool (?:mac-telnet|e-mail send|sms send|bandwidth-test|traffic-generator|romon))\\b"
+    },
+    {
+      "id": "ros-script-exec",
+      "class": "write_risky",
+      "pattern": "^(?::execute|:parse|/system script run|/import)\\b"
+    },
+    {
+      "id": "ros-block",
+      "class": "write_risky",
+      "pattern": "[{}]"
+    },
+    {
+      "id": "ros-firewall-write",
+      "class": "write_risky",
+      "pattern": "^/(?:ip|ipv6) firewall(?: [a-z0-9-]+)* {W}\\b"
+    },
+    {
+      "id": "ros-default-route",
+      "class": "write_risky",
+      "pattern": "^/(?:ip|ipv6) route\\b.*\\b(?:dst-address=(?:0\\.0\\.0\\.0/0|::/0))"
+    },
+    {
+      "id": "ros-route-remove",
+      "class": "write_risky",
+      "pattern": "^/(?:ip|ipv6) route (?:remove|disable|unset)\\b"
+    },
+    {
+      "id": "ros-management-write",
+      "class": "write_risky",
+      "pattern": "^/(?:ip service|ip ssh|user|user group|user aaa|routing|certificate|radius|snmp|ip cloud|ip socks|ip proxy|ip smb|ip upnp|tool mac-server|ip neighbor discovery-settings|system scheduler|system script|system logging action|interface bridge|interface vlan|ppp|ip address|ip dhcp-client|ipv6 address|ip ipsec|interface wireguard|interface eoip|interface gre|interface l2tp-client|interface sstp-client|interface ovpn-client|interface pptp-client)(?: [a-z0-9-]+)* {W}\\b"
+    },
+    {
+      "id": "ros-interface-down",
+      "class": "write_risky",
+      "pattern": "^/interface(?: [a-z0-9-]+)* (?:disable|remove)\\b"
+    },
+    {
+      "id": "ros-reboot-upgrade",
+      "class": "write_risky",
+      "pattern": "^/system (?:reboot|routerboard upgrade|package (?:downgrade|enable|disable|update (?:install|download)))\\b"
+    },
+    {
+      "id": "ros-file-output",
+      "class": "write_low",
+      "pattern": "(?:^| )file="
+    },
+    {
+      "id": "ros-write",
+      "class": "write_low",
+      "pattern": "(?:^| ){W}(?: |$)"
+    },
+    {
+      "id": "ros-script-read",
+      "class": "read",
+      "pattern": "^:(?:put|delay|len|typeof|tostr|tonum|toip|toarray|pick|find|time|resolve)\\b"
+    },
+    {
+      "id": "ros-diagnostics",
+      "class": "read",
+      "pattern": "^/(?:ping|traceroute|tool (?:ping|traceroute|torch|profile|sniffer quick|ip-scan))\\b"
+    },
+    {
+      "id": "ros-print",
+      "class": "read",
+      "pattern": "^/(?:[a-z0-9-]+ )*(?:print|export|monitor|monitor-traffic|get|find)(?: |$)"
+    },
+    {
+      "id": "ros-quit",
+      "class": "read",
+      "pattern": "^/quit$"
+    },
+    {
+      "id": "ros-empty",
+      "class": "read",
+      "pattern": "^/?$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|pre-shared-key|passphrase|community|token|api-key|private-key|auth-key|authentication-key|-key)\\s*[=:]\\s*)(?<value>\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*'|[^\\s\"']+)"
+    }
+  ],
+  "navigationRoots": [
+    "interface",
+    "ip",
+    "ipv6",
+    "routing",
+    "system",
+    "tool",
+    "user",
+    "ppp",
+    "queue",
+    "certificate",
+    "snmp",
+    "radius",
+    "log",
+    "file",
+    "disk",
+    "container",
+    "mpls",
+    "caps-man",
+    "port",
+    "special-login",
+    "lcd",
+    "partitions",
+    "console",
+    "driver",
+    "iot",
+    "zerotier",
+    "app",
+    "user-manager",
+    "dude"
+  ]
+}

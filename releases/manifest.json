@@ -1,0 +1,12 @@
+{
+  "product": "mnscloud-access-gateway",
+  "repository": "manaoscloud/mnscloud-access-gateway",
+  "channels": {
+    "stable": {
+      "version": "0.1.0",
+      "ref": "v0.1.0",
+      "releasedAt": null,
+      "minimumVersion": "0.1.0"
+    }
+  }
+}

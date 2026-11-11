@@ -1,0 +1,11 @@
+{
+  "name": "mnscloud-access-gateway",
+  "private": true,
+  "description": "Vendored npm dependencies of the access gateway (node_modules is committed; runtime uses --cached-only).",
+  "dependencies": {
+    "ssh2": "1.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1"
+  }
+}

@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic secrets of the redaction and hostile-device test suites (never real credentials)"
+paths = [
+  '''tests/fixtures/redaction\.json''',
+  '''tests/redaction_test\.ts''',
+  '''tests/hostile_ssh_server\.ts''',
+  '''tests/input_gate_test\.ts''',
+  '''tests/routeros_api_test\.ts''',
+]

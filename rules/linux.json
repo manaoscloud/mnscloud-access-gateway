@@ -1,0 +1,250 @@
+{
+  "dialect": "linux",
+  "description": "POSIX shells (bash, sh, zsh) on Linux. Each segment of a pipeline or command list is classified; the strictest class wins. Command substitution, continuation lines and unbalanced quotes are at least write_risky.",
+  "syntax": "posix",
+  "clearKeys": [
+    "\u0003",
+    "\u0015"
+  ],
+  "untrackable": [],
+  "cancelLine": "\u0015",
+  "macros": {
+    "SECRETFILE": "(?:/etc/(?:g?shadow-?|sudoers(?:\\.d)?|security/opasswd|ssh/ssh_host_[a-z0-9]+_key\\b|ppp/(?:chap|pap)-secrets|wireguard/|openvpn/\\S*\\.key|pve/priv/|mnscloud/)|/\\.ssh/id_|/root/\\.ssh/|\\.pem\\b|\\.key\\b|/var/lib/mnscloud/|\\.netrc\\b|\\.pgpass\\b|\\.my\\.cnf\\b|wpa_supplicant\\S*\\.conf|\\.kube/config|\\.aws/credentials|\\.docker/config\\.json|/proc/\\d+/environ|/proc/self/environ)"
+  },
+  "rules": [
+    {
+      "id": "sh-secret-file",
+      "class": "secret_read",
+      "pattern": "^(?:cat|tac|less|more|head|tail|grep|egrep|fgrep|zgrep|awk|sed|strings|xxd|hexdump|od|base64|cp|scp|vi|vim|nvim|nano|view|nl|cut|sort|uniq|diff|tee|dd|install)\\b.*{SECRETFILE}",
+      "hint": "Secret files are never shown in the console."
+    },
+    {
+      "id": "sh-env-dump",
+      "class": "secret_read",
+      "pattern": "^(?:env|printenv|set|export|declare(?: -[px])?|typeset)$",
+      "hint": "Environment dumps can hold credentials; print one variable with echo \"$NAME\" instead."
+    },
+    {
+      "id": "sh-getent-shadow",
+      "class": "secret_read",
+      "pattern": "^getent g?shadow\\b"
+    },
+    {
+      "id": "sh-key-material",
+      "class": "secret_read",
+      "pattern": "^(?:openssl (?:rsa|pkey|ec|pkcs12)\\b.*-in\\b|ssh-keygen\\b.*\\s-y\\b|wg showconf\\b|wg show \\S+ private-key\\b)"
+    },
+    {
+      "id": "sh-rm-recursive",
+      "class": "destructive",
+      "pattern": "^rm\\b.*(?:\\s-[a-zA-Z]*[rR][a-zA-Z]*\\b|\\s--recursive\\b|\\s--no-preserve-root\\b)"
+    },
+    {
+      "id": "sh-disk-tools",
+      "class": "destructive",
+      "pattern": "^(?:mkfs(?:\\.\\w+)?|mke2fs|mkswap|wipefs|shred|sgdisk|sfdisk|fdisk|cfdisk|parted|gdisk|blkdiscard|cryptsetup|pvremove|vgremove|lvremove|zpool (?:destroy|labelclear)|zfs destroy|mdadm\\b.*--zero-superblock)\\b"
+    },
+    {
+      "id": "sh-dd-device",
+      "class": "destructive",
+      "pattern": "^dd\\b.*\\bof=/dev/(?!null\\b)"
+    },
+    {
+      "id": "sh-recursive-root",
+      "class": "destructive",
+      "pattern": "^(?:chmod|chown|chgrp|setfacl)\\b.*\\s-[a-zA-Z]*R[a-zA-Z]*\\b.*\\s/(?:\\s|$)"
+    },
+    {
+      "id": "sh-find-delete",
+      "class": "destructive",
+      "pattern": "^find\\b.*\\s-(?:delete\\b|exec(?:dir)?\\s+rm\\b)"
+    },
+    {
+      "id": "sh-fork-bomb",
+      "class": "destructive",
+      "pattern": "^:\\s*\\(\\s*\\)"
+    },
+    {
+      "id": "sh-pivot",
+      "class": "pivot",
+      "pattern": "^(?:ssh|scp|sftp|telnet|nc|ncat|netcat|socat|curl|wget|ftp|lftp|rsync|tftp|nmap|masscan|mosh|rdesktop|xfreerdp|smbclient|mysql|mariadb|psql|redis-cli|mongo|mongosh|ssh-copy-id|sshpass|proxychains4?|tsocks|nsenter|openssl s_client|ip netns exec)\\b"
+    },
+    {
+      "id": "sh-power",
+      "class": "write_risky",
+      "pattern": "^(?:reboot|shutdown|poweroff|halt|init|telinit|kexec|systemctl (?:reboot|poweroff|halt|kexec|isolate|rescue|emergency|soft-reboot))\\b"
+    },
+    {
+      "id": "sh-critical-service",
+      "class": "write_risky",
+      "pattern": "^(?:systemctl (?:stop|restart|reload|disable|mask|kill|try-restart|reload-or-restart)|service)\\b.*\\b(?:ssh|sshd|networking|network|NetworkManager|systemd-networkd|systemd-resolved|nftables|iptables|ufw|firewalld|pve-cluster|corosync|pveproxy|pvedaemon|frr|bird2?|wg-quick@\\S*|openvpn\\S*|strongswan\\S*|ipsec|mnscloud-\\S+)\\b"
+    },
+    {
+      "id": "sh-firewall-list",
+      "class": "read",
+      "pattern": "^(?:ip6?tables(?:-legacy|-nft)?(?: -t \\w+)? (?:-[nvxL]*L[nvxL]*|-S|--list|--list-rules)(?: -[nvx]+| [A-Za-z0-9_][A-Za-z0-9_-]*)*|nft(?: -[ajns]+)* list\\b.*|ufw status\\b.*|firewall-cmd --(?:list|state|get|query)\\S*.*)$"
+    },
+    {
+      "id": "sh-firewall-write",
+      "class": "write_risky",
+      "pattern": "^(?:ip6?tables\\S*|nft|ufw|firewall-cmd|ebtables|arptables)\\b"
+    },
+    {
+      "id": "sh-ip-read",
+      "class": "read",
+      "pattern": "^ip(?: -[a-z0-9]+)*(?: (?:a|ad|addr|address|r|ro|rou|route|l|li|link|n|neigh|neighbor|neighbour|rule|maddr|ntable|tunnel|xfrm|vrf|netns|mroute|token|monitor|-br|stats))?(?: (?:show|sh|s|list|ls|get|lst)\\b.*)?$"
+    },
+    {
+      "id": "sh-ip-risky",
+      "class": "write_risky",
+      "pattern": "^ip(?: -[a-z0-9]+)* (?:(?:r|ro|rou|rout|route) (?:add|del|delete|replace|change|append|flush)\\b.*\\bdefault\\b|(?:r|ro|rou|rout|route) flush\\b|(?:l|li|lin|link) (?:set|del|delete)\\b|(?:a|ad|addr|address) (?:del|delete|flush|replace|change)\\b|(?:rule|netns|tunnel|xfrm|vrf|tuntap)\\b)"
+    },
+    {
+      "id": "sh-ip-low",
+      "class": "write_low",
+      "pattern": "^ip(?: -[a-z0-9]+)* (?:(?:r|ro|rou|rout|route|a|ad|addr|address|n|neigh) (?:add|append|replace)\\b)"
+    },
+    {
+      "id": "sh-accounts",
+      "class": "write_risky",
+      "pattern": "^(?:useradd|userdel|usermod|adduser|deluser|passwd|chpasswd|chage|gpasswd|groupadd|groupdel|groupmod|visudo|vipw|vigr)\\b"
+    },
+    {
+      "id": "sh-packages-read",
+      "class": "read",
+      "pattern": "^(?:(?:apt|apt-cache) (?:list|show|search|policy|depends|rdepends|madison)\\b.*|dpkg (?:-l|-L|-s|-S|-p|--list|--status|--listfiles|--search|--print-architecture)\\b.*|dpkg-query\\b.*|rpm -q\\S*\\b.*|apt-mark (?:showhold|showmanual|showauto)\\b.*)$"
+    },
+    {
+      "id": "sh-packages-update",
+      "class": "write_low",
+      "pattern": "^(?:apt|apt-get|aptitude|dnf|yum|zypper|apk) (?:update|refresh|makecache)\\s*$"
+    },
+    {
+      "id": "sh-packages-write",
+      "class": "write_risky",
+      "pattern": "^(?:apt|apt-get|aptitude|dpkg|yum|dnf|rpm|zypper|pacman|apk|snap|flatpak|pip3?|npm|gem|cargo|go)\\b"
+    },
+    {
+      "id": "sh-crontab-list",
+      "class": "read",
+      "pattern": "^crontab -l\\b.*$"
+    },
+    {
+      "id": "sh-vtysh-show",
+      "class": "read",
+      "pattern": "^vtysh -c [\"']?(?:show|sh)\\b[^;|&]*$"
+    },
+    {
+      "id": "sh-wg-show",
+      "class": "read",
+      "pattern": "^wg(?: show(?: \\S+)?(?: (?:peers|endpoints|allowed-ips|latest-handshakes|transfer|listen-port|fwmark|persistent-keepalive|public-key))?)?$"
+    },
+    {
+      "id": "sh-sysctl-read",
+      "class": "read",
+      "pattern": "^sysctl(?: -[anNe]+)*(?: [a-z0-9_.*/-]+)*$"
+    },
+    {
+      "id": "sh-bare-read",
+      "class": "read",
+      "pattern": "^(?:mount|ifconfig|route(?: -n)?|arp(?: -[an]+)?|hostname(?: -[a-zA-Z]+)*|iwconfig|brctl show|ethtool(?: -[ikSTPm])? \\S+|hostnamectl(?: status)?|timedatectl(?: status| show| timesync-status)?|localectl(?: status)?|iw dev|iw \\S+ (?:info|link|station dump))$"
+    },
+    {
+      "id": "sh-interpreters",
+      "class": "write_risky",
+      "pattern": "^(?:sudo|su|doas|pkexec|bash|sh|zsh|dash|ksh|fish|csh|tcsh|busybox|python[0-9.]*|perl|ruby|node|deno|bun|php|lua|tclsh|expect|screen|tmux|script|vi|vim|nvim|nano|emacs|mcedit|joe|ed|crontab|at|batch|chroot|unshare|setsid|eval|source|\\.|exec|env|xargs|parallel|systemd-run|run-parts|make|ansible\\S*|docker|podman|kubectl|ctr|nerdctl|lxc|incus|virsh)\\b"
+    },
+    {
+      "id": "sh-kernel-network",
+      "class": "write_risky",
+      "pattern": "^(?:sysctl|modprobe|rmmod|insmod|swapoff|swapon|mount|umount|losetup|exportfs|hostnamectl|hostname|timedatectl set|update-grub|grub-install|efibootmgr|wg|wg-quick|openvpn|ipsec|strongswan|vtysh|birdc|ethtool|tc|brctl|ovs-vsctl|ovs-ofctl|ifdown|ifup|ifconfig|route|arp|nmcli|netplan|resolvectl (?:dns|domain|revert)|iw|iwconfig|dhclient|dhcpcd)\\b"
+    },
+    {
+      "id": "sh-system-files",
+      "class": "write_risky",
+      "pattern": "^(?:chmod|chown|chgrp|chattr|setfacl|mv|cp|ln|install|rsync|tee|truncate|sed)\\b.*\\s/(?:boot|etc/(?:ssh|sudoers|pam\\.d|network|netplan|nftables|iptables|systemd/network|fstab|passwd|group|hosts\\.allow|hosts\\.deny|resolv\\.conf|pve|frr|wireguard)|usr|bin|sbin|lib)\\b"
+    },
+    {
+      "id": "sh-awk-system",
+      "class": "write_risky",
+      "pattern": "^(?:awk|gawk|mawk|nawk)\\b.*(?:\\bsystem\\s*\\(|\\bgetline\\b|\\|\\s*\"|print[^;]*>)"
+    },
+    {
+      "id": "sh-find-exec",
+      "class": "write_risky",
+      "pattern": "^find\\b.*\\s-(?:exec|execdir|ok|okdir|fprint|fprintf|fls)\\b"
+    },
+    {
+      "id": "sh-kill-critical",
+      "class": "write_risky",
+      "pattern": "^(?:kill|pkill|killall)\\b.*(?:\\s1$|\\s-\\S+\\s+1$|\\bsshd?\\b|\\bsystemd\\b|\\binit\\b)"
+    },
+    {
+      "id": "sh-rm",
+      "class": "write_risky",
+      "pattern": "^(?:rm|unlink|rmdir)\\b"
+    },
+    {
+      "id": "sh-journal-write",
+      "class": "write_low",
+      "pattern": "^journalctl\\b.*--(?:vacuum-\\S+|rotate|flush|sync|relinquish-var|setup-keys)\\b"
+    },
+    {
+      "id": "sh-date-set",
+      "class": "write_low",
+      "pattern": "^(?:date\\b.*\\s(?:-s|--set)\\b|hwclock\\b.*--(?:set|systohc|hctosys))"
+    },
+    {
+      "id": "sh-sed-inplace",
+      "class": "write_low",
+      "pattern": "^sed\\b.*\\s(?:-i\\S*|--in-place)\\b"
+    },
+    {
+      "id": "sh-tcpdump-write",
+      "class": "write_low",
+      "pattern": "^tcpdump\\b.*\\s-w\\b"
+    },
+    {
+      "id": "sh-write-low",
+      "class": "write_low",
+      "pattern": "^(?:touch|mkdir|cp|mv|ln|chmod|chown|chgrp|tar|unzip|gzip|gunzip|zip|xz|unxz|bzip2|bunzip2|tee|truncate|logrotate|systemctl (?:start|stop|restart|reload|enable|disable|try-restart|reset-failed|daemon-reload|reload-or-restart)|service \\S+ (?:start|stop|restart|reload)|kill|pkill|killall|wall|logger|resolvectl flush-caches|sync)\\b"
+    },
+    {
+      "id": "sh-systemctl-read",
+      "class": "read",
+      "pattern": "^systemctl(?: --no-pager| -l| --full| -a| --all| --failed| --user)*(?: (?:status|is-active|is-enabled|is-failed|list-units|list-unit-files|list-timers|list-sockets|list-dependencies|list-jobs|show|cat|get-default)\\b.*)?$"
+    },
+    {
+      "id": "sh-service-status",
+      "class": "read",
+      "pattern": "^service \\S+ status$"
+    },
+    {
+      "id": "sh-read",
+      "class": "read",
+      "pattern": "^(?:ls|ll|la|l|dir|vdir|cat|tac|less|more|most|head|tail|grep|egrep|fgrep|zgrep|zcat|zless|awk|gawk|cut|sort|uniq|wc|tr|column|jq|yq|ps|pstree|pgrep|top|htop|atop|btop|iotop|iftop|nload|bmon|vmstat|iostat|mpstat|pidstat|sar|free|uptime|uname|whoami|id|groups|who|w|last|lastb|lastlog|date|cal|df|du|lsblk|blkid|findmnt|lscpu|lsmem|lspci|lsusb|lsmod|lsof|lshw|dmidecode|sensors|dmesg|journalctl|ss|netstat|ping|ping6|traceroute|traceroute6|tracepath|mtr|dig|host|nslookup|drill|resolvectl(?: (?:status|query|statistics))?|tcpdump|stat|file|which|whereis|type|realpath|readlink|pwd|cd|clear|reset|exit|logout|true|false|echo|printf|sleep|seq|basename|dirname|md5sum|sha1sum|sha256sum|sha512sum|cksum|diff|cmp|tree|find|locate|getent (?:passwd|group|hosts|ahosts|services)|timedatectl(?: status)?|localectl(?: status)?|hostnamectl(?: status)?|systemd-analyze|loginctl|nproc|getconf|man|help|apropos|watch|history|alias|ulimit|smartctl -[aAiHxl]+|nvme (?:list|smart-log)|zpool (?:status|list|iostat|history)|zfs (?:list|get)|pvs|vgs|lvs|pvdisplay|vgdisplay|lvdisplay|mdadm --detail|xxd|hexdump|od|strings|base64|nl|fold|fmt|expand|test|\\[|arping|ethtool|iw dev|iw \\S+ (?:info|link|station dump)|curl --version|lldpctl|lldpcli show)\\b"
+    },
+    {
+      "id": "sh-empty",
+      "class": "read",
+      "pattern": "^$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|pre-shared-key|passphrase|token|api[-_]?key|private[-_]key|auth[-_]key|access[-_]key|client[-_]secret)\\s*[=:]\\s*)(?<value>\"(?:[^\"\\\\]|\\\\.)*\"|'[^']*'|[^\\s\"']+)"
+    },
+    {
+      "id": "wg-private",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:PrivateKey|PresharedKey|private key|preshared key)\\s*[=:]\\s*)(?<value>\\S+)"
+    },
+    {
+      "id": "url-userinfo",
+      "flags": "g",
+      "pattern": "(?<key>[a-z][a-z0-9+.-]*://[^:/@\\s]+:)(?<value>[^@\\s]+)(?=@)"
+    }
+  ]
+}

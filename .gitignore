@@ -1,0 +1,5 @@
+# node_modules is committed on purpose (vendored, --cached-only at runtime); only build leftovers
+# of optional native addons are ignored.
+node_modules/.deno/*/node_modules/*/build/
+.mnscloud-runtime-kit/
+*.log
