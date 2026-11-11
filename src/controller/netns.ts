@@ -172,7 +172,7 @@ export function renderHostNft(input: HostFirewallInput): string {
   const pool6 = parseCidr(input.pool6 ?? DEFAULT_POOL_IPV6)!;
   const t = HOST_TABLE;
   return [
-    `table inet ${t} {}`,
+    'table inet ' + t + ' {}',
     `delete table inet ${t}`,
     `table inet ${t} {`,
     `  set deny4 { type ipv4_addr; flags interval; auto-merge;${

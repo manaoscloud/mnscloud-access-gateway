@@ -114,7 +114,9 @@ class Mailbox {
 }
 
 export async function runWorker(io: WorkerIO): Promise<Exit> {
-  const iterator = io.messages[Symbol.asyncIterator]();
+  const iterator = (async function* () {
+    yield* io.messages;
+  })();
   const mailbox = new Mailbox();
   let bytesIn = 0, bytesOut = 0;
   const finish = (state: Exit['state'], reason: string): Exit => {
@@ -137,7 +139,6 @@ export async function runWorker(io: WorkerIO): Promise<Exit> {
   }
   io.send({ t: 'started' });
   // Pump the remaining controller messages.
-  let pumpDone = false;
   const pump = (async () => {
     try {
       for (;;) {
@@ -146,7 +147,6 @@ export async function runWorker(io: WorkerIO): Promise<Exit> {
         mailbox.dispatch(next.value as ControllerToWorker);
       }
     } catch { /* controller pipe closed */ }
-    pumpDone = true;
     mailbox.dispatch({ t: 'close', reason: 'controller_gone' });
   })();
 

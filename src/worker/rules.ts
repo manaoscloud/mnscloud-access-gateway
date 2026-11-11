@@ -85,7 +85,8 @@ export function compileRules(raw: RawFile, base?: DialectRules): DialectRules {
     return {
       id: rule.id,
       class: rule.class as CommandClass,
-      regex: new RegExp(expand(rule.pattern, macros), flags),
+      // Patterns come from the versioned rules/*.json of this repository, never from input.
+      regex: new RegExp(expand(rule.pattern, macros), flags), // nosemgrep
       ...(rule.hint ? { hint: rule.hint } : {}),
     };
   });
@@ -93,7 +94,8 @@ export function compileRules(raw: RawFile, base?: DialectRules): DialectRules {
     const flags = pattern.flags ?? 'g';
     return {
       id: pattern.id,
-      regex: new RegExp(
+      // Patterns come from the versioned rules/*.json of this repository, never from input.
+      regex: new RegExp( // nosemgrep
         expand(pattern.pattern, macros),
         (flags.includes('g') ? flags : flags + 'g') + (flags.includes('d') ? '' : 'd'),
       ),

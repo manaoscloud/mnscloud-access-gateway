@@ -14,7 +14,7 @@ export class ControlPlaneRejected extends Error {
   }
 }
 
-const HINTS: Record<string, string> = {
+const HINTS = new Map<string, string>(Object.entries({
   ACCESS_GATEWAY_AGENT_FORBIDDEN:
     '; the host Agent must be active and belong to an environment of the platform master who generated this command',
   ACCESS_GATEWAY_INSTALLATION_EXPIRED:
@@ -25,7 +25,7 @@ const HINTS: Record<string, string> = {
     '; the listen address must be a private address reported by the host Agent (wait for the next Agent heartbeat, then rerun)',
   ACCESS_GATEWAY_TRANSITION_INVALID:
     '; use Retry installation in the App, then rerun the resume command',
-};
+}));
 
 /** Reads a root-owned private file (no symlink, mode 0600 or stricter, bounded size). */
 export function privateRead(path: string, maxBytes = 65536): string {
@@ -163,7 +163,7 @@ export class ControlPlane {
           code = candidate;
         }
       } catch { /* not JSON */ }
-      throw new ControlPlaneRejected(response.status, code, HINTS[code] ?? '');
+      throw new ControlPlaneRejected(response.status, code, HINTS.get(code) ?? '');
     }
     if (!bytes.length) return null as T;
     const parsed = JSON.parse(new TextDecoder().decode(bytes));
