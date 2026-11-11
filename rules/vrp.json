@@ -1,0 +1,65 @@
+{
+  "dialect": "vrp",
+  "description": "Huawei VRP 5/8 CLI (user view and system view). Anything that is not a display/diagnostic command needs confirmation; unknown commands are write_risky.",
+  "syntax": "plain",
+  "flags": "i",
+  "clearKeys": [],
+  "untrackable": ["?"],
+  "cancelLine": "\u0015",
+  "rules": [
+    {
+      "id": "vrp-private-key",
+      "class": "secret_read",
+      "pattern": "^dis(?:p|pl|pla|play)? .*\\bprivate\\b",
+      "hint": "Private keys are never shown in the console."
+    },
+    {
+      "id": "vrp-destructive",
+      "class": "destructive",
+      "pattern": "^(?:reset (?:saved-configuration|factory-configuration|patch|boot)|delete|del|format|fixdisk|rmdir|startup saved-configuration|undo startup|patch delete|license revoke|clear configuration)\\b"
+    },
+    {
+      "id": "vrp-pivot",
+      "class": "pivot",
+      "pattern": "^(?:stelnet|telnet|ssh client|ssh|ftp|sftp|scp|tftp|http client|netconf client)\\b"
+    },
+    {
+      "id": "vrp-risky",
+      "class": "write_risky",
+      "pattern": "^(?:reboot|rebo|upgrade|startup (?:system-software|patch)|patch (?:load|active|run)|aaa|local-user|user-interface|stelnet server|ssh (?:server|user|authentication-type)|acl|rule|traffic-filter|traffic-policy|firewall|ip route-static|ipv6 route-static|ospf|ospfv3|bgp|isis|rip|mpls|vrrp|ip vpn-instance|ip address|shutdown|undo|ntp-service|snmp-agent|hwtacacs|radius-server|password|super password|authentication-mode|protocol inbound|set authentication|user privilege)\\b"
+    },
+    {
+      "id": "vrp-write",
+      "class": "write_low",
+      "pattern": "^(?:interface|int|vlan|description|desc|port|port-group|save|sysname|clock|info-center|header|dhcp|lldp|stp|loopback-detect|commit|mac-address|arp static|ip netstream|qos|bpdu)\\b"
+    },
+    {
+      "id": "vrp-read",
+      "class": "read",
+      "pattern": "^(?:dis(?:p|pl|pla|play)?\\b.*|ping\\b.*|tracert\\b.*|traceroute\\b.*|screen-length\\b.*|undo screen-length\\b.*|screen-width\\b.*|terminal (?:monitor|debugging)|undo terminal (?:monitor|debugging)|quit|q|return|ret|system-view|sys|language-mode\\b.*)$"
+    },
+    { "id": "vrp-empty", "class": "read", "pattern": "^$" }
+  ],
+  "redact": [
+    {
+      "id": "vrp-cipher",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:cipher|irreversible-cipher|simple|sha|md5|hmac-sha256)\\s+)(?<value>%[\\^@$#]%[#@$\\^]\\S*|\\S+)(?=\\s|$)"
+    },
+    {
+      "id": "vrp-marker",
+      "flags": "g",
+      "pattern": "(?<value>%\\^%#\\S+?%\\^%#|%@%@\\S+?%@%@|%\\$%\\$\\S+?%\\$%\\$|@%@%\\S+?@%@%)"
+    },
+    {
+      "id": "kw-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key-string|pre-shared-key|psk|community(?: read| write)?)\\s+(?:\\d\\s+)?)(?<value>\\S+)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    }
+  ]
+}

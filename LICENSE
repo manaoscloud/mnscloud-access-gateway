@@ -1,0 +1,12 @@
+Copyright (c) 2026 MNSCloud. All rights reserved.
+
+License to be finalized before the first public source release.
+
+Until a final open-source license is selected and committed, the source code and documentation in
+this repository are published for transparency, security review and partner evaluation only. Do
+not assume permission to redistribute, modify or operate this software beyond the terms published
+by MNSCloud.
+
+Third-party components vendored under node_modules/ keep their own licenses (ssh2, asn1,
+bcrypt-pbkdf, safer-buffer and tweetnacl: MIT, BSD or public domain, as stated in each package;
+@types/node and undici-types: MIT).

@@ -1,0 +1,28 @@
+name: Sync release cache
+
+# Registers an existing release (latest by default) in the MNSCloud runtime release cache (DEV),
+# so the access gateway runtime is a versioned product even without cutting a new release.
+# Production is filled by scripts/ops/promote.sh.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Release tag to publish (vX.Y.Z). Empty uses the latest release.'
+        required: false
+        type: string
+  schedule:
+    - cron: '47 6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-release-cache
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    uses: manaoscloud/mnscloud-runtime-kit/.github/workflows/sync-release-cache.yml@main
+    with:
+      ref: ${{ inputs.ref || '' }}
+    secrets: inherit

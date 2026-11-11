@@ -1,0 +1,29 @@
+{
+  "dialect": "other",
+  "description": "Any other CLI. Only well-known read commands run without confirmation; everything else is unknown and write_risky (fail-closed).",
+  "syntax": "plain",
+  "flags": "i",
+  "clearKeys": [],
+  "untrackable": ["?"],
+  "cancelLine": "\u0015",
+  "rules": [
+    {
+      "id": "other-read",
+      "class": "read",
+      "pattern": "^(?:show\\b.*|sh\\b.*|display\\b.*|dis\\b.*|get\\b.*|ping\\b.*|traceroute\\b.*|tracert\\b.*|exit|quit|logout|help|terminal (?:length|width|pager) \\d+|screen-length \\d+.*)$"
+    },
+    { "id": "other-empty", "class": "read", "pattern": "^$" }
+  ],
+  "redact": [
+    {
+      "id": "kw-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key-string|pre-shared-key|psk|community|enable secret|enable password)\\s+(?:\\d\\s+)?)(?<value>\\S+)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    }
+  ]
+}

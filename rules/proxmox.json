@@ -1,0 +1,33 @@
+{
+  "dialect": "proxmox",
+  "description": "Proxmox VE hosts: the Linux rules plus the Proxmox tools (qm, pct, pvesh, pvecm, pveceph, pvesm, pveum).",
+  "extends": "linux",
+  "rules": [
+    {
+      "id": "pve-token-add",
+      "class": "secret_read",
+      "pattern": "^pveum (?:user )?token add\\b",
+      "hint": "API tokens are created in the Proxmox web interface, never shown in the console."
+    },
+    {
+      "id": "pve-destroy",
+      "class": "destructive",
+      "pattern": "^(?:(?:qm|pct) (?:destroy|unlink|rollback)|pvesm free|pveceph (?:osd destroy|pool destroy|purge|fs destroy)|pvecm delnode)\\b"
+    },
+    {
+      "id": "pve-guest-shell",
+      "class": "pivot",
+      "pattern": "^(?:qm (?:terminal|monitor|guest exec|vncproxy|guest passwd)|pct (?:enter|exec|console|push|pull)|pvesh\\b.*/(?:termproxy|vncproxy|spiceproxy|vncwebsocket))\\b"
+    },
+    {
+      "id": "pve-read",
+      "class": "read",
+      "pattern": "^(?:(?:qm|pct) (?:list|status|config|pending|showcmd|cloudinit dump|df|listsnapshot)\\b.*|pvesh (?:get|ls|usage)\\b.*|pveversion\\b.*|pvecm (?:status|nodes|qdevice status|expected --help)\\b.*|pvesm (?:status|list|path)\\b.*|pveceph (?:status|osd ls|pool ls|mon ls)\\b.*|ha-manager (?:status|config)\\b.*|pvesr (?:status|list)\\b.*|pve-firewall (?:status|compile|localnet)\\b.*|pvenode (?:config get|cert info|task list|task status)\\b.*|pveam (?:list|available)\\b.*|pveum (?:user list|group list|role list|acl list|pool list|realm list)\\b.*|pvereport|pvesubscription get|pveperf\\b.*)$"
+    },
+    {
+      "id": "pve-write",
+      "class": "write_risky",
+      "pattern": "^(?:qm|pct|pvesh|pvecm|pveceph|ha-manager|pvesr|vzdump|pve-firewall|pvenode|pveam|pvesm|pveum|pvesubscription|pveupgrade|pve-efiboot-tool|proxmox-boot-tool|qmrestore|pct restore)\\b"
+    }
+  ]
+}

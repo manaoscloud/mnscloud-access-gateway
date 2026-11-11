@@ -1,0 +1,44 @@
+{
+  "routeros": [
+    ["/ppp secret add name=u1 password=Sup3rS3cret! service=pppoe\r\n", "Sup3rS3cret!"],
+    [
+      "set [ find default-name=wlan1 ] wpa2-pre-shared-key=\"wifi pass 123\" ssid=x\r\n",
+      "wifi pass 123"
+    ],
+    ["/ip ipsec identity add peer=p1 secret=ipsecS3cret\r\n", "ipsecS3cret"],
+    ["/radius add address=192.0.2.9 secret=radSecret99 service=ppp\r\n", "radSecret99"],
+    [
+      "/interface wireguard add private-key=\"aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8=\"\r\n",
+      "aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8="
+    ],
+    ["\u001b[m\u001b[36mpassword\u001b[m=\u001b[33mcolored123\u001b[m\r\n", "colored123"]
+  ],
+  "linux": [
+    [
+      "root:$6$saltsalt$Zx9yQ1w2e3r4t5y6u7i8o9p0aSdFgHjKlZxCvBnM.:19000:0:99999:7:::\n",
+      "$6$saltsalt$Zx9yQ1w2e3r4t5y6u7i8o9p0aSdFgHjKlZxCvBnM."
+    ],
+    ["DB_PASSWORD=hunter2hunter2\n", "hunter2hunter2"],
+    [
+      "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACDX\n-----END OPENSSH PRIVATE KEY-----\n",
+      "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW"
+    ],
+    [
+      "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\n",
+      "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
+    ],
+    ["remote: https://deploy:tok3nValue@git.example.com/repo.git\n", "tok3nValue"]
+  ],
+  "vrp": [
+    [
+      " local-user admin password irreversible-cipher %^%#abcDEF123ghiJKL%^%#\r\n",
+      "abcDEF123ghiJKL"
+    ],
+    [" snmp-agent community read cipher %^%#Q2NhbXB1cw==%^%#\r\n", "Q2NhbXB1cw=="],
+    [" pre-shared-key cipher %^%#xyzXYZ789%^%#\r\n", "xyzXYZ789"]
+  ],
+  "other": [
+    ["enable secret 5 $1$mERr$hx5rVt7rPNoS4wqbXKX7m0\r\n", "hx5rVt7rPNoS4wqbXKX7m0"],
+    ["username admin password 7 0822455D0A16\r\n", "0822455D0A16"]
+  ]
+}
