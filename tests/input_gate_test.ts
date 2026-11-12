@@ -200,3 +200,30 @@ Deno.test('gate: inside a full-screen program only an empty Enter passes unclass
   assertEquals(h.events[2].verdict, 'blocked');
   h.gate.close();
 });
+
+Deno.test('gate: terminal reports the device asked for pass without tainting the line', () => {
+  const h = harness('routeros', 'n1');
+  // RouterOS login: cursor position queries (one split across two output chunks) and DECID.
+  h.gate.observeOutput('\r\x1b[9999B\x1bZ  \x1b[6n');
+  h.gate.observeOutput('\x1b[H\x1b[9999C\x1b[');
+  h.gate.observeOutput('6n');
+  h.gate.input('\x1b[?1;2c');
+  h.gate.input('\x1b[24;80R\x1b[1;80R');
+  h.gate.input('/interface print\r');
+  assertEquals(h.device(), '\x1b[?1;2c\x1b[24;80R\x1b[1;80R/interface print\r');
+  assertEquals(h.events.map((e) => [e.class, e.verdict]), [['read', 'allowed']]);
+  h.gate.close();
+});
+
+Deno.test('gate: an unrequested or extra terminal report still taints the line', () => {
+  const h = harness('routeros', 'n2');
+  h.gate.input('\x1b[24;80R/interface print\r');
+  // One query allows one report: the second one taints.
+  h.gate.observeOutput('\x1b[6n');
+  h.gate.input('\x1b[24;80R\x1b[24;80R/interface print\r');
+  assertEquals(h.events.map((e) => [e.class, e.verdict]), [
+    ['write_risky', 'blocked'],
+    ['write_risky', 'blocked'],
+  ]);
+  h.gate.close();
+});
