@@ -98,7 +98,15 @@ export class Gateway {
         ).catch(() => {});
         return 'refused';
       }
-      if (!this.options.hub?.has(assignment.connectorUuid!)) {
+      const tunnelKey = this.options.hub?.fingerprintOf(assignment.connectorUuid!) ?? null;
+      if (tunnelKey !== null && tunnelKey !== assignment.connectorKeyFingerprint) {
+        await this.options.deps.api.finish(
+          assignment.connectionUUID,
+          refusal(assignment, 'connector_key_mismatch'),
+        ).catch(() => {});
+        return 'refused';
+      }
+      if (tunnelKey === null) {
         await this.options.deps.api.finish(
           assignment.connectionUUID,
           refusal(assignment, 'connector_offline', 'failed'),
@@ -205,7 +213,7 @@ export class Gateway {
     if (url.pathname === `/access-gateway/${this.options.gatewayKey}/connector`) {
       if (!this.options.hub) return new Response('Not found', { status: 404 });
       if (this.#draining) return new Response('Draining', { status: 503 });
-      return this.options.hub.handleUpgrade(request);
+      return this.options.hub.handleUpgrade(request, remote);
     }
     const paths = [`/access-gateway/${this.options.gatewayKey}/ws`, '/ws'];
     if (!paths.includes(url.pathname)) return new Response('Not found', { status: 404 });

@@ -30,12 +30,24 @@ Deno.test('contract: assignment validation refuses what the gateway must not do'
     path: 'connector',
     transport: 'connector',
     connectorUuid: ASSIGNMENT.connectionUUID,
+    connectorKeyFingerprint: 'SHA256:Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw=',
     target: { address: '10.20.30.40', port: 22 },
   });
   assertEquals(
     [viaConnector.path, viaConnector.transport, viaConnector.connectorUuid],
     ['connector', 'connector', ASSIGNMENT.connectionUUID],
   );
+  // The API must pin the connector key: a connector assignment without it is refused.
+  assertThrows(
+    () =>
+      parseAssignment({
+        ...ASSIGNMENT,
+        path: 'connector',
+        connectorUuid: ASSIGNMENT.connectionUUID,
+      }),
+    /connectorKeyFingerprint/,
+  );
+  assertEquals(viaConnector.connectorKeyFingerprint?.length, 51);
   assertEquals(parseAssignment(ASSIGNMENT).transport, 'direct');
   assertEquals(parseAssignment(ASSIGNMENT).connectorUuid, null);
   assertThrows(

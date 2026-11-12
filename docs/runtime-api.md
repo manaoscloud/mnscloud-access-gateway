@@ -156,6 +156,7 @@ ends them (finish reason `cancelled`).
   "path": "public | connector",
   "transport": "direct | connector",
   "connectorUuid": "uuid (required, and only allowed, when transport is connector)",
+  "connectorKeyFingerprint": "SHA256:<44 base64 chars incl. padding> (required with transport connector)",
   "target": { "address": "<IP literal resolved by the API with the rebinding guard>", "port": 22 },
   "shellDialect": "routeros | linux | proxmox | vrp | other",
   "username": "<device login, no CR/LF/NUL, <=128>",
@@ -183,6 +184,11 @@ ends them (finish reason `cancelled`).
   and 8728, `telnet`, and any `path` other than `public` and `connector` are refused in this
   release. `transport` defaults to `connector` when `path` is `connector` and to `direct` otherwise;
   `path: connector` requires `transport: connector` (and the reverse), otherwise `path_unsupported`.
+  `connectorKeyFingerprint` is the fingerprint of the connector public key the API has on file
+  (`SHA256:` + base64 of sha256(raw key), as in `AcnPublicKeyFingerprint`); the gateway refuses the
+  connection (`refused`, `connector_key_mismatch`) when the tunnel authenticated with another key,
+  and drops any tunnel whose key it can no longer confirm with `GET /connectors/:uuid` (checked
+  every 60 s: a disabled, deleted or re-installed connector loses its tunnel).
 - The gateway refuses (finish `refused`) any target in the denylist unless it is a DEV lab target.
   For `transport: connector` the public denylist does not apply (tenant private ranges are the
   point); the gateway still refuses loopback, link-local, multicast, unspecified, broadcast and
@@ -267,7 +273,7 @@ Exactly once per connection (also for refused and expired assignments).
 ```json
 {
   "state": "closed | failed | refused | expired",
-  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | connector_offline | not_allowed | api_refused | api_unavailable | connect_timeout | open_timeout | too_many_streams | tunnel_closed | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
+  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | connector_offline | connector_key_mismatch | connector_open_failed | not_allowed | api_refused | api_unavailable | connect_timeout | open_timeout | too_many_streams | tunnel_closed | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
   "bytesFromDevice": 0,
   "bytesToDevice": 0,
   "durationMs": 0,
@@ -373,22 +379,26 @@ identity is an Ed25519 key generated on the tenant host; only the public key is 
 
 ### Installation
 
-The App shows one command (single-use token, 24 h). The script is pinned by the SHA-256 the API
-computes from the raw file of the release tag (`scripts/install-connector.sh` at `<tag>`), the commit
-is verified again after the clone:
+The App shows one command (single-use token, 24 h). The script is downloaded to a private temporary
+file and pinned by the SHA-256 the API computes from the raw file of the release tag
+(`scripts/install-connector.sh` at `<tag>`); the commit is verified again after the clone. The token
+travels on **stdin** (never in the environment or on a command line, where it would show up in
+`/proc`, shell history and sudo logs):
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/manaoscloud/mnscloud-access-gateway/<tag>/scripts/install-connector.sh -o /tmp/mns-connector-install.sh \
-  && echo "<sha256 of the script at <tag>>  /tmp/mns-connector-install.sh" | sha256sum -c - \
-  && sudo MNSCLOUD_CONNECTOR_TOKEN=<token> MNSCLOUD_API_URL=<public api base> MNSCLOUD_CONNECTOR_RELEASE=<tag> MNSCLOUD_CONNECTOR_COMMIT=<40 hex> bash /tmp/mns-connector-install.sh
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/manaoscloud/mnscloud-access-gateway/<tag>/scripts/install-connector.sh -o "$f" \
+  && echo "<sha256 of the script at <tag>>  $f" | sha256sum -c - \
+  && printf '%s' '<token>' | sudo env MNSCLOUD_API_URL=<public api base> MNSCLOUD_CONNECTOR_RELEASE=<tag> MNSCLOUD_CONNECTOR_COMMIT=<40 hex> bash "$f"; rm -f "$f"
 ```
 
-- `MNSCLOUD_CONNECTOR_TOKEN`: `^[A-Za-z0-9_-]{32,128}$` (the API issues 32 random bytes, base64url, 43
-  chars). The script passes it to the claim on stdin only, never on a command line, and unsets it.
+- Token: `^[A-Za-z0-9_-]{32,128}$` (the API issues 32 random bytes, base64url, 43 chars). The script
+  refuses a token in the environment; with nothing on stdin and a terminal available it prompts
+  (`read -rs`). It passes the token to the claim on stdin only.
 - `MNSCLOUD_API_URL`: `https://<host>[:port][/api[/v1]]`; the connector normalizes it to `.../api/v1`.
 - `MNSCLOUD_CONNECTOR_RELEASE`: `vX.Y.Z` tag of this repository; `MNSCLOUD_CONNECTOR_COMMIT`: the
   commit the tag must resolve to (the script refuses a mismatch). The same two values come back as
-  `release` in the config for updates.
+  `release` in the config for updates; the updater also refuses a tag older than the running
+  `VERSION`.
 - The script installs Deno from `mnscloud-runtime-kit` (same pin as the gateway), clones this
   repository to `/opt/mnscloud-access-connector`, creates the system user `mns-connector`, generates
   the key (`/etc/mnscloud-access-connector/key.pkcs8`, 0600, owner `mns-connector`), claims, writes
@@ -479,7 +489,7 @@ upstream, WebSocket upgrade and a read timeout above 75 s). Text handshake, then
    `2kJt7jDaV6-w8EzMom7VZhtkezpjEZyGNlaonk091NrmAGBdbqEZJGD41GAHWbsMSX7DY2I_8P7oWXle0vhKAw`.
 3. gateway: `GET /access/runtime/connectors/:uuid` (section 10), verifies, `POST .../attach`, answers
    `{"t":"ready","maxStreams":<capacity>,"window":262144}`. Close codes: 4401 not authenticated, 4400
-   protocol violation, 4408 handshake timeout (10 s), 4409 replaced by a newer tunnel, 4503 attach
+   protocol violation, 4408 handshake timeout (3 s), 4429 busy (per-source and global handshake caps; the source is `X-Real-IP` / the last `X-Forwarded-For` entry set by the edge), 4409 replaced by a newer tunnel, 4503 attach
    refused or gateway shutdown. One tunnel per connector; a newly authenticated one replaces the old.
    The gateway calls `detach` when its tunnel closes (not when it was replaced).
 
@@ -499,8 +509,9 @@ Binary frames: `[type u8][stream u32 big endian][payload]`, whole frame <= 65536
 Only the gateway sends OPEN; a connector that does, any unknown type, an oversized frame, DATA beyond
 the granted window or credit above 256 KiB ends the tunnel. Every stream starts with a 256 KiB
 window per direction; a receiver returns credit as it consumes data. At most `maxStreams` (the
-gateway capacity) streams per tunnel (the connector itself allows 64). Idle ping every 20 s; a
-tunnel without any frame for 60 s is dead. OPEN_FAIL codes: `destination_refused`, `not_allowed`
+gateway capacity) streams per tunnel (the connector itself allows 64). Idle ping every 20 s (answered with at most one PONG per 2 s); a
+tunnel without any frame for 60 s is dead, and one whose socket buffers more than 2 MiB is closed.
+Empty DATA frames and more than 256 queued chunks per stream are protocol violations. OPEN_FAIL codes: `destination_refused`, `not_allowed`
 (outside `allowedCidrs`), `protocol_refused`, `invalid_address`, `invalid_port`, `invalid_open`,
 `api_refused` (4xx from `accept`), `api_unavailable`, `connect_failed`, `connect_timeout` (10 s),
 `too_many_streams`.
@@ -512,8 +523,11 @@ credit flow control. It never executes commands and never listens on a port.
 
 On the gateway the worker of a `transport: connector` connection has no network: systemd
 `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, and Deno permissions
-only for one controller-owned unix socket (`--allow-net=unix:<socket>`); the controller pipes that
-socket to the tunnel stream. The stream ends inside the worker's own SSH/TLS client: host key
+only for one controller-owned unix socket (`--allow-net=unix:<socket>`); `/run` is an empty tmpfs
+in the unit with only that socket bound in under a fixed name, D-Bus and systemd paths are
+inaccessible, and the worker must present a per-session secret (sent on its stdin, never argv)
+before the controller pipes the socket to the tunnel stream. The stream ends inside the worker's own SSH/TLS client: host key
 pinning, redaction, recording and command policy are unchanged. The gateway finishes a connector
 connection with `connector_offline` (state `failed`) when no tunnel is attached, or with the OPEN_FAIL
-code of the connector (`refused` for the refusal codes, `failed` for the others).
+code of the connector (`refused` for the refusal codes, `failed` for the others; any code outside the fixed list is
+reported as `connector_open_failed`).

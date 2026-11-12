@@ -19,6 +19,7 @@ import { fingerprintOf, generateHostKey, PASSWORD, startDevice } from './hostile
 const ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const SEED = Uint8Array.from({ length: 32 }, (_, i) => i);
 const PUBLIC_KEY = 'A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg';
+const FINGERPRINT = 'SHA256:Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw=';
 const CONNECTOR = '11111111-2222-4333-8444-555555555555';
 
 // A tenant LAN device: the test dials the local fake device in its place.
@@ -133,6 +134,7 @@ Deno.test({
       path: 'connector',
       transport: 'connector',
       connectorUuid: CONNECTOR,
+      connectorKeyFingerprint: FINGERPRINT,
       username: 'support',
       hostKey: { pinned: fingerprintOf(key) },
     };

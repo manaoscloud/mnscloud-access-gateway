@@ -54,7 +54,11 @@ export function validateInit(value: unknown): WorkerInit {
     ['n1', 'n2', 'n3'].includes(v.level) && v.terminal && v.limits;
   if (!ok) throw new WorkerExit('refused', 'invalid_assignment');
   if (REFUSED_PORTS.has(v.target.port)) throw new WorkerExit('refused', 'protocol_refused');
-  if (v.transport === 'connector' ? !validBridgePath(v.bridge) : v.bridge !== undefined) {
+  if (
+    v.transport === 'connector'
+      ? !validBridgePath(v.bridge) || !/^[0-9a-f]{64}$/.test(String(v.bridgeSecret))
+      : v.bridge !== undefined || v.bridgeSecret !== undefined
+  ) {
     throw new WorkerExit('refused', 'invalid_assignment');
   }
   if (v.protocol === 'routeros_api' && v.mode !== 'test') {
@@ -243,7 +247,9 @@ async function routerOsTest(init: WorkerInit, h: Helpers): Promise<Exit> {
       init.target.address,
       init.target.port,
       init.limits.connectTimeoutSeconds * 1000,
-      init.transport === 'connector' ? init.bridge : undefined,
+      init.transport === 'connector'
+        ? { path: init.bridge!, secret: init.bridgeSecret! }
+        : undefined,
     );
     api = new RouterOsApi(connection.transport);
     if (!(await h.verifyKey('tls', 'x509', connection.pin, init.tls.pinned))) {
@@ -456,6 +462,8 @@ function sshSession(init: WorkerInit, h: SshHelpers): Promise<Exit> {
     if (init.transport === 'connector') {
       sock = net.createConnection({ path: init.bridge! });
       sock.on('error', () => {});
+      // Proves to the controller that this is the session's worker (queued before any SSH byte).
+      sock.write(init.bridgeSecret!);
     }
     client.connect({
       ...(sock ? { sock } : {}),

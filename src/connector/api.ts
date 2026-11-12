@@ -48,7 +48,13 @@ export class ConnectorApi {
     private readonly now: () => number = Date.now,
   ) {}
 
-  async call<T>(method: string, route: string, body?: unknown, timeoutMs = 20000): Promise<T> {
+  async call<T>(
+    method: string,
+    route: string,
+    body?: unknown,
+    timeoutMs = 20000,
+    cancel?: AbortSignal,
+  ): Promise<T> {
     const url = new URL(this.apiUrl + route);
     const payload = body === undefined
       ? new Uint8Array(0)
@@ -72,7 +78,9 @@ export class ConnectorApi {
       },
       body: body === undefined ? undefined : payload as Uint8Array<ArrayBuffer>,
       redirect: 'manual',
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: cancel
+        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), cancel])
+        : AbortSignal.timeout(timeoutMs),
     });
     const bytes = new Uint8Array(await response.arrayBuffer());
     if (response.status >= 300 && response.status < 400) throw new ApiRejected(response.status);
@@ -96,11 +104,22 @@ export class ConnectorApi {
   }
 
   /** True only when the API confirms this exact connection for this connector. */
-  async accept(connectionUuid: string, destination: string, port: number): Promise<boolean> {
-    await this.call('POST', `/access/connector/connections/${connectionUuid}/accept`, {
-      destination,
-      port,
-    });
+  async accept(
+    connectionUuid: string,
+    destination: string,
+    port: number,
+    cancel?: AbortSignal,
+  ): Promise<boolean> {
+    await this.call(
+      'POST',
+      `/access/connector/connections/${connectionUuid}/accept`,
+      {
+        destination,
+        port,
+      },
+      8000,
+      cancel,
+    );
     return true;
   }
 }

@@ -122,7 +122,7 @@ async function run() {
             allowedCidrs: remote.allowedCidrs,
             ownAddresses: ownAddressesOf(Deno.networkInterfaces()),
           }),
-          accept: (uuid, host, port) => api.accept(uuid, host, port),
+          accept: (uuid, host, port, signal) => api.accept(uuid, host, port, signal),
           connect: dialWithTimeout,
           log,
         });

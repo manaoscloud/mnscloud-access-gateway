@@ -9,13 +9,25 @@ import { checkConnectorDestination, type DestinationPolicy } from '../shared/des
 import { type Mux, type OpenSpec, type TunnelStream } from '../shared/tunnel.ts';
 
 export const CONNECT_TIMEOUT_MS = 10000;
+/** accept + connect (8 s + 10 s) stay under the gateway's 20 s open timeout. */
+export const ACCEPT_TIMEOUT_MS = 8000;
 
 export interface OpenDeps {
   /** Current policy (tenant allowed networks and this host's addresses). */
   policy(): DestinationPolicy;
   /** True when the API accepted this connection; throws or returns false otherwise. */
-  accept(connectionUuid: string, host: string, port: number): Promise<boolean>;
-  connect(host: string, port: number, timeoutMs: number): Promise<Deno.Conn>;
+  accept(
+    connectionUuid: string,
+    host: string,
+    port: number,
+    signal: AbortSignal,
+  ): Promise<boolean>;
+  connect(
+    host: string,
+    port: number,
+    timeoutMs: number,
+    signal: AbortSignal,
+  ): Promise<Deno.Conn>;
   log(message: string): void;
 }
 
@@ -23,11 +35,18 @@ export async function dialWithTimeout(
   host: string,
   port: number,
   timeoutMs = CONNECT_TIMEOUT_MS,
+  cancel?: AbortSignal,
 ): Promise<Deno.Conn> {
-  const signal = AbortSignal.timeout(timeoutMs);
+  const signal = cancel
+    ? AbortSignal.any([AbortSignal.timeout(timeoutMs), cancel])
+    : AbortSignal.timeout(timeoutMs);
   const connection = Deno.connect({ hostname: host, port, transport: 'tcp' });
   const timeout = new Promise<never>((_, reject) => {
-    signal.addEventListener('abort', () => reject(new Error('connect_timeout')), { once: true });
+    signal.addEventListener(
+      'abort',
+      () => reject(new Error(cancel?.aborted ? 'cancelled' : 'connect_timeout')),
+      { once: true },
+    );
   });
   try {
     return await Promise.race([connection, timeout]);
@@ -69,14 +88,22 @@ export async function handleOpen(mux: Mux, id: number, spec: OpenSpec, deps: Ope
     deps.log(`stream ${id} refused: ${code}`);
     mux.rejectOpen(id, code);
   };
+  // Aborted when the gateway gave up (CLOSE) or the tunnel died: nothing may stay open for it.
+  const signal = mux.openSignal(id);
+  if (!signal) return;
   if (!UUID.test(spec.connectionUuid)) return refuse('invalid_open');
   const verdict = checkConnectorDestination(spec.host, spec.port, deps.policy());
   if (verdict) return refuse(verdict);
   try {
-    if (!(await deps.accept(spec.connectionUuid, spec.host, spec.port))) {
-      return refuse('api_refused');
-    }
+    const accepted = await deps.accept(
+      spec.connectionUuid,
+      spec.host,
+      spec.port,
+      AbortSignal.any([signal, AbortSignal.timeout(ACCEPT_TIMEOUT_MS)]),
+    );
+    if (!accepted) return refuse('api_refused');
   } catch (error) {
+    if (signal.aborted) return;
     const status = (error as { status?: number }).status;
     return refuse(
       typeof status === 'number' && status >= 400 && status < 500 && status !== 429
@@ -84,14 +111,23 @@ export async function handleOpen(mux: Mux, id: number, spec: OpenSpec, deps: Ope
         : 'api_unavailable',
     );
   }
+  if (signal.aborted) return;
   let conn: Deno.Conn;
   try {
-    conn = await deps.connect(spec.host, spec.port, CONNECT_TIMEOUT_MS);
+    conn = await deps.connect(spec.host, spec.port, CONNECT_TIMEOUT_MS, signal);
   } catch (error) {
+    if (signal.aborted) return;
     return refuse(
       (error as Error).message === 'connect_timeout' ? 'connect_timeout' : 'connect_failed',
     );
   }
-  const stream = mux.acceptOpen(id);
+  const stream = signal.aborted ? null : mux.acceptOpen(id);
+  if (!stream) {
+    // The gateway gave up while we were dialing: do not keep the device connection.
+    try {
+      conn.close();
+    } catch { /* closed */ }
+    return;
+  }
   await pipe(conn, stream);
 }

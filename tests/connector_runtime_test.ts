@@ -10,7 +10,14 @@ import {
   parseAllowedCidrs,
   reportedAddresses,
 } from '../src/shared/destination.ts';
-import { decodeFrame, encodeFrame, FrameType, Mux, type OpenSpec } from '../src/shared/tunnel.ts';
+import {
+  decodeFrame,
+  encodeFrame,
+  encodeOpen,
+  FrameType,
+  Mux,
+  type OpenSpec,
+} from '../src/shared/tunnel.ts';
 import { assert, assertEquals, assertMatch } from './assert.ts';
 
 const UUID = '0b793486-b265-4564-9bfd-df227704d8f9';
@@ -97,6 +104,7 @@ class Harness {
     deps: { accept?: boolean | 'error'; policy?: DestinationPolicy } = {},
   ) {
     const full = { connectionUuid: UUID, host: '10.20.30.40', port: 22, ...spec };
+    this.mux.receive(encodeFrame(FrameType.OPEN, 1, encodeOpen(full)));
     return handleOpen(this.mux, 1, full, {
       policy: () => deps.policy ?? policy,
       accept: (uuid, host, port) => {
@@ -171,7 +179,9 @@ Deno.test('open: a confirmed connection is piped to the device', async () => {
     }
   })();
   const h = new Harness();
-  const done = handleOpen(h.mux, 3, { connectionUuid: UUID, host: '10.20.30.40', port: 22 }, {
+  const spec = { connectionUuid: UUID, host: '10.20.30.40', port: 22 };
+  h.mux.receive(encodeFrame(FrameType.OPEN, 3, encodeOpen(spec)));
+  const done = handleOpen(h.mux, 3, spec, {
     policy: () => policy,
     accept: () => Promise.resolve(true),
     connect: () => Deno.connect({ hostname: '127.0.0.1', port: (echo.addr as Deno.NetAddr).port }),

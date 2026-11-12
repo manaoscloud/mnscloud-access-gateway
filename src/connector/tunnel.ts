@@ -80,6 +80,7 @@ export function runTunnel(options: TunnelOptions, signal: AbortSignal): Promise<
         mux = new Mux({
           role: 'connector',
           send: (bytes) => socket.send(bytes),
+          bufferedAmount: () => socket.bufferedAmount,
           onFatal: (reason) => {
             options.log(`tunnel protocol error: ${reason}`);
             finish();

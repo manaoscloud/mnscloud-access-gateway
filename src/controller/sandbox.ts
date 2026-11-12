@@ -8,6 +8,8 @@ import { validBridgePath } from '../shared/ipc.ts';
 import type { SessionNet, SessionTarget } from './netns.ts';
 
 export const UNIT_PREFIX = 'mnscloud-access-gateway-session-';
+/** Where the bridge socket appears inside a connector worker's unit (the real name stays hidden). */
+export const BRIDGE_IN_UNIT = '/run/bridge.sock';
 export const DENO_BIN = '/usr/local/bin/deno';
 
 export interface SandboxLimits {
@@ -157,9 +159,15 @@ export function renderConnectorSystemdRun(
 ): string[] {
   if (!/^[0-9a-f]{8}$/.test(id)) throw new Error('Invalid session id');
   if (!validBridgePath(bridge)) throw new Error('Invalid bridge path');
+  // /run is replaced by an empty tmpfs: the worker sees neither D-Bus, journald, systemd's transient
+  // unit files nor other sessions' bridges. Only its own socket is bound in, under a fixed name, so
+  // neither argv nor unit properties readable from inside carry the real path.
   return systemdRun(`${UNIT_PREFIX}${id}`, [
     'PrivateNetwork=yes',
     'RestrictAddressFamilies=AF_UNIX',
+    'TemporaryFileSystem=/run:ro',
+    `BindPaths=${bridge}:${BRIDGE_IN_UNIT}`,
+    'InaccessiblePaths=-/run/dbus -/run/systemd',
     ...sandboxProperties(runtimeRoot, limits),
-  ], workerDenoArgs(runtimeRoot, target, limits.memoryMaxMB, bridge));
+  ], workerDenoArgs(runtimeRoot, target, limits.memoryMaxMB, BRIDGE_IN_UNIT));
 }

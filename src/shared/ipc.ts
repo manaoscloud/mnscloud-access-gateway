@@ -23,6 +23,8 @@ export interface WorkerInit {
   /** `connector`: connect to the unix socket `bridge` instead of the network. */
   transport?: 'direct' | 'connector';
   bridge?: string;
+  /** 64 hex characters the worker writes first on the bridge socket. */
+  bridgeSecret?: string;
   shellDialect: ShellDialect;
   username: string;
   level: SupportLevel;

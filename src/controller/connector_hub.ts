@@ -7,9 +7,17 @@
 //   gateway fetches the public key from the API (host Agent identity), verifies, calls attach
 //   gateway -> {"t":"ready","maxStreams":<n>,"window":262144}
 // Afterwards only binary frames (src/shared/tunnel.ts). One tunnel per connector: a newly
-// authenticated tunnel replaces the old one. Only this side opens streams.
+// authenticated tunnel replaces the old one. Only this side opens streams. The verified public key
+// is kept with the tunnel and re-checked every minute: a disabled, deleted or re-installed
+// connector loses its tunnel.
 
-import { b64urlEncode, tunnelSigningString, verifyText } from '../shared/connector_auth.ts';
+import {
+  b64urlEncode,
+  publicKeyFingerprint,
+  tunnelSigningString,
+  verifyText,
+} from '../shared/connector_auth.ts';
+import { parseAddress } from '../shared/ip.ts';
 import {
   INITIAL_WINDOW,
   Mux,
@@ -29,6 +37,7 @@ export interface ConnectorRuntimeApi {
 export interface HubSocket {
   readyState: number;
   binaryType: string;
+  bufferedAmount?: number;
   send(data: string | Uint8Array): void;
   close(code?: number, reason?: string): void;
   onopen: ((event: Event) => void) | null;
@@ -43,21 +52,45 @@ export interface HubOptions {
   /** Current capacity of the gateway (maximum streams per tunnel). */
   maxStreams(): number;
   log(message: string): void;
+  /** Time an unauthenticated socket may take to present a valid hello (default 3 s). */
   handshakeTimeoutMs?: number;
+  /** How often an attached tunnel's key is verified again (default 60 s). */
+  recheckMs?: number;
 }
 
 interface Tunnel {
   uuid: string;
   socket: HubSocket;
   mux: Mux;
+  publicKey: string;
+  fingerprint: string;
+  recheck: ReturnType<typeof setInterval> | null;
 }
 
 const MAX_PENDING_HANDSHAKES = 32;
+const MAX_PENDING_PER_SOURCE = 4;
+const MAX_KEY_LOOKUPS = 8;
 const MAX_HELLO_BYTES = 1024;
+
+/**
+ * Client address the trusted edge saw: `X-Real-IP`, else the last `X-Forwarded-For` entry (the one
+ * the edge appended), else the socket peer. Only called for requests that already passed the
+ * edge-source check, so the headers come from our own nginx.
+ */
+export function sourceOf(request: Request, remote: string): string {
+  const real = request.headers.get('x-real-ip')?.trim();
+  if (real && parseAddress(real)) return parseAddress(real)!.text;
+  const forwarded = request.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim();
+  if (forwarded && parseAddress(forwarded)) return parseAddress(forwarded)!.text;
+  return remote;
+}
 
 export class ConnectorHub {
   readonly tunnels = new Map<string, Tunnel>();
   #pending = 0;
+  #lookups = 0;
+  #bySource = new Map<string, number>();
+  #chains = new Map<string, Promise<void>>();
   #draining = false;
 
   constructor(private readonly options: HubOptions) {}
@@ -70,37 +103,61 @@ export class ConnectorHub {
     return this.tunnels.has(connectorUuid);
   }
 
+  /** Fingerprint of the key the attached tunnel authenticated with. */
+  fingerprintOf(connectorUuid: string): string | null {
+    return this.tunnels.get(connectorUuid)?.fingerprint ?? null;
+  }
+
   /** HTTP side: upgrades the request and runs the handshake. */
-  handleUpgrade(request: Request): Response {
+  handleUpgrade(request: Request, remote = 'unknown'): Response {
     if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('WebSocket required', { status: 426 });
     }
-    if (this.#draining || this.#pending >= MAX_PENDING_HANDSHAKES) {
+    const source = sourceOf(request, remote);
+    if (
+      this.#draining || this.#pending >= MAX_PENDING_HANDSHAKES ||
+      (this.#bySource.get(source) ?? 0) >= MAX_PENDING_PER_SOURCE
+    ) {
       return new Response('Busy', { status: 503 });
     }
     const { socket, response } = Deno.upgradeWebSocket(request, { idleTimeout: 60 });
-    this.attach(socket as unknown as HubSocket);
+    this.attach(socket as unknown as HubSocket, source);
     return response;
   }
 
+  /** Serializes API attach/detach calls of one connector. */
+  #serial<T>(uuid: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.#chains.get(uuid) ?? Promise.resolve();
+    const run = previous.then(fn, fn);
+    const tail = run.then(() => {}, () => {});
+    this.#chains.set(uuid, tail);
+    void tail.then(() => {
+      if (this.#chains.get(uuid) === tail) this.#chains.delete(uuid);
+    });
+    return run;
+  }
+
   /** Runs the handshake and then the multiplexer on one accepted socket. */
-  attach(socket: HubSocket) {
+  attach(socket: HubSocket, source = 'unknown') {
     socket.binaryType = 'arraybuffer';
     const challenge = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
     let state: 'hello' | 'verifying' | 'ready' | 'closed' = 'hello';
-    let tunnel: Tunnel | null = null;
     const isClosed = () => state === 'closed';
+    let tunnel: Tunnel | null = null;
     this.#pending++;
+    this.#bySource.set(source, (this.#bySource.get(source) ?? 0) + 1);
     let counted = true;
     const settle = () => {
-      if (counted) {
-        counted = false;
-        this.#pending--;
-      }
+      if (!counted) return;
+      counted = false;
+      this.#pending--;
+      const left = (this.#bySource.get(source) ?? 1) - 1;
+      if (left <= 0) this.#bySource.delete(source);
+      else this.#bySource.set(source, left);
     };
     const timer = setTimeout(() => {
       if (state !== 'ready') fail(4408, 'handshake_timeout');
-    }, this.options.handshakeTimeoutMs ?? 10000);
+    }, this.options.handshakeTimeoutMs ?? 3000);
 
     const fail = (code: number, reason: string) => {
       if (state === 'closed') return;
@@ -113,15 +170,15 @@ export class ConnectorHub {
       if (tunnel) this.#drop(tunnel);
     };
 
-    const sendHello = () => {
+    const sendChallenge = () => {
       try {
         socket.send(JSON.stringify({ t: 'challenge', challenge }));
       } catch {
         fail(4500, 'send_failed');
       }
     };
-    if (socket.readyState === 1) sendHello();
-    else socket.onopen = () => sendHello();
+    if (socket.readyState === 1) sendChallenge();
+    else socket.onopen = () => sendChallenge();
 
     socket.onclose = () => {
       state = 'closed';
@@ -141,25 +198,27 @@ export class ConnectorHub {
         return fail(4400, 'protocol_error');
       }
       state = 'verifying';
-      void this.#verify(event.data, challenge).then(async (uuid) => {
+      void this.#verify(event.data, challenge).then(async (verified) => {
         if (isClosed()) return;
-        if (!uuid) return fail(4401, 'unauthorized');
-        const candidate = this.#buildTunnel(uuid, socket, fail);
+        if (verified === 'busy') return fail(4429, 'busy');
+        if (!verified) return fail(4401, 'unauthorized');
+        const candidate = this.#buildTunnel(verified, socket, fail);
         try {
-          await this.options.api.connectorAttach(uuid);
+          await this.#serial(verified.uuid, async () => {
+            await this.options.api.connectorAttach(verified.uuid);
+            if (isClosed()) return;
+            const previous = this.tunnels.get(verified.uuid);
+            this.tunnels.set(verified.uuid, candidate);
+            if (previous) this.#closeTunnel(previous, 4409, 'replaced');
+          });
         } catch (error) {
           this.options.log(`connector attach refused: ${(error as Error).message}`);
           candidate.mux.close('attach_failed');
           return fail(4503, 'attach_failed');
         }
         if (isClosed()) {
-          await this.options.api.connectorDetach(uuid).catch(() => {});
+          this.#detachIfAbsent(verified.uuid);
           return;
-        }
-        const previous = this.tunnels.get(uuid);
-        this.tunnels.set(uuid, candidate);
-        if (previous) {
-          this.#closeTunnel(previous, 4409, 'replaced');
         }
         tunnel = candidate;
         state = 'ready';
@@ -171,25 +230,48 @@ export class ConnectorHub {
           window: INITIAL_WINDOW,
         }));
         candidate.mux.startKeepalive();
+        candidate.recheck = setInterval(
+          () => void this.#recheck(candidate, fail),
+          this.options.recheckMs ?? 60000,
+        );
       }).catch(() => fail(4401, 'unauthorized'));
     };
   }
 
   #buildTunnel(
-    uuid: string,
+    verified: { uuid: string; publicKey: string; fingerprint: string },
     socket: HubSocket,
     fail: (code: number, reason: string) => void,
   ): Tunnel {
     const mux = new Mux({
       role: 'gateway',
       send: (bytes) => socket.send(bytes),
+      bufferedAmount: () => socket.bufferedAmount ?? 0,
       onFatal: (reason) => fail(4400, reason.slice(0, 100)),
       maxStreams: this.options.maxStreams(),
     });
-    return { uuid, socket, mux };
+    return { ...verified, socket, mux, recheck: null };
   }
 
-  async #verify(raw: string, challenge: string): Promise<string | null> {
+  /** The key of an attached tunnel must still be the connector's current, active key. */
+  async #recheck(tunnel: Tunnel, fail: (code: number, reason: string) => void) {
+    let record: { publicKey: string } | null;
+    try {
+      record = await this.options.api.connector(tunnel.uuid);
+    } catch {
+      return; // transient API failure: keep the tunnel, the next check decides
+    }
+    if (this.tunnels.get(tunnel.uuid) !== tunnel) return;
+    if (!record || record.publicKey !== tunnel.publicKey) {
+      this.options.log('connector key no longer valid: closing its tunnel');
+      fail(4401, 'key_changed');
+    }
+  }
+
+  async #verify(
+    raw: string,
+    challenge: string,
+  ): Promise<{ uuid: string; publicKey: string; fingerprint: string } | 'busy' | null> {
     if (raw.length > MAX_HELLO_BYTES) return null;
     let hello: { t?: unknown; connectorUuid?: unknown; signature?: unknown };
     try {
@@ -202,11 +284,16 @@ export class ConnectorHub {
       !UUID.test(hello.connectorUuid) || typeof hello.signature !== 'string' ||
       hello.signature.length > 128
     ) return null;
+    // Bounded key lookups: unauthenticated sockets cannot flood the API.
+    if (this.#lookups >= MAX_KEY_LOOKUPS) return 'busy';
+    this.#lookups++;
     let record: { publicKey: string } | null;
     try {
       record = await this.options.api.connector(hello.connectorUuid);
     } catch {
       return null;
+    } finally {
+      this.#lookups--;
     }
     if (!record) return null;
     const ok = await verifyText(
@@ -214,30 +301,53 @@ export class ConnectorHub {
       tunnelSigningString(this.options.gatewayKey, challenge),
       hello.signature,
     );
-    return ok ? hello.connectorUuid : null;
+    if (!ok) return null;
+    return {
+      uuid: hello.connectorUuid,
+      publicKey: record.publicKey,
+      fingerprint: await publicKeyFingerprint(record.publicKey),
+    };
   }
 
   /** A tunnel ended (closed socket or protocol failure): detach it unless it was replaced. */
   #drop(tunnel: Tunnel) {
+    if (tunnel.recheck) clearInterval(tunnel.recheck);
     tunnel.mux.close('tunnel_closed');
     if (this.tunnels.get(tunnel.uuid) !== tunnel) return;
     this.tunnels.delete(tunnel.uuid);
-    void this.options.api.connectorDetach(tunnel.uuid).catch((error) =>
-      this.options.log(`connector detach failed: ${(error as Error).message}`)
-    );
+    this.#detachIfAbsent(tunnel.uuid);
+  }
+
+  /** Detaches only when, at the moment it runs, no tunnel of that connector is attached. */
+  #detachIfAbsent(uuid: string) {
+    void this.#serial(uuid, async () => {
+      if (this.tunnels.has(uuid)) return;
+      await this.options.api.connectorDetach(uuid);
+    }).catch((error) => this.options.log(`connector detach failed: ${(error as Error).message}`));
   }
 
   #closeTunnel(tunnel: Tunnel, code: number, reason: string) {
+    if (tunnel.recheck) clearInterval(tunnel.recheck);
     tunnel.mux.close(reason);
     try {
       tunnel.socket.close(code, reason);
     } catch { /* closed */ }
   }
 
-  /** Opens one stream to `host:port` through the connector's tunnel. */
-  async open(connectorUuid: string, spec: OpenSpec): Promise<TunnelStream> {
+  /**
+   * Opens one stream to `host:port` through the connector's tunnel. `fingerprint` is the key
+   * fingerprint the API put in the assignment: a tunnel authenticated with another key is refused.
+   */
+  async open(
+    connectorUuid: string,
+    spec: OpenSpec,
+    fingerprint?: string | null,
+  ): Promise<TunnelStream> {
     const tunnel = this.tunnels.get(connectorUuid);
     if (!tunnel) throw new OpenError('connector_offline');
+    if (fingerprint !== undefined && fingerprint !== tunnel.fingerprint) {
+      throw new OpenError('connector_key_mismatch');
+    }
     return await tunnel.mux.open(spec);
   }
 

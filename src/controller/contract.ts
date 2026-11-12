@@ -28,6 +28,8 @@ export interface Assignment {
   /** `connector`: the worker has no network; the stream goes through the tenant connector. */
   transport: 'direct' | 'connector';
   connectorUuid: string | null;
+  /** Fingerprint of the connector key the API expects (`SHA256:` + base64); null for direct. */
+  connectorKeyFingerprint: string | null;
   target: { address: string; port: number };
   shellDialect: ShellDialect;
   username: string;
@@ -183,6 +185,12 @@ export function parseAssignment(value: unknown): Assignment {
   if (transport === 'connector' && !UUID.test(String(v.connectorUuid))) {
     throw new ContractError('Invalid connectorUuid');
   }
+  if (
+    transport === 'connector' &&
+    !/^SHA256:[A-Za-z0-9+/]{43}=$/.test(String(v.connectorKeyFingerprint))
+  ) {
+    throw new ContractError('Invalid connectorKeyFingerprint');
+  }
   const address = parseAddress(v.target?.address);
   if (!address) throw new ContractError('Invalid target address');
   if (!DIALECTS.includes(v.shellDialect)) throw new ContractError('Invalid shellDialect');
@@ -210,6 +218,7 @@ export function parseAssignment(value: unknown): Assignment {
     path,
     transport,
     connectorUuid: transport === 'connector' ? v.connectorUuid : null,
+    connectorKeyFingerprint: transport === 'connector' ? v.connectorKeyFingerprint : null,
     target: { address: address.text, port: int(v.target.port, 1, 65535, 'port') },
     shellDialect: v.shellDialect,
     username: v.username,

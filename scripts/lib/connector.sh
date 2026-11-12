@@ -14,6 +14,7 @@ CONNECTOR_CACHE_DIR="/var/cache/mnscloud-access-connector"
 CONNECTOR_ROOT_CACHE_DIR="/var/cache/mnscloud-access-connector-root"
 CONNECTOR_REPO="https://github.com/manaoscloud/mnscloud-access-gateway.git"
 RUNTIME_KIT_REF="v0.1.76"
+RUNTIME_KIT_COMMIT="3ca5ae172bb1e2ec5ebe78e725a25fdd35903540"
 RUNTIME_KIT_DIR="/opt/mnscloud-access-connector-runtime-kit"
 DENO_BIN="/usr/local/bin/deno"
 clog() { printf '[mnscloud-access-connector] %s\n' "$*"; }
@@ -41,7 +42,8 @@ connector_ensure_deno() {
  if [[ ! -x "$DENO_BIN" ]]; then
   if [[ ! -d "$RUNTIME_KIT_DIR/.git" ]]; then git clone -q https://github.com/manaoscloud/mnscloud-runtime-kit.git "$RUNTIME_KIT_DIR"; fi
   git -C "$RUNTIME_KIT_DIR" fetch -q origin tag "$RUNTIME_KIT_REF"
-  git -C "$RUNTIME_KIT_DIR" checkout -q --detach "$RUNTIME_KIT_REF"
+  [[ "$(git -C "$RUNTIME_KIT_DIR" rev-parse "refs/tags/$RUNTIME_KIT_REF^{commit}")" == "$RUNTIME_KIT_COMMIT" ]] || cdie 'runtime-kit release does not match the pinned commit; refusing'
+  git -C "$RUNTIME_KIT_DIR" checkout -q --detach "$RUNTIME_KIT_COMMIT"
   bash "$RUNTIME_KIT_DIR/scripts/install-tool.sh" --tool deno
  fi
  [[ -x "$DENO_BIN" ]] || cdie 'Deno is not installed'
@@ -59,15 +61,25 @@ connector_check_runtime() {
   "--config=$CONNECTOR_APP_DIR/deno.json" "$CONNECTOR_APP_DIR/src/connector/main.ts" >/dev/null
 }
 
-# Checks out an exact release: the tag must exist and resolve to the expected commit.
-connector_checkout() {
- local tag="$1" commit="$2" actual
+# Fetches an exact release and verifies it without touching the working tree: the tag must exist,
+# resolve to the expected commit and not be older than the running VERSION (no downgrade).
+connector_verify_release() {
+ local tag="$1" commit="$2" actual current target
  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || cdie 'invalid release tag'
  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || cdie 'invalid release commit'
  git -C "$CONNECTOR_APP_DIR" fetch -q --force origin "refs/tags/$tag:refs/tags/$tag"
  actual="$(git -C "$CONNECTOR_APP_DIR" rev-parse "refs/tags/$tag^{commit}")"
  [[ "$actual" == "$commit" ]] || cdie "release $tag does not match the expected commit; refusing"
- git -C "$CONNECTOR_APP_DIR" checkout -q --detach "$commit"
+ current="$(tr -d '[:space:]' < "$CONNECTOR_APP_DIR/VERSION")"
+ target="$(git -C "$CONNECTOR_APP_DIR" show "$commit:VERSION" | tr -d '[:space:]')"
+ [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || cdie 'invalid VERSION'
+ [[ "$(printf '%s\n%s\n' "$current" "$target" | sort -V | head -n 1)" == "$current" ]] || cdie "release $tag is older than the running $current; refusing a downgrade"
+}
+
+# Checks out an exact release (verify first: connector_verify_release).
+connector_checkout() {
+ connector_verify_release "$1" "$2"
+ git -C "$CONNECTOR_APP_DIR" checkout -q --detach "$2"
 }
 
 # Unprivileged service plus the root update oneshot and its timer.
@@ -105,6 +117,10 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# OS-level second layer behind the destination checks: never loopback, link-local or multicast
+# (the local resolver stub stays reachable for DNS).
+IPAddressDeny=localhost link-local multicast
+IPAddressAllow=127.0.0.53 127.0.0.54
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

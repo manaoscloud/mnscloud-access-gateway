@@ -5,6 +5,7 @@ import { encodeMessage, readMessages } from '../shared/ipc.ts';
 import type { ControllerToWorker } from '../shared/ipc.ts';
 import type { SessionNet, SessionTarget } from './netns.ts';
 import {
+  BRIDGE_IN_UNIT,
   renderConnectorSystemdRun,
   renderSystemdRun,
   type SandboxLimits,
@@ -18,6 +19,8 @@ export interface WorkerHandle {
   send(message: ControllerToWorker): void;
   messages: AsyncIterable<unknown>;
   kill(): Promise<void>;
+  /** Path of the bridge socket as the worker sees it (differs from the host path under systemd). */
+  bridgePath?: string;
   exited: Promise<number>;
 }
 
@@ -72,7 +75,7 @@ export class SystemdLauncher implements WorkerLauncher {
       stdout: 'piped',
       stderr: 'null',
     }).spawn();
-    return Promise.resolve(wrap(child, async () => {
+    const handle = wrap(child, async () => {
       await new Deno.Command('systemctl', {
         args: ['kill', '--signal=KILL', `${unit}.service`],
         stdout: 'null',
@@ -82,7 +85,9 @@ export class SystemdLauncher implements WorkerLauncher {
       try {
         child.kill('SIGKILL');
       } catch { /* gone */ }
-    }));
+    });
+    if (bridge) handle.bridgePath = BRIDGE_IN_UNIT;
+    return Promise.resolve(handle);
   }
 }
 

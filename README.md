@@ -95,7 +95,7 @@ gateway the platform assigned to it, and the gateway reaches the device through 
   no network at all).
 - **Install**: in the App, **Rede › Conectores**, create the connector and use **Instalar**. The
   command downloads `scripts/install-connector.sh` of an approved release, checks its SHA-256 and
-  runs it with a single-use token (24 h) in the environment. The service runs as the unprivileged
+  runs it with a single-use token (24 h) piped on stdin (never in the environment or a command line). The service runs as the unprivileged
   `mns-connector` user (`NoNewPrivileges`, `ProtectSystem=strict`, no capabilities); a root timer
   applies the release the platform announces (the tag must resolve to the announced commit; a release
   that does not start is rolled back).

@@ -31,6 +31,12 @@ export const INITIAL_WINDOW = 256 * 1024;
 export const PING_INTERVAL_MS = 20000;
 export const DEAD_AFTER_MS = 60000;
 export const MAX_OPEN_PAYLOAD = 1024;
+/** Chunks a reader may leave queued per stream (the window bounds the bytes, this the count). */
+export const MAX_QUEUED_CHUNKS = 256;
+/** A peer whose socket buffers more than this is not reading: the tunnel ends. */
+export const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+/** At most one PONG per interval, so PING floods cannot be reflected. */
+export const MIN_PONG_INTERVAL_MS = 2000;
 
 export class TunnelProtocolError extends Error {}
 
@@ -189,6 +195,9 @@ export class TunnelStream {
   /** Called by the multiplexer. */
   deliver(chunk: Uint8Array) {
     if (this.#closed || this.#remoteClosed) return;
+    // An empty DATA frame consumes no window: it would grow the queue without bound.
+    if (chunk.length === 0) throw new TunnelProtocolError('empty data');
+    if (this.#queue.length >= MAX_QUEUED_CHUNKS) throw new TunnelProtocolError('queue overflow');
     if (chunk.length > this.#recvWindow) throw new TunnelProtocolError('data beyond window');
     this.#recvWindow -= chunk.length;
     if (this.#readWaiter) {
@@ -227,9 +236,11 @@ export interface MuxOptions {
   role: 'gateway' | 'connector';
   /** Sends one binary frame on the WebSocket. */
   send(bytes: Uint8Array): void;
+  /** Bytes queued on the WebSocket and not yet sent (backpressure; the tunnel fails above 2 MiB). */
+  bufferedAmount?(): number;
   /** The tunnel must end (protocol violation, dead peer). */
   onFatal(reason: string): void;
-  /** Maximum concurrent streams. */
+  /** Maximum concurrent streams (accepted or in flight). */
   maxStreams: number;
   /** Connector side: the gateway opened a stream; answer with `acceptOpen` or `rejectOpen`. */
   onOpen?(id: number, spec: OpenSpec): void;
@@ -246,9 +257,12 @@ interface PendingOpen {
 export class Mux implements StreamHost {
   readonly streams = new Map<number, TunnelStream>();
   #pending = new Map<number, PendingOpen>();
+  /** Connector side: OPENs received and not yet answered (cancelled by CLOSE or tunnel death). */
+  #inflight = new Map<number, AbortController>();
   #nextId = 1;
   #lastReceived: number;
   #lastSent: number;
+  #lastPong = 0;
   #timer: ReturnType<typeof setInterval> | null = null;
   #dead = false;
 
@@ -261,8 +275,13 @@ export class Mux implements StreamHost {
     return this.options.now ? this.options.now() : Date.now();
   }
 
+  /** Streams accepted, pending (gateway) or in flight (connector). */
   get streamCount() {
-    return this.streams.size + this.#pending.size;
+    return this.streams.size + this.#inflight.size;
+  }
+
+  get dead() {
+    return this.#dead;
   }
 
   /** Starts the idle ping and the dead-peer check (call once the handshake is done). */
@@ -286,7 +305,9 @@ export class Mux implements StreamHost {
       this.options.send(encodeFrame(type, stream, payload));
     } catch {
       this.#fatal('send_failed');
+      return;
     }
+    if ((this.options.bufferedAmount?.() ?? 0) > MAX_BUFFERED_BYTES) this.#fatal('backpressure');
   }
 
   release(id: number) {
@@ -309,6 +330,8 @@ export class Mux implements StreamHost {
       pending.reject(new OpenError(reason));
       this.#pending.delete(id);
     }
+    for (const controller of this.#inflight.values()) controller.abort();
+    this.#inflight.clear();
     for (const stream of [...this.streams.values()]) stream.remoteClose();
     this.streams.clear();
   }
@@ -326,6 +349,7 @@ export class Mux implements StreamHost {
     return new Promise<TunnelStream>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
+        this.streams.delete(id);
         this.sendFrame(FrameType.CLOSE, id);
         reject(new OpenError('open_timeout'));
       }, timeoutMs);
@@ -335,8 +359,14 @@ export class Mux implements StreamHost {
     });
   }
 
-  /** Connector side: accept a stream the gateway opened. */
-  acceptOpen(id: number): TunnelStream {
+  /** Connector side: signal aborted when the gateway gave up on this OPEN or the tunnel died. */
+  openSignal(id: number): AbortSignal | null {
+    return this.#inflight.get(id)?.signal ?? null;
+  }
+
+  /** Connector side: accept a stream the gateway opened; null when it was cancelled meanwhile. */
+  acceptOpen(id: number): TunnelStream | null {
+    if (!this.#inflight.delete(id) || this.#dead) return null;
     const stream = new TunnelStream(id, this);
     this.streams.set(id, stream);
     this.sendFrame(FrameType.OPEN_OK, id);
@@ -344,6 +374,8 @@ export class Mux implements StreamHost {
   }
 
   rejectOpen(id: number, code: string) {
+    // Not in flight any more (gateway sent CLOSE, tunnel died): nobody waits for the answer.
+    if (!this.#inflight.delete(id)) return;
     this.sendFrame(FrameType.OPEN_FAIL, id, encoder.encode(JSON.stringify({ code })));
   }
 
@@ -362,24 +394,32 @@ export class Mux implements StreamHost {
     const { type, stream: id, payload } = frame;
     const gateway = this.options.role === 'gateway';
     switch (type) {
-      case FrameType.PING:
-        this.sendFrame(FrameType.PONG, 0);
+      case FrameType.PING: {
+        const now = this.#now();
+        if (now - this.#lastPong >= MIN_PONG_INTERVAL_MS) {
+          this.#lastPong = now;
+          this.sendFrame(FrameType.PONG, 0);
+        }
         return;
+      }
       case FrameType.PONG:
         return;
       case FrameType.OPEN: {
         // Only the gateway opens streams: a connector sending OPEN ends the tunnel.
         if (gateway) throw new TunnelProtocolError('open from connector');
-        if (id === 0 || this.streams.has(id)) throw new TunnelProtocolError('bad stream id');
+        if (id === 0 || this.streams.has(id) || this.#inflight.has(id)) {
+          throw new TunnelProtocolError('bad stream id');
+        }
         const spec = decodeOpen(payload);
         if (!spec) {
-          this.rejectOpen(id, 'invalid_open');
+          this.sendFrame(FrameType.OPEN_FAIL, id, encoder.encode('{"code":"invalid_open"}'));
           return;
         }
-        if (this.streams.size >= this.options.maxStreams) {
-          this.rejectOpen(id, 'too_many_streams');
+        if (this.streamCount >= this.options.maxStreams) {
+          this.sendFrame(FrameType.OPEN_FAIL, id, encoder.encode('{"code":"too_many_streams"}'));
           return;
         }
+        this.#inflight.set(id, new AbortController());
         this.options.onOpen?.(id, spec);
         return;
       }
@@ -409,9 +449,17 @@ export class Mux implements StreamHost {
         this.streams.get(id)?.addCredit(n);
         return;
       }
-      case FrameType.CLOSE:
+      case FrameType.CLOSE: {
+        // The gateway gave up on an OPEN the connector is still working on.
+        const inflight = this.#inflight.get(id);
+        if (inflight) {
+          this.#inflight.delete(id);
+          inflight.abort();
+          return;
+        }
         this.streams.get(id)?.remoteClose();
         return;
+      }
     }
   }
 }

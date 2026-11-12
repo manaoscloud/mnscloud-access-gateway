@@ -256,11 +256,16 @@ export function connectApiSsl(
   port: number,
   timeoutMs: number,
   /** Connector transport: unix socket of the controller bridge (no network). */
-  bridge?: string,
+  bridge?: { path: string; secret: string },
 ): Promise<TlsConnection> {
   return new Promise((resolve, reject) => {
+    let raw: net.Socket | undefined;
+    if (bridge) {
+      raw = net.createConnection({ path: bridge.path });
+      raw.write(bridge.secret);
+    }
     const socket = tls.connect({
-      ...(bridge ? { socket: net.createConnection({ path: bridge }) } : { host: address, port }),
+      ...(raw ? { socket: raw } : { host: address, port }),
       rejectUnauthorized: false,
       // RouterOS certificates rarely name the address; the pin replaces hostname checks.
       checkServerIdentity: () => undefined,

@@ -75,10 +75,13 @@ export interface BrowserSocket {
 /** Tunnels of the tenant connectors attached to this gateway (`ConnectorHub`). */
 export interface ConnectorTransport {
   has(connectorUuid: string): boolean;
-  open(connectorUuid: string, spec: OpenSpec): Promise<TunnelStream>;
+  open(connectorUuid: string, spec: OpenSpec, fingerprint?: string | null): Promise<TunnelStream>;
 }
 
-/** Refusals that come from the connector side rather than a failure of the path. */
+/**
+ * Finish reasons a connector may cause. The connector is outside the platform's trust boundary, so
+ * it cannot choose the reason text: anything not listed becomes `connector_open_failed`.
+ */
 const REFUSED_OPEN = new Set([
   'destination_refused',
   'not_allowed',
@@ -87,7 +90,25 @@ const REFUSED_OPEN = new Set([
   'invalid_address',
   'invalid_port',
   'invalid_open',
+  'connector_key_mismatch',
 ]);
+const FAILED_OPEN = new Set([
+  'connector_offline',
+  'api_unavailable',
+  'connect_failed',
+  'connect_timeout',
+  'open_timeout',
+  'too_many_streams',
+  'tunnel_closed',
+  'tunnel_exhausted',
+]);
+
+/** Maps an open failure to the fixed (state, reason) pair reported to the API. */
+export function openFailure(code: string): { state: 'refused' | 'failed'; reason: string } {
+  if (REFUSED_OPEN.has(code)) return { state: 'refused', reason: code };
+  if (FAILED_OPEN.has(code)) return { state: 'failed', reason: code };
+  return { state: 'failed', reason: 'connector_open_failed' };
+}
 
 export interface SessionDeps {
   api: SessionApi;
@@ -227,13 +248,14 @@ export class Session {
             connectionUuid: a.connectionUUID,
             host: a.target.address,
             port: a.target.port,
-          });
+          }, a.connectorKeyFingerprint);
         } catch (error) {
           const code = error instanceof OpenError ? error.code : 'connector_failed';
+          const failure = openFailure(code);
           await this.#finish({
             t: 'exit',
-            state: REFUSED_OPEN.has(code) ? 'refused' : 'failed',
-            reason: code,
+            state: failure.state,
+            reason: failure.reason,
             bytesIn: 0,
             bytesOut: 0,
           });
@@ -283,7 +305,13 @@ export class Session {
       mode: a.mode,
       protocol: a.protocol,
       target: a.target,
-      ...(this.#bridge ? { transport: 'connector' as const, bridge: this.#bridge.path } : {}),
+      ...(this.#bridge
+        ? {
+          transport: 'connector' as const,
+          bridge: this.#worker.bridgePath ?? this.#bridge.path,
+          bridgeSecret: this.#bridge.secret,
+        }
+        : {}),
       shellDialect: a.shellDialect,
       username: a.username,
       level: a.level,

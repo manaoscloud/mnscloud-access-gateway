@@ -13,6 +13,6 @@ rm -f /etc/systemd/system/mnscloud-access-connector.service \
  /etc/systemd/system/mnscloud-access-connector-update.service \
  /etc/systemd/system/mnscloud-access-connector-update.timer
 systemctl daemon-reload
-rm -rf "$CONNECTOR_CONF_DIR" "$CONNECTOR_APP_DIR" /var/cache/mnscloud-access-connector /var/cache/mnscloud-access-connector-root
+rm -rf "$CONNECTOR_CONF_DIR" "$CONNECTOR_APP_DIR" /opt/mnscloud-access-connector-runtime-kit /var/cache/mnscloud-access-connector /var/cache/mnscloud-access-connector-root
 if id -u "$CONNECTOR_USER" >/dev/null 2>&1; then userdel "$CONNECTOR_USER" >/dev/null 2>&1 || true; fi
 printf '[mnscloud-access-connector] removed; delete the connector in the App (Rede > Conectores) too\n'

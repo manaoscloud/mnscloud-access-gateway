@@ -9,7 +9,7 @@
   },
   "tasks": {
     "check": "deno check --frozen src tests",
-    "test": "deno test --cached-only --frozen --allow-net --allow-read --allow-write=/tmp --allow-run=deno,openssl,bash,shellcheck tests",
+    "test": "deno test --cached-only --frozen --allow-net --allow-read --allow-write=/tmp --allow-run=deno,openssl,bash,shellcheck,git tests",
     "fmt": "deno fmt",
     "lint": "deno lint"
   },
