@@ -19,15 +19,17 @@ const PASTE_END = '\x1b[201~';
 // Terminal reports: the browser terminal (xterm.js) answers device queries through the keystroke
 // channel. A report passes without tainting the line only when the device asked for it in its
 // output (RouterOS asks the cursor position several times at login); any other one still taints.
+// Patterns match what follows ESC (no control characters in the expressions).
+const ESC = '\x1b';
 const QUERIES: [RegExp, 'cpr' | 'da' | 'dsr'][] = [
-  [/\x1b\[\??6n/g, 'cpr'],
-  [/\x1bZ|\x1b\[[0>]?c/g, 'da'],
-  [/\x1b\[5n/g, 'dsr'],
+  [/^\[\??6n/, 'cpr'],
+  [/^(?:Z|\[[0>]?c)/, 'da'],
+  [/^\[5n/, 'dsr'],
 ];
 const REPORTS: [RegExp, 'cpr' | 'da' | 'dsr'][] = [
-  [/^\x1b\[\??\d{1,4};\d{1,4}R$/, 'cpr'],
-  [/^\x1b\[[?>][\d;]{0,32}c$/, 'da'],
-  [/^\x1b\[0n$/, 'dsr'],
+  [/^\[\??\d{1,4};\d{1,4}R$/, 'cpr'],
+  [/^\[[?>][\d;]{0,32}c$/, 'da'],
+  [/^\[0n$/, 'dsr'],
 ];
 const MAX_OPEN_QUERIES = 16;
 
@@ -73,12 +75,12 @@ export class InputGate {
   /** Counts device queries (a query split across two chunks is joined by the kept tail). */
   #countQueries(data: string) {
     const text = this.#outputTail + data;
-    for (const [pattern, kind] of QUERIES) {
-      const found = text.match(pattern)?.length ?? 0;
-      this.#queries[kind] = Math.min(MAX_OPEN_QUERIES, this.#queries[kind] + found);
+    for (const part of text.split(ESC).slice(1)) {
+      const kind = QUERIES.find(([pattern]) => pattern.test(part))?.[1];
+      if (kind) this.#queries[kind] = Math.min(MAX_OPEN_QUERIES, this.#queries[kind] + 1);
     }
     // Keep only an unfinished escape at the end, never a query already counted.
-    const last = text.lastIndexOf('\x1b');
+    const last = text.lastIndexOf(ESC);
     this.#outputTail = last >= 0 && text.length - last < 4 && !/[A-Za-z]/.test(text.slice(last + 1))
       ? text.slice(last)
       : '';
@@ -86,7 +88,8 @@ export class InputGate {
 
   /** True when the sequence is a terminal report the device asked for (consumes one query). */
   #takeReport(sequence: string): boolean {
-    const kind = REPORTS.find(([pattern]) => pattern.test(sequence))?.[1];
+    if (!sequence.startsWith(ESC)) return false;
+    const kind = REPORTS.find(([pattern]) => pattern.test(sequence.slice(1)))?.[1];
     if (!kind || this.#queries[kind] === 0) return false;
     this.#queries[kind]--;
     return true;
