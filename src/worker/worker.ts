@@ -3,6 +3,7 @@
 // device protocol, never runs a local program, and redacts everything before it leaves.
 
 import { createHash } from 'node:crypto';
+import net from 'node:net';
 // @ts-types="../types/ssh2.d.ts"
 import ssh2 from 'ssh2';
 import { AsciicastWriter } from '../shared/asciicast.ts';
@@ -14,6 +15,7 @@ import type {
   WorkerInit,
   WorkerToController,
 } from '../shared/ipc.ts';
+import { validBridgePath } from '../shared/ipc.ts';
 import { Classifier } from './classifier.ts';
 import { InputGate } from './input_gate.ts';
 import { Redactor } from './redaction.ts';
@@ -52,6 +54,9 @@ export function validateInit(value: unknown): WorkerInit {
     ['n1', 'n2', 'n3'].includes(v.level) && v.terminal && v.limits;
   if (!ok) throw new WorkerExit('refused', 'invalid_assignment');
   if (REFUSED_PORTS.has(v.target.port)) throw new WorkerExit('refused', 'protocol_refused');
+  if (v.transport === 'connector' ? !validBridgePath(v.bridge) : v.bridge !== undefined) {
+    throw new WorkerExit('refused', 'invalid_assignment');
+  }
   if (v.protocol === 'routeros_api' && v.mode !== 'test') {
     throw new WorkerExit('refused', 'protocol_refused');
   }
@@ -238,6 +243,7 @@ async function routerOsTest(init: WorkerInit, h: Helpers): Promise<Exit> {
       init.target.address,
       init.target.port,
       init.limits.connectTimeoutSeconds * 1000,
+      init.transport === 'connector' ? init.bridge : undefined,
     );
     api = new RouterOsApi(connection.transport);
     if (!(await h.verifyKey('tls', 'x509', connection.pin, init.tls.pinned))) {
@@ -444,7 +450,15 @@ function sshSession(init: WorkerInit, h: SshHelpers): Promise<Exit> {
     let hostKeyRefused = false;
     let hostKeyReason = 'hostkey_mismatch';
     h.control({ type: 'state', state: 'connecting' });
+    // Connector transport: the only socket the worker has is the controller's bridge, which ends
+    // at the device through the tenant connector. There is no network to fall back to.
+    let sock: net.Socket | undefined;
+    if (init.transport === 'connector') {
+      sock = net.createConnection({ path: init.bridge! });
+      sock.on('error', () => {});
+    }
     client.connect({
+      ...(sock ? { sock } : {}),
       host: init.target.address,
       port: init.target.port,
       username: init.username,

@@ -4,7 +4,15 @@
 import { encodeMessage, readMessages } from '../shared/ipc.ts';
 import type { ControllerToWorker } from '../shared/ipc.ts';
 import type { SessionNet, SessionTarget } from './netns.ts';
-import { renderSystemdRun, type SandboxLimits, unitName, workerDenoArgs } from './sandbox.ts';
+import {
+  renderConnectorSystemdRun,
+  renderSystemdRun,
+  type SandboxLimits,
+  UNIT_PREFIX,
+  unitName,
+  workerDenoArgs,
+} from './sandbox.ts';
+import { sessionId } from './netns.ts';
 
 export interface WorkerHandle {
   send(message: ControllerToWorker): void;
@@ -18,6 +26,8 @@ export interface WorkerLauncher {
     target: SessionTarget,
     net: SessionNet | null,
     limits: SandboxLimits,
+    /** Connector transport: unix socket of the bridge (no session network exists). */
+    bridge?: { connectionUUID: string; path: string } | null,
   ): Promise<WorkerHandle>;
 }
 
@@ -43,16 +53,25 @@ export class SystemdLauncher implements WorkerLauncher {
     target: SessionTarget,
     net: SessionNet | null,
     limits: SandboxLimits,
+    bridge: { connectionUUID: string; path: string } | null = null,
   ): Promise<WorkerHandle> {
-    if (!net) throw new Error('A session network is required');
-    const argv = renderSystemdRun(net, target, this.runtimeRoot, limits);
+    let unit: string;
+    let argv: string[];
+    if (bridge) {
+      const id = sessionId(bridge.connectionUUID);
+      unit = `${UNIT_PREFIX}${id}`;
+      argv = renderConnectorSystemdRun(id, target, this.runtimeRoot, limits, bridge.path);
+    } else {
+      if (!net) throw new Error('A session network is required');
+      unit = unitName(net);
+      argv = renderSystemdRun(net, target, this.runtimeRoot, limits);
+    }
     const child = new Deno.Command(argv[0], {
       args: argv.slice(1),
       stdin: 'piped',
       stdout: 'piped',
       stderr: 'null',
     }).spawn();
-    const unit = unitName(net);
     return Promise.resolve(wrap(child, async () => {
       await new Deno.Command('systemctl', {
         args: ['kill', '--signal=KILL', `${unit}.service`],
@@ -78,9 +97,10 @@ export class DirectLauncher implements WorkerLauncher {
     target: SessionTarget,
     _net: SessionNet | null,
     limits: SandboxLimits,
+    bridge: { connectionUUID: string; path: string } | null = null,
   ): Promise<WorkerHandle> {
     const child = new Deno.Command('deno', {
-      args: workerDenoArgs(this.runtimeRoot, target, limits.memoryMaxMB),
+      args: workerDenoArgs(this.runtimeRoot, target, limits.memoryMaxMB, bridge?.path ?? null),
       stdin: 'piped',
       stdout: 'piped',
       stderr: this.stderr,

@@ -28,7 +28,11 @@ export interface FakeDevice {
   close(): Promise<void>;
 }
 
-export function startDevice(hostKey: string, behaviour: Behaviour = 'normal'): Promise<FakeDevice> {
+export function startDevice(
+  hostKey: string,
+  behaviour: Behaviour = 'normal',
+  host = '127.0.0.1',
+): Promise<FakeDevice> {
   const received: string[] = [];
   const state = { authAttempts: 0 };
   // deno-lint-ignore no-explicit-any
@@ -116,7 +120,7 @@ export function startDevice(hostKey: string, behaviour: Behaviour = 'normal'): P
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(0, host, () => {
       resolve({
         port: server.address().port,
         received,

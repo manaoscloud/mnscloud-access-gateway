@@ -73,6 +73,39 @@ environment.
    is reported to the App.
 3. A failed attempt shows **Retry installation** in the App; the resume command has no token.
 
+## Remote access connector (tenant network path)
+
+The public path reaches devices that are routable from the internet. For devices on a private LAN or
+behind CGNAT the tenant installs a **connector**: a small runtime on a Debian 12/13 or Ubuntu
+22.04/24.04 host (amd64 or arm64) inside its own network. It opens an outbound tunnel to the access
+gateway the platform assigned to it, and the gateway reaches the device through it.
+
+- **Requirements**: outbound HTTPS (TCP 443) to the platform API and to the assigned gateway's public
+  host; a route from the connector host to the devices (SSH 22 or the RouterOS API-SSL port). No
+  inbound port, no VPN, no port forwarding.
+- **What it reaches**: only a device the API confirmed for that exact connection (connection,
+  address, port, this connector, single use). Private ranges of the tenant are allowed; if the tenant
+  set allowed networks on the connector, only those. **What it never reaches**: loopback, link-local
+  (including 169.254.169.254), multicast, unspecified and broadcast addresses, the connector host
+  itself, Telnet (23) and the plain RouterOS API (8728).
+- **What it is not**: it holds no platform secret (its identity is an Ed25519 key generated on the
+  host; only the public key leaves it), never executes commands, never listens on a port, and cannot
+  start anything toward the platform: only the gateway opens streams over the tunnel, and the gateway
+  never forwards packets (the stream ends inside the sandboxed worker's own SSH/TLS client, which has
+  no network at all).
+- **Install**: in the App, **Rede › Conectores**, create the connector and use **Instalar**. The
+  command downloads `scripts/install-connector.sh` of an approved release, checks its SHA-256 and
+  runs it with a single-use token (24 h) in the environment. The service runs as the unprivileged
+  `mns-connector` user (`NoNewPrivileges`, `ProtectSystem=strict`, no capabilities); a root timer
+  applies the release the platform announces (the tag must resolve to the announced commit; a release
+  that does not start is rolled back).
+- **Uninstall**: `sudo /opt/mnscloud-access-connector/scripts/uninstall-connector.sh`, then delete the
+  connector in the App.
+
+The connector code is `src/connector/`, the gateway side is `src/controller/connector_hub.ts` and
+`src/controller/bridge.ts`, the frame format `src/shared/tunnel.ts`. Wire contract, signatures and
+test vectors: `docs/runtime-api.md` → Remote access connector.
+
 ## Update and rollback
 
 MNSCloud delivery (maintainers and AI agents) is the Agent rollout:
@@ -116,7 +149,8 @@ deno fmt --check && deno lint && deno task check && deno task test
 shellcheck -x scripts/*.sh scripts/lib/*.sh
 ```
 
-Tests run offline with the vendored dependencies: classifier and redaction fixtures, framing,
+Tests run offline with the vendored dependencies: connector tunnel (frames, credit flow, handshake
+signatures, destination checks, an end-to-end tunnel to a fake device), classifier and redaction fixtures, framing,
 tickets, nftables/netns/systemd rendering, a hostile fake SSH device (host key change, output flood,
 escape sequences, prompt-injection text) and a RouterOS API-SSL mock. The runtime API contract is
 `docs/runtime-api.md`.

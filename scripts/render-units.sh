@@ -25,11 +25,14 @@ Type=simple
 Environment=DENO_DIR=$DENO_CACHE_DIR
 Environment=DENO_NO_UPDATE_CHECK=1
 Environment=NO_COLOR=1
-ExecStart=$DENO_BIN run --cached-only --frozen --no-prompt --config=$ROOT_DIR/deno.json --allow-net --allow-read --allow-write=$STATE_DIR --allow-run=systemd-run,systemctl,ip,nft $ROOT_DIR/src/controller/main.ts --env $DEFAULT_ENV_FILE
+ExecStart=$DENO_BIN run --cached-only --frozen --no-prompt --config=$ROOT_DIR/deno.json --allow-net --allow-read --allow-write=$STATE_DIR,$BRIDGE_DIR --allow-run=systemd-run,systemctl,ip,nft $ROOT_DIR/src/controller/main.ts --env $DEFAULT_ENV_FILE
 ExecStopPost=$ROOT_DIR/scripts/cleanup-sessions.sh
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
+# Unix sockets that bridge connector tunnels to the sandboxed workers (no network in those workers).
+RuntimeDirectory=mnscloud-access-gateway-bridge
+RuntimeDirectoryMode=0711
 UMask=0077
 # No mount namespace (PrivateTmp/ProtectSystem/ProtectHome): the session namespaces the
 # controller creates under /run/netns must be visible to systemd, which starts each worker in one.

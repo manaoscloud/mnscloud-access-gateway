@@ -1,8 +1,10 @@
 // Gateway core: takes assignments from the API, keeps console tickets, starts sessions and
 // terminates browser WebSockets (only from the edge hosts, only with a valid ticket).
 
+import { checkConnectorDestination } from '../shared/destination.ts';
 import { cidrContains, parseAddress, parseCidr } from '../shared/ip.ts';
 import { type Assignment, ContractError, type FinishBody, parseAssignment } from './contract.ts';
+import type { ConnectorHub } from './connector_hub.ts';
 import { checkDestination, type Denylist } from './denylist.ts';
 import { Session, type SessionDeps } from './session.ts';
 import { TicketBook } from './ticket.ts';
@@ -16,6 +18,8 @@ export interface GatewayOptions {
   capacity: number;
   version: string;
   deps: SessionDeps;
+  /** Connector tunnels (`/access-gateway/<key>/connector`); absent when not served. */
+  hub?: ConnectorHub;
 }
 
 function refusal(
@@ -79,13 +83,37 @@ export class Gateway {
     if (
       this.sessions.has(assignment.connectionUUID) || this.#pending.has(assignment.connectionUUID)
     ) return 'waiting';
-    const destination = checkDestination(assignment.target.address, this.options.denylist);
-    if (!destination.allowed || [23, 8728].includes(assignment.target.port)) {
-      await this.options.deps.api.finish(
-        assignment.connectionUUID,
-        refusal(assignment, destination.allowed ? 'protocol_refused' : 'destination_refused'),
-      ).catch(() => {});
-      return 'refused';
+    if (assignment.transport === 'connector') {
+      // Tenant private ranges are the point of a connector: only the always-refused set applies
+      // here (the API and the connector check the tenant's allowed networks).
+      const verdict = checkConnectorDestination(
+        assignment.target.address,
+        assignment.target.port,
+        { allowedCidrs: [] },
+      );
+      if (verdict) {
+        await this.options.deps.api.finish(
+          assignment.connectionUUID,
+          refusal(assignment, verdict === 'protocol_refused' ? verdict : 'destination_refused'),
+        ).catch(() => {});
+        return 'refused';
+      }
+      if (!this.options.hub?.has(assignment.connectorUuid!)) {
+        await this.options.deps.api.finish(
+          assignment.connectionUUID,
+          refusal(assignment, 'connector_offline', 'failed'),
+        ).catch(() => {});
+        return 'refused';
+      }
+    } else {
+      const destination = checkDestination(assignment.target.address, this.options.denylist);
+      if (!destination.allowed || [23, 8728].includes(assignment.target.port)) {
+        await this.options.deps.api.finish(
+          assignment.connectionUUID,
+          refusal(assignment, destination.allowed ? 'protocol_refused' : 'destination_refused'),
+        ).catch(() => {});
+        return 'refused';
+      }
     }
     if (this.#draining || this.freeSlots <= 0) {
       await this.options.deps.api.finish(
@@ -141,6 +169,7 @@ export class Gateway {
     clearInterval(this.#sweeper);
     for (const uuid of [...this.#pending]) this.cancel(uuid);
     for (const session of this.sessions.values()) session.close(reason);
+    void this.options.hub?.drain();
     await Promise.race([
       Promise.all([...this.sessions.values()].map((s) => s.done)),
       new Promise((resolve) => setTimeout(resolve, timeoutMs)),
@@ -172,6 +201,11 @@ export class Gateway {
         activeSessions: this.sessions.size,
         freeSlots: this.freeSlots,
       }, { headers: { 'Cache-Control': 'no-store' } });
+    }
+    if (url.pathname === `/access-gateway/${this.options.gatewayKey}/connector`) {
+      if (!this.options.hub) return new Response('Not found', { status: 404 });
+      if (this.#draining) return new Response('Draining', { status: 503 });
+      return this.options.hub.handleUpgrade(request);
     }
     const paths = [`/access-gateway/${this.options.gatewayKey}/ws`, '/ws'];
     if (!paths.includes(url.pathname)) return new Response('Not found', { status: 404 });

@@ -4,6 +4,7 @@
 // allow only the device IP:port (third layer after the namespace and host firewalls).
 
 import { parseAddress } from '../shared/ip.ts';
+import { validBridgePath } from '../shared/ipc.ts';
 import type { SessionNet, SessionTarget } from './netns.ts';
 
 export const UNIT_PREFIX = 'mnscloud-access-gateway-session-';
@@ -39,7 +40,17 @@ export function workerDenoArgs(
   runtimeRoot: string,
   target: SessionTarget,
   memoryMaxMB = 256,
+  bridge: string | null = null,
 ): string[] {
+  // Connector transport: no TCP/UDP permission at all; Deno needs net, read and write grants for
+  // the one unix socket of the controller bridge (and nothing else).
+  const access = bridge
+    ? [
+      `--allow-net=unix:${bridge}`,
+      `--allow-read=${runtimeRoot},${bridge}`,
+      `--allow-write=${bridge}`,
+    ]
+    : [`--allow-net=${allowNet(target)}`, `--allow-read=${runtimeRoot}`];
   return [
     'run',
     '--cached-only',
@@ -47,24 +58,14 @@ export function workerDenoArgs(
     '--no-prompt',
     `--config=${runtimeRoot}/deno.json`,
     `--v8-flags=--max-old-space-size=${Math.max(64, Math.floor(memoryMaxMB * 0.6))}`,
-    `--allow-net=${allowNet(target)}`,
-    `--allow-read=${runtimeRoot}`,
+    ...access,
     `${runtimeRoot}/src/worker/main.ts`,
   ];
 }
 
-/** systemd-run argv of one session worker. stdin/stdout are piped straight to the worker. */
-export function renderSystemdRun(
-  net: SessionNet,
-  target: SessionTarget,
-  runtimeRoot: string,
-  limits: SandboxLimits,
-): string[] {
-  const parsed = parseAddress(target.address);
-  if (!parsed) throw new Error('Invalid target address');
-  const family = parsed.family === 4 ? 'AF_INET' : 'AF_INET6';
-  const properties = [
-    `NetworkNamespacePath=/run/netns/${net.namespace}`,
+/** Hardening shared by direct and connector workers (network properties are added by the caller). */
+function sandboxProperties(runtimeRoot: string, limits: SandboxLimits): string[] {
+  return [
     'DynamicUser=yes',
     `MemoryMax=${limits.memoryMaxMB}M`,
     'MemorySwapMax=0',
@@ -87,7 +88,6 @@ export function renderSystemdRun(
     'ProcSubset=pid',
     'CapabilityBoundingSet=',
     'AmbientCapabilities=',
-    `RestrictAddressFamilies=${family}`,
     'RestrictNamespaces=yes',
     'RestrictRealtime=yes',
     'RestrictSUIDSGID=yes',
@@ -97,7 +97,6 @@ export function renderSystemdRun(
     // V8 uses memory protection keys (pkey_*), outside @system-service.
     'SystemCallFilter=pkey_alloc pkey_free pkey_mprotect',
     'SystemCallFilter=~@privileged @mount @swap @reboot @module @raw-io @debug @cpu-emulation @obsolete',
-    `IPAddressAllow=${parsed.text}`,
     'IPAddressDeny=any',
     'InaccessiblePaths=-/etc/mnscloud -/var/lib/mnscloud -/root -/run/netns',
     'UMask=0077',
@@ -107,6 +106,9 @@ export function renderSystemdRun(
     'Environment=NO_COLOR=1',
     `WorkingDirectory=${runtimeRoot}`,
   ];
+}
+
+function systemdRun(unit: string, properties: string[], denoArgs: string[]): string[] {
   return [
     'systemd-run',
     '--quiet',
@@ -114,11 +116,50 @@ export function renderSystemdRun(
     '--pipe',
     '--wait',
     '--service-type=exec',
-    `--unit=${unitName(net)}`,
+    `--unit=${unit}`,
     '--description=MNSCloud access gateway session',
     ...properties.flatMap((property) => ['-p', property]),
     '--',
     DENO_BIN,
-    ...workerDenoArgs(runtimeRoot, target, limits.memoryMaxMB),
+    ...denoArgs,
   ];
+}
+
+/** systemd-run argv of one session worker. stdin/stdout are piped straight to the worker. */
+export function renderSystemdRun(
+  net: SessionNet,
+  target: SessionTarget,
+  runtimeRoot: string,
+  limits: SandboxLimits,
+): string[] {
+  const parsed = parseAddress(target.address);
+  if (!parsed) throw new Error('Invalid target address');
+  const family = parsed.family === 4 ? 'AF_INET' : 'AF_INET6';
+  return systemdRun(unitName(net), [
+    `NetworkNamespacePath=/run/netns/${net.namespace}`,
+    `RestrictAddressFamilies=${family}`,
+    `IPAddressAllow=${parsed.text}`,
+    ...sandboxProperties(runtimeRoot, limits),
+  ], workerDenoArgs(runtimeRoot, target, limits.memoryMaxMB));
+}
+
+/**
+ * systemd-run argv of a connector-session worker: no network at all (private empty namespace,
+ * AF_UNIX only, nothing allowed by the cgroup IP filter, no Deno net permission). The one thing it
+ * can open is the controller's bridge socket.
+ */
+export function renderConnectorSystemdRun(
+  id: string,
+  target: SessionTarget,
+  runtimeRoot: string,
+  limits: SandboxLimits,
+  bridge: string,
+): string[] {
+  if (!/^[0-9a-f]{8}$/.test(id)) throw new Error('Invalid session id');
+  if (!validBridgePath(bridge)) throw new Error('Invalid bridge path');
+  return systemdRun(`${UNIT_PREFIX}${id}`, [
+    'PrivateNetwork=yes',
+    'RestrictAddressFamilies=AF_UNIX',
+    ...sandboxProperties(runtimeRoot, limits),
+  ], workerDenoArgs(runtimeRoot, target, limits.memoryMaxMB, bridge));
 }

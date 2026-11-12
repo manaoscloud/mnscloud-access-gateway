@@ -24,7 +24,10 @@ export interface Assignment {
   connectionUUID: string;
   mode: 'console' | 'test';
   protocol: 'ssh' | 'routeros_api';
-  path: 'public';
+  path: 'public' | 'connector';
+  /** `connector`: the worker has no network; the stream goes through the tenant connector. */
+  transport: 'direct' | 'connector';
+  connectorUuid: string | null;
   target: { address: string; port: number };
   shellDialect: ShellDialect;
   username: string;
@@ -168,7 +171,18 @@ export function parseAssignment(value: unknown): Assignment {
   if (v.protocol !== 'ssh' && v.protocol !== 'routeros_api') {
     throw new ContractError('protocol_refused');
   }
-  if ((v.path ?? 'public') !== 'public') throw new ContractError('path_unsupported');
+  const path = v.path ?? 'public';
+  if (path !== 'public' && path !== 'connector') throw new ContractError('path_unsupported');
+  const transport = v.transport ?? (path === 'connector' ? 'connector' : 'direct');
+  if (transport !== 'direct' && transport !== 'connector') {
+    throw new ContractError('path_unsupported');
+  }
+  if ((path === 'connector') !== (transport === 'connector')) {
+    throw new ContractError('path_unsupported');
+  }
+  if (transport === 'connector' && !UUID.test(String(v.connectorUuid))) {
+    throw new ContractError('Invalid connectorUuid');
+  }
   const address = parseAddress(v.target?.address);
   if (!address) throw new ContractError('Invalid target address');
   if (!DIALECTS.includes(v.shellDialect)) throw new ContractError('Invalid shellDialect');
@@ -193,7 +207,9 @@ export function parseAssignment(value: unknown): Assignment {
     connectionUUID: v.connectionUUID,
     mode: v.mode,
     protocol: v.protocol,
-    path: 'public',
+    path,
+    transport,
+    connectorUuid: transport === 'connector' ? v.connectorUuid : null,
     target: { address: address.text, port: int(v.target.port, 1, 65535, 'port') },
     shellDialect: v.shellDialect,
     username: v.username,
