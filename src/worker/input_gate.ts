@@ -16,6 +16,22 @@ const MAX_LINE = 4096;
 const MAX_QUEUE = 64 * 1024;
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
+// Terminal reports: the browser terminal (xterm.js) answers device queries through the keystroke
+// channel. A report passes without tainting the line only when the device asked for it in its
+// output (RouterOS asks the cursor position several times at login); any other one still taints.
+// Patterns match what follows ESC (no control characters in the expressions).
+const ESC = '\x1b';
+const QUERIES: [RegExp, 'cpr' | 'da' | 'dsr'][] = [
+  [/^\[\??6n/, 'cpr'],
+  [/^(?:Z|\[[0>]?c)/, 'da'],
+  [/^\[5n/, 'dsr'],
+];
+const REPORTS: [RegExp, 'cpr' | 'da' | 'dsr'][] = [
+  [/^\[\??\d{1,4};\d{1,4}R$/, 'cpr'],
+  [/^\[[?>][\d;]{0,32}c$/, 'da'],
+  [/^\[0n$/, 'dsr'],
+];
+const MAX_OPEN_QUERIES = 16;
 
 export interface GateSinks {
   toDevice(data: string): void;
@@ -45,6 +61,8 @@ export class InputGate {
   #pending: Pending | null = null;
   #queue = '';
   #alternateScreen = false;
+  #queries = { cpr: 0, da: 0, dsr: 0 };
+  #outputTail = '';
   #counter = 0;
 
   constructor(
@@ -53,6 +71,29 @@ export class InputGate {
     private readonly sinks: GateSinks,
     private readonly verdictTimeoutSeconds = 120,
   ) {}
+
+  /** Counts device queries (a query split across two chunks is joined by the kept tail). */
+  #countQueries(data: string) {
+    const text = this.#outputTail + data;
+    for (const part of text.split(ESC).slice(1)) {
+      const kind = QUERIES.find(([pattern]) => pattern.test(part))?.[1];
+      if (kind) this.#queries[kind] = Math.min(MAX_OPEN_QUERIES, this.#queries[kind] + 1);
+    }
+    // Keep only an unfinished escape at the end, never a query already counted.
+    const last = text.lastIndexOf(ESC);
+    this.#outputTail = last >= 0 && text.length - last < 4 && !/[A-Za-z]/.test(text.slice(last + 1))
+      ? text.slice(last)
+      : '';
+  }
+
+  /** True when the sequence is a terminal report the device asked for (consumes one query). */
+  #takeReport(sequence: string): boolean {
+    if (!sequence.startsWith(ESC)) return false;
+    const kind = REPORTS.find(([pattern]) => pattern.test(sequence.slice(1)))?.[1];
+    if (!kind || this.#queries[kind] === 0) return false;
+    this.#queries[kind]--;
+    return true;
+  }
 
   get line() {
     return this.#buffer;
@@ -68,6 +109,7 @@ export class InputGate {
 
   /** Device output hook: full-screen programs change how Enter is read. */
   observeOutput(data: string) {
+    this.#countQueries(data);
     const on = data.lastIndexOf('\x1b[?1049h'), off = data.lastIndexOf('\x1b[?1049l');
     if (on < 0 && off < 0) return;
     const next = on > off;
@@ -108,6 +150,10 @@ export class InputGate {
         }
         i += sequence.length;
         if (sequence === PASTE_START || sequence === PASTE_END) continue; // pasted lines run one by one
+        if (this.#takeReport(sequence)) {
+          this.sinks.toDevice(sequence);
+          continue;
+        }
         this.#tainted = true;
         this.sinks.toDevice(sequence);
         continue;
