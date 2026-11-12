@@ -109,7 +109,7 @@ CacheDirectory=mnscloud-access-connector
 Environment=DENO_DIR=$CONNECTOR_CACHE_DIR/deno
 Environment=DENO_NO_UPDATE_CHECK=1
 Environment=NO_COLOR=1
-ExecStart=$DENO_BIN run --cached-only --frozen --no-prompt --config=$CONNECTOR_APP_DIR/deno.json --allow-net --allow-read=$CONNECTOR_APP_DIR,$CONNECTOR_CONF_DIR --allow-sys=hostname,networkInterfaces $CONNECTOR_APP_DIR/src/connector/main.ts run --config $CONNECTOR_CONFIG
+ExecStart=$DENO_BIN run --cached-only --frozen --no-prompt --config=$CONNECTOR_APP_DIR/deno.json --allow-net --allow-read=$CONNECTOR_APP_DIR,$CONNECTOR_CONF_DIR --allow-sys=hostname,networkInterfaces,uid $CONNECTOR_APP_DIR/src/connector/main.ts run --config $CONNECTOR_CONFIG
 Restart=always
 RestartSec=5
 UMask=0077

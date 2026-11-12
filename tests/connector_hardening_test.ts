@@ -551,3 +551,31 @@ cd .. && git clone -q origin app && git -C app checkout -q --detach v0.2.0`);
   assertEquals((await verify('v0.2.0', await rev('v0.2.0'))).code, 0);
   await Deno.remove(dir, { recursive: true });
 });
+
+Deno.test('lab finding: the service unit grants every sys API the connector runtime calls', () => {
+  const unit = read('scripts/lib/connector.sh').match(
+    /--allow-sys=([A-Za-z,]+) \$CONNECTOR_APP_DIR/,
+  );
+  assert(unit, 'service ExecStart --allow-sys not found');
+  const granted = new Set(unit[1].split(','));
+  const SYS = [
+    'hostname',
+    'networkInterfaces',
+    'uid',
+    'gid',
+    'osRelease',
+    'osUptime',
+    'loadavg',
+    'systemMemoryInfo',
+  ];
+  const used = new Set<string>();
+  for (const dir of ['src/connector', 'src/shared']) {
+    for (const entry of Deno.readDirSync(`${ROOT}/${dir}`)) {
+      if (!entry.name.endsWith('.ts')) continue;
+      const source = read(`${dir}/${entry.name}`);
+      for (const name of SYS) if (source.includes(`Deno.${name}(`)) used.add(name);
+    }
+  }
+  assert(used.has('uid'), 'key file owner check uses Deno.uid()');
+  for (const name of used) assert(granted.has(name), `--allow-sys lacks ${name}`);
+});
