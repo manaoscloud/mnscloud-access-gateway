@@ -61,6 +61,7 @@ connector_fix_permissions
 connector_check_runtime
 
 id -u "$CONNECTOR_USER" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$CONNECTOR_USER"
+connector_check_service_exec
 install -d -m 0750 -o root -g "$CONNECTOR_USER" "$CONNECTOR_CONF_DIR"
 # Re-installation replaces the key: stop the service and keep the old key until the claim worked.
 systemctl stop "$CONNECTOR_UNIT" >/dev/null 2>&1 || true

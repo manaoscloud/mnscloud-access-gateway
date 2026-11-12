@@ -491,6 +491,21 @@ Deno.test('findings 6, 8, 12, 13, 14: install, update and unit hardening', () =>
   assertMatch(read('scripts/uninstall-connector.sh'), /mnscloud-access-connector-runtime-kit/);
 });
 
+Deno.test('lab finding: the service user must be able to execute Deno (installer bin dir 0700)', () => {
+  const lib = read('scripts/lib/connector.sh');
+  assertMatch(
+    lib,
+    /connector_check_service_exec\(\) \{[\s\S]*chmod go\+rx \/usr\/local\/deno[\s\S]*runuser -u "\$CONNECTOR_USER" -- "\$DENO_BIN" --version/,
+  );
+  const install = read('scripts/install-connector.sh');
+  assert(install.indexOf('useradd --system') < install.indexOf('connector_check_service_exec'));
+  assert(install.indexOf('connector_check_service_exec') < install.indexOf('systemctl enable'));
+  assertMatch(
+    read('scripts/update-connector.sh'),
+    / connector_ensure_deno\n connector_check_service_exec\n/,
+  );
+});
+
 Deno.test('finding 8: a downgrade or a tag/commit mismatch is refused before any checkout', async () => {
   const dir = await tempDir('agw-rel-');
   const sh = async (script: string) => {
