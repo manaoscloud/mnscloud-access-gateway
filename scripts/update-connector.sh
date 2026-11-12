@@ -35,6 +35,7 @@ apply() (
  set -Eeuo pipefail
  git -C "$CONNECTOR_APP_DIR" checkout -q --detach "$commit"
  connector_ensure_deno
+ connector_check_service_exec
  connector_fix_permissions
  connector_check_runtime
  connector_render_units

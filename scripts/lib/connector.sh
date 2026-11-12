@@ -49,6 +49,16 @@ connector_ensure_deno() {
  [[ -x "$DENO_BIN" ]] || cdie 'Deno is not installed'
 }
 
+# The service runs as $CONNECTOR_USER, so Deno and its directories must be executable by that user.
+# The deno.land installer can leave its bin directory 0700 (root-only runtimes never notice).
+connector_check_service_exec() {
+ local real
+ real="$(readlink -f "$DENO_BIN")"
+ if [[ "$real" == /usr/local/deno/* ]]; then chmod go+rx /usr/local/deno "$(dirname "$real")" "$real"; fi
+ runuser -u "$CONNECTOR_USER" -- "$DENO_BIN" --version >/dev/null 2>&1 ||
+  cdie "Deno ($real) is not executable by $CONNECTOR_USER; make it and its directories world-executable"
+}
+
 # Runtime tree: world-readable, never writable by the service user.
 connector_fix_permissions() {
  find "$CONNECTOR_APP_DIR" -path "$CONNECTOR_APP_DIR/.git" -prune -o -exec chmod go+rX,go-w {} +
