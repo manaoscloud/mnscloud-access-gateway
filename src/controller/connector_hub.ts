@@ -27,8 +27,14 @@ import {
 } from '../shared/tunnel.ts';
 import { UUID } from './contract.ts';
 
+/** The API refused an attach for good (disabled, deleted or re-installed connector). */
+export class AttachRefused extends Error {}
+
+/** Where the API records the connector's tunnel: this gateway, none or another gateway. */
+export type ConnectorAttachment = 'here' | 'none' | 'other';
+
 export interface ConnectorRuntimeApi {
-  connector(uuid: string): Promise<{ publicKey: string } | null>;
+  connector(uuid: string): Promise<{ publicKey: string; attachment?: ConnectorAttachment } | null>;
   connectorAttach(uuid: string): Promise<void>;
   connectorDetach(uuid: string): Promise<void>;
 }
@@ -253,9 +259,14 @@ export class ConnectorHub {
     return { ...verified, socket, mux, recheck: null };
   }
 
-  /** The key of an attached tunnel must still be the connector's current, active key. */
+  /**
+   * The key of an attached tunnel must still be the connector's current, active key, and the API must
+   * still record the tunnel here: a disable/enable (or a reinstall race) can clear the record while the
+   * socket stays up, which would leave a live tunnel that consoles cannot use. 'none' attaches again,
+   * 'other' means another gateway holds the connector now.
+   */
   async #recheck(tunnel: Tunnel, fail: (code: number, reason: string) => void) {
-    let record: { publicKey: string } | null;
+    let record: { publicKey: string; attachment?: ConnectorAttachment } | null;
     try {
       record = await this.options.api.connector(tunnel.uuid);
     } catch {
@@ -264,7 +275,25 @@ export class ConnectorHub {
     if (this.tunnels.get(tunnel.uuid) !== tunnel) return;
     if (record?.publicKey !== tunnel.publicKey) {
       this.options.log('connector key no longer valid: closing its tunnel');
-      fail(4401, 'key_changed');
+      return fail(4401, 'key_changed');
+    }
+    if (record.attachment === 'other') {
+      this.options.log('connector is attached to another gateway: closing its tunnel');
+      return fail(4409, 'replaced');
+    }
+    if (record.attachment !== 'none') return;
+    try {
+      await this.#serial(tunnel.uuid, async () => {
+        if (this.tunnels.get(tunnel.uuid) === tunnel) {
+          await this.options.api.connectorAttach(tunnel.uuid);
+        }
+      });
+      this.options.log('connector tunnel attached again');
+    } catch (error) {
+      if (error instanceof AttachRefused) {
+        this.options.log(`connector attach refused: ${error.message}`);
+        if (this.tunnels.get(tunnel.uuid) === tunnel) fail(4503, 'attach_failed');
+      } // a transient failure keeps the tunnel; the next check tries again
     }
   }
 

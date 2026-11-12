@@ -6,8 +6,12 @@ import type {
   FinishBody,
   HostKeyResponse,
 } from './contract.ts';
+import {
+  AttachRefused,
+  type ConnectorAttachment,
+  type ConnectorRuntimeApi,
+} from './connector_hub.ts';
 import { type ControlPlane, ControlPlaneRejected } from './control_plane.ts';
-import type { ConnectorRuntimeApi } from './connector_hub.ts';
 import type { RuntimeEvent, SessionApi } from './session.ts';
 
 export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
@@ -27,8 +31,15 @@ export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
   /** Public key of an active, operational connector of this environment (null when not usable). */
   async connector(uuid: string) {
     try {
-      const data = await this.cp.call<{ publicKey?: unknown } | null>('GET', `/connectors/${uuid}`);
-      return typeof data?.publicKey === 'string' ? { publicKey: data.publicKey } : null;
+      const data = await this.cp.call<{ publicKey?: unknown; attachment?: unknown } | null>(
+        'GET',
+        `/connectors/${uuid}`,
+      );
+      if (typeof data?.publicKey !== 'string') return null;
+      // An older API sends no attachment: 'here' keeps the previous behavior (key check only).
+      const attachment: ConnectorAttachment =
+        data.attachment === 'none' || data.attachment === 'other' ? data.attachment : 'here';
+      return { publicKey: data.publicKey, attachment };
     } catch (error) {
       if (error instanceof ControlPlaneRejected && [403, 404].includes(error.status)) return null;
       throw error;
@@ -36,7 +47,14 @@ export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
   }
 
   async connectorAttach(uuid: string) {
-    await this.cp.call('POST', `/connectors/${uuid}/attach`, {});
+    try {
+      await this.cp.call('POST', `/connectors/${uuid}/attach`, {});
+    } catch (error) {
+      if (error instanceof ControlPlaneRejected && [403, 404, 409].includes(error.status)) {
+        throw new AttachRefused(error.message);
+      }
+      throw error;
+    }
   }
 
   async connectorDetach(uuid: string) {
