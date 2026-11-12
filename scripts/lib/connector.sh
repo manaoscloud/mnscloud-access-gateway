@@ -78,8 +78,9 @@ connector_verify_release() {
 
 # Checks out an exact release (verify first: connector_verify_release).
 connector_checkout() {
- connector_verify_release "$1" "$2"
- git -C "$CONNECTOR_APP_DIR" checkout -q --detach "$2"
+ local tag="$1" commit="$2"
+ connector_verify_release "$tag" "$commit"
+ git -C "$CONNECTOR_APP_DIR" checkout -q --detach "$commit"
 }
 
 # Unprivileged service plus the root update oneshot and its timer.

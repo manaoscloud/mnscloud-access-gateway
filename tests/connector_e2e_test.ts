@@ -1,6 +1,7 @@
 // End to end over a real WebSocket: gateway hub <-> connector tunnel client <-> device, with the
 // real worker process that has no network permission and talks only to the bridge socket.
 
+import { tempDir } from './tmp.ts';
 import { handleOpen } from '../src/connector/open.ts';
 import { runTunnel } from '../src/connector/tunnel.ts';
 import { ConnectorHub } from '../src/controller/connector_hub.ts';
@@ -10,7 +11,7 @@ import { Gateway } from '../src/controller/gateway.ts';
 import type { SessionApi } from '../src/controller/session.ts';
 import { DirectLauncher } from '../src/controller/worker_launcher.ts';
 import { importPrivateKey, pkcs8FromSeed } from '../src/shared/connector_auth.ts';
-import { workerDenoArgs } from '../src/controller/sandbox.ts';
+import { unixSocketNeedsNet, workerDenoArgs } from '../src/controller/sandbox.ts';
 import { makeCertificate, startRouterOs } from './routeros_mock.ts';
 import { assert, assertEquals } from './assert.ts';
 import { ASSIGNMENT } from './fixtures.ts';
@@ -45,10 +46,17 @@ function sessionApi(finished: Map<string, FinishBody>): SessionApi {
 }
 
 Deno.test('worker args: connector transport has no TCP permission, only the bridge socket', () => {
-  const args = workerDenoArgs('/opt/x', { address: '10.0.0.1', port: 22 }, 256, '/run/b/ab.sock');
+  const target = { address: '10.0.0.1', port: 22 };
+  const args = workerDenoArgs('/opt/x', target, 256, '/run/b/ab.sock', '2.9.8');
   assertEquals(args.filter((a) => a.startsWith('--allow-net')), [
     '--allow-net=unix:/run/b/ab.sock',
   ]);
+  // Deno 2.8 (pinned by the runtime kit) rejects a unix: net value and needs only read/write.
+  const old = workerDenoArgs('/opt/x', target, 256, '/run/b/ab.sock', '2.8.1');
+  assertEquals(old.filter((a) => a.startsWith('--allow-net')), []);
+  assert(
+    !unixSocketNeedsNet('2.8.1') && unixSocketNeedsNet('2.9.0') && unixSocketNeedsNet('3.0.0'),
+  );
   assert(args.includes('--allow-read=/opt/x,/run/b/ab.sock'));
   assert(args.includes('--allow-write=/run/b/ab.sock'));
   assert(!args.some((a) => a.startsWith('--allow-run') || a.startsWith('--allow-env')));
@@ -63,7 +71,7 @@ Deno.test({
     const device = await startDevice(key);
     const router = await startRouterOs(await makeCertificate(), PASSWORD);
     const finished = new Map<string, FinishBody>();
-    const bridgeDir = await Deno.makeTempDir({ prefix: 'agw-bridge-' });
+    const bridgeDir = await tempDir('agw-bridge-');
     const hub = new ConnectorHub({
       gatewayKey: 'gw-test1',
       api: {

@@ -1,9 +1,10 @@
 // Regression tests for the review findings of the connector (tunnel, hub, bridge, scripts).
 
+import { tempDir } from './tmp.ts';
 import { handleOpen } from '../src/connector/open.ts';
 import { startBridge } from '../src/controller/bridge.ts';
 import { ConnectorHub, type HubSocket, sourceOf } from '../src/controller/connector_hub.ts';
-import { renderConnectorSystemdRun } from '../src/controller/sandbox.ts';
+import { renderConnectorSystemdRun, unixSocketNeedsNet } from '../src/controller/sandbox.ts';
 import { openFailure } from '../src/controller/session.ts';
 import {
   importPrivateKey,
@@ -396,7 +397,7 @@ class FakeStream {
 }
 
 Deno.test('finding 2: the bridge pipes only the peer that presents the session secret', async () => {
-  const dir = await Deno.makeTempDir({ prefix: 'agw-bridge-' });
+  const dir = await tempDir('agw-bridge-');
   const stream = new FakeStream();
   const bridge = await startBridge(stream as unknown as TunnelStream, dir);
   assertMatch(bridge.secret, /^[0-9a-f]{64}$/);
@@ -426,13 +427,16 @@ Deno.test('finding 2: connector workers see a private /run with the bridge under
     { memoryMaxMB: 256, cpuQuotaPercent: 50, tasksMax: 64, maxSessionSeconds: 3600 },
     real,
   );
-  const props = argv.flatMap((a, i) => (argv[i - 1] === '-p' ? [a] : []));
-  assert(props.includes('TemporaryFileSystem=/run:ro'));
-  assert(props.includes(`BindPaths=${real}:/run/bridge.sock`));
-  assert(props.includes('InaccessiblePaths=-/run/dbus -/run/systemd'));
+  const props = new Set(argv.flatMap((a, i) => (argv[i - 1] === '-p' ? [a] : [])));
+  assert(props.has('TemporaryFileSystem=/run:ro'));
+  assert(props.has(`BindPaths=${real}:/run/bridge.sock`));
+  assert(props.has('InaccessiblePaths=-/run/dbus -/run/systemd'));
   const denoArgs = argv.slice(argv.indexOf('--') + 1);
   assert(!denoArgs.some((a) => a.includes(real)), 'real socket name is not on the worker argv');
-  assert(denoArgs.includes('--allow-net=unix:/run/bridge.sock'));
+  assertEquals(
+    denoArgs.includes('--allow-net=unix:/run/bridge.sock'),
+    unixSocketNeedsNet(Deno.version.deno),
+  );
 });
 
 Deno.test('finding 2: the worker refuses a connector init without the bridge secret', () => {
@@ -488,7 +492,7 @@ Deno.test('findings 6, 8, 12, 13, 14: install, update and unit hardening', () =>
 });
 
 Deno.test('finding 8: a downgrade or a tag/commit mismatch is refused before any checkout', async () => {
-  const dir = await Deno.makeTempDir({ prefix: 'agw-rel-' });
+  const dir = await tempDir('agw-rel-');
   const sh = async (script: string) => {
     const out = await new Deno.Command('bash', {
       args: ['-c', script],

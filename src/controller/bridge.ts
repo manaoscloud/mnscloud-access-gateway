@@ -61,7 +61,7 @@ export async function startBridge(stream: TunnelStream, dir = BRIDGE_DIR): Promi
   const secret = randomHex(SECRET_HEX / 2);
   const expected = new TextEncoder().encode(secret);
   const listener = Deno.listen({ transport: 'unix', path });
-  await Deno.chmod(path, 0o666);
+  await Deno.chmod(path, 0o666); // NOSONAR: world-connectable by design (worker is a dynamic user); only the session secret is accepted
   let connection: Deno.Conn | null = null;
   let closed = false;
 
@@ -90,8 +90,8 @@ export async function startBridge(stream: TunnelStream, dir = BRIDGE_DIR): Promi
       let conn: Deno.Conn | null = null;
       let rest: Uint8Array = new Uint8Array(0);
       for (let attempt = 0; attempt < MAX_CANDIDATES && !conn && !closed; attempt++) {
-        const candidate = await listener.accept();
-        const read = await readSecret(candidate).catch(() => null);
+        const candidate = await listener.accept(); // NOSONAR: sequential
+        const read = await readSecret(candidate).catch(() => null); // NOSONAR: sequential
         if (read && sameBytes(read.secret, expected)) {
           conn = candidate;
           rest = read.rest;
@@ -109,18 +109,18 @@ export async function startBridge(stream: TunnelStream, dir = BRIDGE_DIR): Promi
       const peer = conn;
       const toWorker = (async () => {
         for (;;) {
-          const chunk = await stream.read();
+          const chunk = await stream.read(); // NOSONAR: sequential
           if (chunk === null) break;
-          await peer.write(chunk);
+          await peer.write(chunk); // NOSONAR: sequential
         }
       })();
       const toDevice = (async () => {
         if (rest.length) await stream.write(rest);
         const buffer = new Uint8Array(32 * 1024);
         for (;;) {
-          const n = await peer.read(buffer);
+          const n = await peer.read(buffer); // NOSONAR: sequential
           if (n === null) break;
-          await stream.write(buffer.slice(0, n));
+          await stream.write(buffer.slice(0, n)); // NOSONAR: sequential
         }
       })();
       await Promise.race([toWorker, toDevice]);

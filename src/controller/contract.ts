@@ -164,15 +164,13 @@ export function parseConfig(value: unknown): GatewayConfig {
   };
 }
 
-export function parseAssignment(value: unknown): Assignment {
-  // deno-lint-ignore no-explicit-any
-  const v = value as Record<string, any>;
-  if (!v || typeof v !== 'object') throw new ContractError('Invalid assignment');
-  if (!UUID.test(String(v.connectionUUID))) throw new ContractError('Invalid connectionUUID');
-  if (v.mode !== 'console' && v.mode !== 'test') throw new ContractError('Invalid mode');
-  if (v.protocol !== 'ssh' && v.protocol !== 'routeros_api') {
-    throw new ContractError('protocol_refused');
-  }
+type Route = Pick<
+  Assignment,
+  'path' | 'transport' | 'connectorUuid' | 'connectorKeyFingerprint'
+>;
+
+/** Path, transport and connector identity (a connector assignment pins the key it expects). */
+function parseRoute(v: Record<string, unknown>): Route {
   const path = v.path ?? 'public';
   if (path !== 'public' && path !== 'connector') throw new ContractError('path_unsupported');
   const transport = v.transport ?? (path === 'connector' ? 'connector' : 'direct');
@@ -182,15 +180,43 @@ export function parseAssignment(value: unknown): Assignment {
   if ((path === 'connector') !== (transport === 'connector')) {
     throw new ContractError('path_unsupported');
   }
-  if (transport === 'connector' && !UUID.test(String(v.connectorUuid))) {
-    throw new ContractError('Invalid connectorUuid');
+  if (transport === 'direct') {
+    return { path, transport, connectorUuid: null, connectorKeyFingerprint: null };
   }
-  if (
-    transport === 'connector' &&
-    !/^SHA256:[A-Za-z0-9+/]{43}=$/.test(String(v.connectorKeyFingerprint))
-  ) {
+  if (!UUID.test(String(v.connectorUuid))) throw new ContractError('Invalid connectorUuid');
+  if (!/^SHA256:[A-Za-z0-9+/]{43}=$/.test(String(v.connectorKeyFingerprint))) {
     throw new ContractError('Invalid connectorKeyFingerprint');
   }
+  return {
+    path,
+    transport,
+    connectorUuid: v.connectorUuid as string,
+    connectorKeyFingerprint: v.connectorKeyFingerprint as string,
+  };
+}
+
+// deno-lint-ignore no-explicit-any
+function parseTicket(v: Record<string, any>): Assignment['ticket'] {
+  if (v.mode !== 'console') return null;
+  if (
+    !/^[0-9a-f]{64}$/.test(String(v.ticket?.sha256)) ||
+    Number.isNaN(Date.parse(String(v.ticket?.expiresAt)))
+  ) {
+    throw new ContractError('Invalid ticket');
+  }
+  return { sha256: v.ticket.sha256, expiresAt: v.ticket.expiresAt };
+}
+
+export function parseAssignment(value: unknown): Assignment {
+  // deno-lint-ignore no-explicit-any
+  const v = value as Record<string, any>;
+  if (!v || typeof v !== 'object') throw new ContractError('Invalid assignment');
+  if (!UUID.test(String(v.connectionUUID))) throw new ContractError('Invalid connectionUUID');
+  if (v.mode !== 'console' && v.mode !== 'test') throw new ContractError('Invalid mode');
+  if (v.protocol !== 'ssh' && v.protocol !== 'routeros_api') {
+    throw new ContractError('protocol_refused');
+  }
+  const route = parseRoute(v);
   const address = parseAddress(v.target?.address);
   if (!address) throw new ContractError('Invalid target address');
   if (!DIALECTS.includes(v.shellDialect)) throw new ContractError('Invalid shellDialect');
@@ -201,24 +227,12 @@ export function parseAssignment(value: unknown): Assignment {
     throw new ContractError('Invalid username');
   }
   if (!['n1', 'n2', 'n3'].includes(v.level)) throw new ContractError('Invalid level');
-  let ticket: Assignment['ticket'] = null;
-  if (v.mode === 'console') {
-    if (
-      !/^[0-9a-f]{64}$/.test(String(v.ticket?.sha256)) ||
-      Number.isNaN(Date.parse(String(v.ticket?.expiresAt)))
-    ) {
-      throw new ContractError('Invalid ticket');
-    }
-    ticket = { sha256: v.ticket.sha256, expiresAt: v.ticket.expiresAt };
-  }
+  const ticket = parseTicket(v);
   return {
     connectionUUID: v.connectionUUID,
     mode: v.mode,
     protocol: v.protocol,
-    path,
-    transport,
-    connectorUuid: transport === 'connector' ? v.connectorUuid : null,
-    connectorKeyFingerprint: transport === 'connector' ? v.connectorKeyFingerprint : null,
+    ...route,
     target: { address: address.text, port: int(v.target.port, 1, 65535, 'port') },
     shellDialect: v.shellDialect,
     username: v.username,

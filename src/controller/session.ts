@@ -234,6 +234,29 @@ export class Session {
     }, 5000);
   }
 
+  /** Opens the tunnel stream of a connector connection; finishes the connection and returns null on failure. */
+  async #openConnectorStream(): Promise<TunnelStream | null> {
+    const a = this.assignment;
+    try {
+      if (!this.deps.connectors) throw new OpenError('connector_offline');
+      return await this.deps.connectors.open(a.connectorUuid!, {
+        connectionUuid: a.connectionUUID,
+        host: a.target.address,
+        port: a.target.port,
+      }, a.connectorKeyFingerprint);
+    } catch (error) {
+      const failure = openFailure(error instanceof OpenError ? error.code : 'connector_failed');
+      await this.#finish({
+        t: 'exit',
+        state: failure.state,
+        reason: failure.reason,
+        bytesIn: 0,
+        bytesOut: 0,
+      });
+      return null;
+    }
+  }
+
   async #run() {
     const a = this.assignment;
     this.#event('state', { state: 'starting' });
@@ -241,26 +264,8 @@ export class Session {
     this.#control({ type: 'state', state: 'connecting' });
     try {
       if (a.transport === 'connector') {
-        let stream: TunnelStream;
-        try {
-          if (!this.deps.connectors) throw new OpenError('connector_offline');
-          stream = await this.deps.connectors.open(a.connectorUuid!, {
-            connectionUuid: a.connectionUUID,
-            host: a.target.address,
-            port: a.target.port,
-          }, a.connectorKeyFingerprint);
-        } catch (error) {
-          const code = error instanceof OpenError ? error.code : 'connector_failed';
-          const failure = openFailure(code);
-          await this.#finish({
-            t: 'exit',
-            state: failure.state,
-            reason: failure.reason,
-            bytesIn: 0,
-            bytesOut: 0,
-          });
-          return;
-        }
+        const stream = await this.#openConnectorStream();
+        if (!stream) return;
         try {
           this.#bridge = await startBridge(stream, this.deps.bridgeDir);
         } catch (error) {

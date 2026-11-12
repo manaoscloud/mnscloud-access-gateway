@@ -127,10 +127,10 @@ export class OpenError extends Error {
 }
 
 export class TunnelStream {
-  #queue: Uint8Array[] = [];
+  readonly #queue: Uint8Array[] = [];
   #readWaiter: ((chunk: Uint8Array | null) => void) | null = null;
   #sendCredit = INITIAL_WINDOW;
-  #creditWaiters: (() => void)[] = [];
+  readonly #creditWaiters: (() => void)[] = [];
   #recvWindow = INITIAL_WINDOW;
   #pendingGrant = 0;
   #remoteClosed = false;
@@ -173,7 +173,7 @@ export class TunnelStream {
     while (offset < bytes.length) {
       while (this.#sendCredit <= 0) {
         if (this.closed) throw new Error('stream closed');
-        await new Promise<void>((resolve) => this.#creditWaiters.push(resolve));
+        await new Promise<void>((resolve) => this.#creditWaiters.push(resolve)); // NOSONAR: sequential by design (credit)
       }
       if (this.closed) throw new Error('stream closed');
       const n = Math.min(DATA_CHUNK_BYTES, this.#sendCredit, bytes.length - offset);
@@ -256,9 +256,9 @@ interface PendingOpen {
 
 export class Mux implements StreamHost {
   readonly streams = new Map<number, TunnelStream>();
-  #pending = new Map<number, PendingOpen>();
+  readonly #pending = new Map<number, PendingOpen>();
   /** Connector side: OPENs received and not yet answered (cancelled by CLOSE or tunnel death). */
-  #inflight = new Map<number, AbortController>();
+  readonly #inflight = new Map<number, AbortController>();
   #nextId = 1;
   #lastReceived: number;
   #lastSent: number;
@@ -332,7 +332,7 @@ export class Mux implements StreamHost {
     }
     for (const controller of this.#inflight.values()) controller.abort();
     this.#inflight.clear();
-    for (const stream of [...this.streams.values()]) stream.remoteClose();
+    for (const stream of this.streams.values()) stream.remoteClose();
     this.streams.clear();
   }
 
@@ -392,74 +392,90 @@ export class Mux implements StreamHost {
 
   #dispatch(frame: Frame) {
     const { type, stream: id, payload } = frame;
-    const gateway = this.options.role === 'gateway';
     switch (type) {
-      case FrameType.PING: {
-        const now = this.#now();
-        if (now - this.#lastPong >= MIN_PONG_INTERVAL_MS) {
-          this.#lastPong = now;
-          this.sendFrame(FrameType.PONG, 0);
-        }
+      case FrameType.PING:
+        this.#onPing();
         return;
-      }
-      case FrameType.PONG:
+      case FrameType.OPEN:
+        this.#onOpen(id, payload);
         return;
-      case FrameType.OPEN: {
-        // Only the gateway opens streams: a connector sending OPEN ends the tunnel.
-        if (gateway) throw new TunnelProtocolError('open from connector');
-        if (id === 0 || this.streams.has(id) || this.#inflight.has(id)) {
-          throw new TunnelProtocolError('bad stream id');
-        }
-        const spec = decodeOpen(payload);
-        if (!spec) {
-          this.sendFrame(FrameType.OPEN_FAIL, id, encoder.encode('{"code":"invalid_open"}'));
-          return;
-        }
-        if (this.streamCount >= this.options.maxStreams) {
-          this.sendFrame(FrameType.OPEN_FAIL, id, encoder.encode('{"code":"too_many_streams"}'));
-          return;
-        }
-        this.#inflight.set(id, new AbortController());
-        this.options.onOpen?.(id, spec);
-        return;
-      }
       case FrameType.OPEN_OK:
-      case FrameType.OPEN_FAIL: {
-        if (!gateway) throw new TunnelProtocolError('unexpected open reply');
-        const pending = this.#pending.get(id);
-        if (!pending) return;
-        this.#pending.delete(id);
-        clearTimeout(pending.timer);
-        if (type === FrameType.OPEN_OK) pending.resolve(pending.stream);
-        else {
-          this.streams.delete(id);
-          pending.reject(new OpenError(decodeFailCode(payload)));
-        }
+      case FrameType.OPEN_FAIL:
+        this.#onOpenReply(type, id, payload);
         return;
-      }
-      case FrameType.DATA: {
-        const stream = this.streams.get(id);
-        if (stream && !this.#pending.has(id)) stream.deliver(payload.slice());
-        else if (stream) throw new TunnelProtocolError('data before open reply');
+      case FrameType.DATA:
+        this.#onData(id, payload);
         return;
-      }
-      case FrameType.CREDIT: {
-        if (payload.length !== 4) throw new TunnelProtocolError('bad credit');
-        const n = new DataView(payload.buffer, payload.byteOffset, 4).getUint32(0);
-        this.streams.get(id)?.addCredit(n);
+      case FrameType.CREDIT:
+        this.#onCredit(id, payload);
         return;
-      }
-      case FrameType.CLOSE: {
-        // The gateway gave up on an OPEN the connector is still working on.
-        const inflight = this.#inflight.get(id);
-        if (inflight) {
-          this.#inflight.delete(id);
-          inflight.abort();
-          return;
-        }
-        this.streams.get(id)?.remoteClose();
+      case FrameType.CLOSE:
+        this.#onClose(id);
         return;
-      }
+      default: // PONG: only proves the peer is alive
     }
+  }
+
+  #onPing() {
+    const now = this.#now();
+    if (now - this.#lastPong < MIN_PONG_INTERVAL_MS) return;
+    this.#lastPong = now;
+    this.sendFrame(FrameType.PONG, 0);
+  }
+
+  #onOpen(id: number, payload: Uint8Array) {
+    // Only the gateway opens streams: a connector sending OPEN ends the tunnel.
+    if (this.options.role === 'gateway') throw new TunnelProtocolError('open from connector');
+    if (id === 0 || this.streams.has(id) || this.#inflight.has(id)) {
+      throw new TunnelProtocolError('bad stream id');
+    }
+    const spec = decodeOpen(payload);
+    const refusal = spec
+      ? (this.streamCount >= this.options.maxStreams ? 'too_many_streams' : null)
+      : 'invalid_open';
+    if (refusal) {
+      this.sendFrame(FrameType.OPEN_FAIL, id, encoder.encode(JSON.stringify({ code: refusal })));
+      return;
+    }
+    this.#inflight.set(id, new AbortController());
+    this.options.onOpen?.(id, spec!);
+  }
+
+  #onOpenReply(type: number, id: number, payload: Uint8Array) {
+    if (this.options.role !== 'gateway') throw new TunnelProtocolError('unexpected open reply');
+    const pending = this.#pending.get(id);
+    if (!pending) return;
+    this.#pending.delete(id);
+    clearTimeout(pending.timer);
+    if (type === FrameType.OPEN_OK) {
+      pending.resolve(pending.stream);
+      return;
+    }
+    this.streams.delete(id);
+    pending.reject(new OpenError(decodeFailCode(payload)));
+  }
+
+  #onData(id: number, payload: Uint8Array) {
+    const stream = this.streams.get(id);
+    if (!stream) return;
+    if (this.#pending.has(id)) throw new TunnelProtocolError('data before open reply');
+    stream.deliver(payload.slice());
+  }
+
+  #onCredit(id: number, payload: Uint8Array) {
+    if (payload.length !== 4) throw new TunnelProtocolError('bad credit');
+    const n = new DataView(payload.buffer, payload.byteOffset, 4).getUint32(0);
+    this.streams.get(id)?.addCredit(n);
+  }
+
+  #onClose(id: number) {
+    // The gateway gave up on an OPEN the connector is still working on.
+    const inflight = this.#inflight.get(id);
+    if (inflight) {
+      this.#inflight.delete(id);
+      inflight.abort();
+      return;
+    }
+    this.streams.get(id)?.remoteClose();
   }
 }

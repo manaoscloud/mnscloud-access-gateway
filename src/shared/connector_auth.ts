@@ -9,15 +9,19 @@ const encoder = new TextEncoder();
 
 export function b64urlEncode(bytes: Uint8Array): string {
   let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  for (const byte of bytes) binary += String.fromCodePoint(byte);
+  const text = btoa(binary).replaceAll('+', '-').replaceAll('/', '_');
+  let end = text.length;
+  while (end > 0 && text[end - 1] === '=') end--;
+  return text.slice(0, end);
 }
 
 export function b64urlDecode(text: string): Uint8Array | null {
   if (!/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) return null;
-  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - text.length % 4) % 4);
+  const padded = text.replaceAll('-', '+').replaceAll('_', '/') +
+    '='.repeat((4 - text.length % 4) % 4);
   try {
-    return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+    return Uint8Array.from(atob(padded), (c) => c.codePointAt(0)!);
   } catch {
     return null;
   }
@@ -75,7 +79,7 @@ export async function verifyText(
 ): Promise<boolean> {
   const raw = b64urlDecode(publicKey);
   const sig = b64urlDecode(signature);
-  if (!raw || raw.length !== 32 || !sig || sig.length !== 64) return false;
+  if (raw?.length !== 32 || sig?.length !== 64) return false;
   try {
     const key = await crypto.subtle.importKey(
       'raw',
@@ -116,7 +120,7 @@ export async function publicKeyFingerprint(publicKey: string): Promise<string> {
     await crypto.subtle.digest('SHA-256', raw as Uint8Array<ArrayBuffer>),
   );
   let binary = '';
-  for (const byte of digest) binary += String.fromCharCode(byte);
+  for (const byte of digest) binary += String.fromCodePoint(byte);
   return `SHA256:${btoa(binary)}`;
 }
 

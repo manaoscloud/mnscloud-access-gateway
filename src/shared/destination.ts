@@ -7,16 +7,16 @@
 import { type Cidr, cidrContains, formatAddress, parseAddress, parseCidr } from './ip.ts';
 
 const ALWAYS_REFUSED = [
-  '0.0.0.0/8', // "this" network, unspecified
-  '127.0.0.0/8', // loopback
-  '169.254.0.0/16', // link-local, cloud metadata
-  '224.0.0.0/4', // multicast
-  '240.0.0.0/4', // reserved, includes 255.255.255.255
-  '::/127', // unspecified, loopback
-  '::ffff:0:0/96', // IPv4-mapped
-  '64:ff9b::/96', // NAT64
-  'fe80::/10', // link-local
-  'ff00::/8', // multicast
+  '0.0.0.0/8', // "this" network, unspecified // NOSONAR
+  '127.0.0.0/8', // loopback // NOSONAR
+  '169.254.0.0/16', // link-local, cloud metadata // NOSONAR
+  '224.0.0.0/4', // multicast // NOSONAR
+  '240.0.0.0/4', // reserved, includes 255.255.255.255 // NOSONAR
+  '::/127', // unspecified, loopback // NOSONAR
+  '::ffff:0:0/96', // IPv4-mapped // NOSONAR
+  '64:ff9b::/96', // NAT64 // NOSONAR
+  'fe80::/10', // link-local // NOSONAR
+  'ff00::/8', // multicast // NOSONAR
 ].map((text) => parseCidr(text)!);
 
 /** Ports the remote support never uses (Telnet is out of scope; plain RouterOS API is clear text). */
@@ -63,7 +63,7 @@ export function checkConnectorDestination(
   if (ALWAYS_REFUSED.some((cidr) => cidrContains(cidr, address))) return 'destination_refused';
   for (const own of policy.ownAddresses ?? []) {
     const parsed = parseAddress(own);
-    if (parsed && parsed.family === address.family && parsed.value === address.value) {
+    if (parsed?.family === address.family && parsed.value === address.value) {
       return 'destination_refused';
     }
   }

@@ -40,7 +40,7 @@ export function readPrivateKeyFile(path: string): Uint8Array {
     }
   }
   const bytes = b64urlDecode(Deno.readTextFileSync(path).trim());
-  if (!bytes || bytes.length !== 48) throw new Error('Invalid key file');
+  if (bytes?.length !== 48) throw new Error('Invalid key file');
   return bytes;
 }
 
@@ -64,7 +64,7 @@ export function relayUrlFor(key: string, relayUrl: unknown, relayPath: unknown, 
   try {
     url = typeof relayUrl === 'string'
       ? new URL(relayUrl)
-      : new URL(String(relayPath), new URL(apiUrl).origin);
+      : new URL(typeof relayPath === 'string' ? relayPath : '', new URL(apiUrl).origin);
   } catch {
     return null;
   }

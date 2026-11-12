@@ -61,17 +61,17 @@ export async function dialWithTimeout(
 export async function pipe(conn: Deno.Conn, stream: TunnelStream) {
   const toDevice = (async () => {
     for (;;) {
-      const chunk = await stream.read();
+      const chunk = await stream.read(); // NOSONAR: sequential pipe
       if (chunk === null) break;
-      await conn.write(chunk);
+      await conn.write(chunk); // NOSONAR: sequential pipe
     }
   })();
   const toGateway = (async () => {
     const buffer = new Uint8Array(32 * 1024);
     for (;;) {
-      const n = await conn.read(buffer);
+      const n = await conn.read(buffer); // NOSONAR: sequential pipe
       if (n === null) break;
-      await stream.write(buffer.slice(0, n));
+      await stream.write(buffer.slice(0, n)); // NOSONAR: sequential pipe
     }
   })();
   try {
@@ -83,6 +83,40 @@ export async function pipe(conn: Deno.Conn, stream: TunnelStream) {
   stream.close();
 }
 
+/** Asks the API to confirm the connection; returns a refusal code, or null when confirmed. */
+async function confirm(
+  spec: OpenSpec,
+  deps: OpenDeps,
+  signal: AbortSignal,
+): Promise<string | null> {
+  try {
+    const accepted = await deps.accept(
+      spec.connectionUuid,
+      spec.host,
+      spec.port,
+      AbortSignal.any([signal, AbortSignal.timeout(ACCEPT_TIMEOUT_MS)]),
+    );
+    return accepted ? null : 'api_refused';
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    const client = typeof status === 'number' && status >= 400 && status < 500 && status !== 429;
+    return client ? 'api_refused' : 'api_unavailable';
+  }
+}
+
+/** Dials the device; returns the connection or a refusal code. */
+async function dial(
+  spec: OpenSpec,
+  deps: OpenDeps,
+  signal: AbortSignal,
+): Promise<Deno.Conn | string> {
+  try {
+    return await deps.connect(spec.host, spec.port, CONNECT_TIMEOUT_MS, signal);
+  } catch (error) {
+    return (error as Error).message === 'connect_timeout' ? 'connect_timeout' : 'connect_failed';
+  }
+}
+
 export async function handleOpen(mux: Mux, id: number, spec: OpenSpec, deps: OpenDeps) {
   const refuse = (code: string) => {
     deps.log(`stream ${id} refused: ${code}`);
@@ -91,43 +125,27 @@ export async function handleOpen(mux: Mux, id: number, spec: OpenSpec, deps: Ope
   // Aborted when the gateway gave up (CLOSE) or the tunnel died: nothing may stay open for it.
   const signal = mux.openSignal(id);
   if (!signal) return;
-  if (!UUID.test(spec.connectionUuid)) return refuse('invalid_open');
-  const verdict = checkConnectorDestination(spec.host, spec.port, deps.policy());
-  if (verdict) return refuse(verdict);
-  try {
-    const accepted = await deps.accept(
-      spec.connectionUuid,
-      spec.host,
-      spec.port,
-      AbortSignal.any([signal, AbortSignal.timeout(ACCEPT_TIMEOUT_MS)]),
-    );
-    if (!accepted) return refuse('api_refused');
-  } catch (error) {
-    if (signal.aborted) return;
-    const status = (error as { status?: number }).status;
-    return refuse(
-      typeof status === 'number' && status >= 400 && status < 500 && status !== 429
-        ? 'api_refused'
-        : 'api_unavailable',
-    );
-  }
+  const early = UUID.test(spec.connectionUuid)
+    ? checkConnectorDestination(spec.host, spec.port, deps.policy())
+    : 'invalid_open';
+  if (early) return refuse(early);
+  const refused = await confirm(spec, deps, signal);
   if (signal.aborted) return;
-  let conn: Deno.Conn;
-  try {
-    conn = await deps.connect(spec.host, spec.port, CONNECT_TIMEOUT_MS, signal);
-  } catch (error) {
-    if (signal.aborted) return;
-    return refuse(
-      (error as Error).message === 'connect_timeout' ? 'connect_timeout' : 'connect_failed',
-    );
-  }
-  const stream = signal.aborted ? null : mux.acceptOpen(id);
-  if (!stream) {
-    // The gateway gave up while we were dialing: do not keep the device connection.
-    try {
-      conn.close();
-    } catch { /* closed */ }
+  if (refused) return refuse(refused);
+  const dialed = await dial(spec, deps, signal);
+  if (signal.aborted || typeof dialed === 'string') {
+    if (typeof dialed === 'string') {
+      if (!signal.aborted) refuse(dialed);
+    } else closeQuietly(dialed); // the gateway gave up while we were dialing
     return;
   }
-  await pipe(conn, stream);
+  const stream = mux.acceptOpen(id);
+  if (!stream) return closeQuietly(dialed);
+  await pipe(dialed, stream);
+}
+
+function closeQuietly(conn: Deno.Conn) {
+  try {
+    conn.close();
+  } catch { /* closed */ }
 }

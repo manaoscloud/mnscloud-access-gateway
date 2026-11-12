@@ -61,6 +61,34 @@ export class Gateway {
     return this.sessions.size;
   }
 
+  /** Destination, protocol and (connector) tunnel checks; null when the assignment may proceed. */
+  #preflight(assignment: Assignment): { reason: string; state: FinishBody['state'] } | null {
+    const { address, port } = assignment.target;
+    if (assignment.transport !== 'connector') {
+      const destination = checkDestination(address, this.options.denylist);
+      if (destination.allowed && ![23, 8728].includes(port)) return null;
+      return {
+        reason: destination.allowed ? 'protocol_refused' : 'destination_refused',
+        state: 'refused',
+      };
+    }
+    // Tenant private ranges are the point of a connector: only the always-refused set applies
+    // here (the API and the connector check the tenant's allowed networks).
+    const verdict = checkConnectorDestination(address, port, { allowedCidrs: [] });
+    if (verdict) {
+      return {
+        reason: verdict === 'protocol_refused' ? verdict : 'destination_refused',
+        state: 'refused',
+      };
+    }
+    const tunnelKey = this.options.hub?.fingerprintOf(assignment.connectorUuid!) ?? null;
+    if (tunnelKey === null) return { reason: 'connector_offline', state: 'failed' };
+    if (tunnelKey !== assignment.connectorKeyFingerprint) {
+      return { reason: 'connector_key_mismatch', state: 'refused' };
+    }
+    return null;
+  }
+
   /** Accepts one raw assignment from the API; refused ones are finished at once. */
   async accept(raw: unknown): Promise<'started' | 'waiting' | 'refused'> {
     const uuid = typeof (raw as { connectionUUID?: unknown })?.connectionUUID === 'string'
@@ -83,45 +111,13 @@ export class Gateway {
     if (
       this.sessions.has(assignment.connectionUUID) || this.#pending.has(assignment.connectionUUID)
     ) return 'waiting';
-    if (assignment.transport === 'connector') {
-      // Tenant private ranges are the point of a connector: only the always-refused set applies
-      // here (the API and the connector check the tenant's allowed networks).
-      const verdict = checkConnectorDestination(
-        assignment.target.address,
-        assignment.target.port,
-        { allowedCidrs: [] },
-      );
-      if (verdict) {
-        await this.options.deps.api.finish(
-          assignment.connectionUUID,
-          refusal(assignment, verdict === 'protocol_refused' ? verdict : 'destination_refused'),
-        ).catch(() => {});
-        return 'refused';
-      }
-      const tunnelKey = this.options.hub?.fingerprintOf(assignment.connectorUuid!) ?? null;
-      if (tunnelKey !== null && tunnelKey !== assignment.connectorKeyFingerprint) {
-        await this.options.deps.api.finish(
-          assignment.connectionUUID,
-          refusal(assignment, 'connector_key_mismatch'),
-        ).catch(() => {});
-        return 'refused';
-      }
-      if (tunnelKey === null) {
-        await this.options.deps.api.finish(
-          assignment.connectionUUID,
-          refusal(assignment, 'connector_offline', 'failed'),
-        ).catch(() => {});
-        return 'refused';
-      }
-    } else {
-      const destination = checkDestination(assignment.target.address, this.options.denylist);
-      if (!destination.allowed || [23, 8728].includes(assignment.target.port)) {
-        await this.options.deps.api.finish(
-          assignment.connectionUUID,
-          refusal(assignment, destination.allowed ? 'protocol_refused' : 'destination_refused'),
-        ).catch(() => {});
-        return 'refused';
-      }
+    const refused = this.#preflight(assignment);
+    if (refused) {
+      await this.options.deps.api.finish(
+        assignment.connectionUUID,
+        refusal(assignment, refused.reason, refused.state),
+      ).catch(() => {});
+      return 'refused';
     }
     if (this.#draining || this.freeSlots <= 0) {
       await this.options.deps.api.finish(

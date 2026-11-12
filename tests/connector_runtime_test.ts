@@ -205,7 +205,7 @@ Deno.test('config: local file, relay URL and remote configuration are validated'
     keyFile: '/etc/mnscloud-access-connector/key.pkcs8',
   }));
   assertEquals(local.apiUrl, 'https://api.example.com/api/v1');
-  for (const bad of [{ keyFile: '/etc/../x' }, { connectorUuid: 'x' }, { apiUrl: 'http://a' }]) {
+  for (const bad of [{ keyFile: '/etc/../x' }, { connectorUuid: 'x' }, { apiUrl: 'ftp://a' }]) {
     let threw = false;
     try {
       parseLocalConfig(JSON.stringify({

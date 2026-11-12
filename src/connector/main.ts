@@ -98,14 +98,14 @@ async function run() {
   while (running) {
     const gateway = haveConfig ? remote.gateway : null;
     if (!gateway) {
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      await new Promise((resolve) => setTimeout(resolve, 5000)); // NOSONAR: sequential loop
       continue;
     }
     current = new AbortController();
     currentGateway = gateway.relayUrl;
     const startedAt = Date.now();
     log(`connecting tunnel to gateway ${gateway.key}`);
-    const ready = await runTunnel({
+    const ready = await runTunnel({ // NOSONAR: sequential loop
       relayUrl: gateway.relayUrl,
       gatewayKey: gateway.key,
       connectorUuid: config.connectorUuid,
@@ -133,7 +133,7 @@ async function run() {
       void heartbeat();
     }
     failures = ready && Date.now() - startedAt > 30000 ? 0 : failures + 1;
-    if (running) await new Promise((resolve) => setTimeout(resolve, backoffMs(failures)));
+    if (running) await new Promise((resolve) => setTimeout(resolve, backoffMs(failures))); // NOSONAR: sequential loop
   }
 }
 

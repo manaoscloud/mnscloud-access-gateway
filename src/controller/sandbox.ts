@@ -37,18 +37,26 @@ export function allowNet(target: SessionTarget): string {
   return `${host}:${target.port}`;
 }
 
+/** True for Deno >= 2.9, which requires `--allow-net=unix:<path>` to open a unix socket. */
+export function unixSocketNeedsNet(version: string): boolean {
+  const [major, minor] = version.split('.').map(Number);
+  return major > 2 || (major === 2 && minor >= 9);
+}
+
 /** Deno command line of the worker (also used without systemd by the tests). */
 export function workerDenoArgs(
   runtimeRoot: string,
   target: SessionTarget,
   memoryMaxMB = 256,
   bridge: string | null = null,
+  denoVersion: string = Deno.version.deno,
 ): string[] {
-  // Connector transport: no TCP/UDP permission at all; Deno needs net, read and write grants for
-  // the one unix socket of the controller bridge (and nothing else).
+  // Connector transport: no TCP/UDP permission at all, only the one unix socket of the controller
+  // bridge. Deno 2.8 (pinned by the runtime kit) grants it through read/write alone and rejects a
+  // `unix:` net value; from 2.9 the same socket also needs a net grant for exactly that path.
   const access = bridge
     ? [
-      `--allow-net=unix:${bridge}`,
+      ...(unixSocketNeedsNet(denoVersion) ? [`--allow-net=unix:${bridge}`] : []),
       `--allow-read=${runtimeRoot},${bridge}`,
       `--allow-write=${bridge}`,
     ]

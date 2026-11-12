@@ -89,8 +89,8 @@ export class ConnectorHub {
   readonly tunnels = new Map<string, Tunnel>();
   #pending = 0;
   #lookups = 0;
-  #bySource = new Map<string, number>();
-  #chains = new Map<string, Promise<void>>();
+  readonly #bySource = new Map<string, number>();
+  readonly #chains = new Map<string, Promise<void>>();
   #draining = false;
 
   constructor(private readonly options: HubOptions) {}
@@ -262,7 +262,7 @@ export class ConnectorHub {
       return; // transient API failure: keep the tunnel, the next check decides
     }
     if (this.tunnels.get(tunnel.uuid) !== tunnel) return;
-    if (!record || record.publicKey !== tunnel.publicKey) {
+    if (record?.publicKey !== tunnel.publicKey) {
       this.options.log('connector key no longer valid: closing its tunnel');
       fail(4401, 'key_changed');
     }
