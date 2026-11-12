@@ -3,7 +3,12 @@
 import { tempDir } from './tmp.ts';
 import { handleOpen } from '../src/connector/open.ts';
 import { startBridge } from '../src/controller/bridge.ts';
-import { ConnectorHub, type HubSocket, sourceOf } from '../src/controller/connector_hub.ts';
+import {
+  AttachRefused,
+  ConnectorHub,
+  type HubSocket,
+  sourceOf,
+} from '../src/controller/connector_hub.ts';
 import { renderConnectorSystemdRun, unixSocketNeedsNet } from '../src/controller/sandbox.ts';
 import { openFailure } from '../src/controller/session.ts';
 import {
@@ -578,4 +583,75 @@ Deno.test('lab finding: the service unit grants every sys API the connector runt
   }
   assert(used.has('uid'), 'key file owner check uses Deno.uid()');
   for (const name of used) assert(granted.has(name), `--allow-sys lacks ${name}`);
+});
+
+Deno.test('lab finding: a tunnel the API no longer records is attached again, or closed', async () => {
+  // 'none' (a disable/enable cleared the record while the socket stayed up): attach again, keep it.
+  let attachment: 'here' | 'none' | 'other' = 'here';
+  let attachError: Error | null = null;
+  const { hub, calls } = hubWith({
+    connector: () => Promise.resolve({ publicKey: PUBLIC_KEY, attachment }),
+    connectorAttach: (u) => {
+      calls.push(`attach:${u}`);
+      return attachError ? Promise.reject(attachError) : Promise.resolve();
+    },
+  });
+  const socket = new FakeSocket();
+  hub.attach(socket);
+  await hello(socket);
+  await settle();
+  assertEquals(calls, [`attach:${CONNECTOR}`]);
+  await settle(60);
+  assertEquals(calls.length, 1); // 'here': nothing to do
+  attachment = 'none';
+  await settle(60);
+  assert(calls.length >= 2 && calls.every((c) => c === `attach:${CONNECTOR}`));
+  assertEquals(socket.closed, null);
+  assert(hub.has(CONNECTOR));
+  // A transient attach failure keeps the tunnel; a refusal closes it.
+  attachError = new Error('down');
+  await settle(60);
+  assertEquals(socket.closed, null);
+  attachError = new AttachRefused('Access connector not found');
+  await settle(80);
+  assertEquals(socket.closed?.[0], 4503);
+  assert(!hub.has(CONNECTOR));
+
+  // 'other': another gateway holds the connector now.
+  const other = hubWith({
+    connector: () => Promise.resolve({ publicKey: PUBLIC_KEY, attachment: 'other' as const }),
+  });
+  const s2 = new FakeSocket();
+  other.hub.attach(s2);
+  await hello(s2);
+  await settle(80);
+  assertEquals(s2.closed?.[0], 4409);
+  assert(!other.hub.has(CONNECTOR));
+});
+
+Deno.test('lab finding: runtime API maps the attachment and turns attach refusals into AttachRefused', async () => {
+  const { RuntimeApi } = await import('../src/controller/runtime_api.ts');
+  const { ControlPlaneRejected } = await import('../src/controller/control_plane.ts');
+  let reply: unknown = null;
+  let reject: Error | null = null;
+  const cp = {
+    call: () => (reject ? Promise.reject(reject) : Promise.resolve(reply)),
+  } as unknown as ConstructorParameters<typeof RuntimeApi>[0];
+  const api = new RuntimeApi(cp);
+  for (
+    const [sent, got] of [['none', 'none'], ['other', 'other'], ['here', 'here'], [
+      undefined,
+      'here',
+    ]]
+  ) {
+    reply = { publicKey: PUBLIC_KEY, attachment: sent };
+    assertEquals((await api.connector(CONNECTOR))?.attachment, got);
+  }
+  reject = new ControlPlaneRejected(404, 'ACCESS_CONNECTOR_NOT_FOUND');
+  assertEquals(await api.connector(CONNECTOR), null);
+  const refused = await api.connectorAttach(CONNECTOR).then(() => null, (e) => e);
+  assert(refused instanceof AttachRefused);
+  reject = new ControlPlaneRejected(502, '');
+  const transient = await api.connectorAttach(CONNECTOR).then(() => null, (e) => e);
+  assert(transient instanceof ControlPlaneRejected && !(transient instanceof AttachRefused));
 });
