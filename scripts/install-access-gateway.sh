@@ -47,14 +47,9 @@ LISTEN_ADDRESS="$(sed -n 's/^ACCESS_GATEWAY_LISTEN_ADDRESS=//p' "$ENV_FILE" | he
 install -d -m 0755 /var/lib/mnscloud /etc/mnscloud
 install -d -m 0700 "$STATE_DIR" /etc/mnscloud/access-gateway "$TLS_DIR"
 # Listener certificate (local, self-signed, never leaves the host except its public part, which
-# the API pins for the edge). Rotated only when it is missing or expires within 30 days.
-if [[ ! -f "$TLS_DIR/cert.pem" ]] || ! openssl x509 -checkend 2592000 -noout -in "$TLS_DIR/cert.pem" >/dev/null 2>&1; then
- openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 825 \
-  -subj "/CN=mnscloud-access-gateway" -addext "subjectAltName=IP:$LISTEN_ADDRESS" \
-  -keyout "$TLS_DIR/key.pem.new" -out "$TLS_DIR/cert.pem.new" >/dev/null 2>&1
- chmod 0600 "$TLS_DIR/key.pem.new" "$TLS_DIR/cert.pem.new"
- mv -f "$TLS_DIR/key.pem.new" "$TLS_DIR/key.pem"
- mv -f "$TLS_DIR/cert.pem.new" "$TLS_DIR/cert.pem"
+# the API pins for the edge). Rewritten when it is missing, expires within 30 days, or is a CA.
+if listener_certificate_stale "$TLS_DIR"; then
+ write_listener_certificate "$TLS_DIR" "$LISTEN_ADDRESS"
 fi
 bash "$ROOT_DIR/scripts/render-units.sh"
 "$ROOT_DIR/scripts/update-access-gateway.sh" --env "$ENV_FILE" --no-checkout-rollback
