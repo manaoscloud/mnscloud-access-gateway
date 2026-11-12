@@ -42,6 +42,29 @@ ensure_deno() {
 fix_runtime_permissions() {
  find "$ROOT_DIR" -path "$ROOT_DIR/.git" -prune -o -exec chmod go+rX,go-w {} +
 }
+# Listener certificate: self-signed end-entity (CA:FALSE, serverAuth). rustls refuses a CA
+# certificate presented by a server (CaUsedAsEndEntity), so the openssl default (CA:TRUE) breaks
+# the health probe and every pinned client. Usage: write_listener_certificate <dir> <address>.
+write_listener_certificate() {
+ local dir="$1" address="$2"
+ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 825 \
+  -subj "/CN=mnscloud-access-gateway" -addext "subjectAltName=IP:$address" \
+  -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -keyout "$dir/key.pem.new" -out "$dir/cert.pem.new" >/dev/null 2>&1
+ chmod 0600 "$dir/key.pem.new" "$dir/cert.pem.new"
+ mv -f "$dir/key.pem.new" "$dir/key.pem"
+ mv -f "$dir/cert.pem.new" "$dir/cert.pem"
+}
+# True when the listener certificate must be (re)written: missing, expiring within 30 days, or a
+# CA certificate written by an earlier installer.
+listener_certificate_stale() {
+ local cert="$1/cert.pem"
+ [[ -f "$cert" ]] || return 0
+ openssl x509 -checkend 2592000 -noout -in "$cert" >/dev/null 2>&1 || return 0
+ openssl x509 -noout -ext basicConstraints -in "$cert" 2>/dev/null | grep -q 'CA:TRUE' && return 0
+ return 1
+}
 deno_run() {
  DENO_DIR="$DENO_CACHE_DIR" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 "$DENO_BIN" run --cached-only --frozen --no-prompt \
   "--config=$ROOT_DIR/deno.json" "$@"
