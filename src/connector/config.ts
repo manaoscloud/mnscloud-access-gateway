@@ -62,9 +62,8 @@ const GATEWAY_KEY = /^[a-z0-9][a-z0-9-]{1,62}$/;
 export function relayUrlFor(key: string, relayUrl: unknown, relayPath: unknown, apiUrl: string) {
   let url: URL;
   try {
-    url = typeof relayUrl === 'string'
-      ? new URL(relayUrl)
-      : new URL(typeof relayPath === 'string' ? relayPath : '', new URL(apiUrl).origin);
+    if (typeof relayUrl === 'string') url = new URL(relayUrl);
+    else url = new URL(typeof relayPath === 'string' ? relayPath : '', new URL(apiUrl).origin);
   } catch {
     return null;
   }

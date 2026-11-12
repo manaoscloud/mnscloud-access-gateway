@@ -183,16 +183,15 @@ function parseRoute(v: Record<string, unknown>): Route {
   if (transport === 'direct') {
     return { path, transport, connectorUuid: null, connectorKeyFingerprint: null };
   }
-  if (!UUID.test(String(v.connectorUuid))) throw new ContractError('Invalid connectorUuid');
-  if (!/^SHA256:[A-Za-z0-9+/]{43}=$/.test(String(v.connectorKeyFingerprint))) {
+  const connectorUuid = typeof v.connectorUuid === 'string' ? v.connectorUuid : '';
+  const fingerprint = typeof v.connectorKeyFingerprint === 'string'
+    ? v.connectorKeyFingerprint
+    : '';
+  if (!UUID.test(connectorUuid)) throw new ContractError('Invalid connectorUuid');
+  if (!/^SHA256:[A-Za-z0-9+/]{43}=$/.test(fingerprint)) {
     throw new ContractError('Invalid connectorKeyFingerprint');
   }
-  return {
-    path,
-    transport,
-    connectorUuid: v.connectorUuid as string,
-    connectorKeyFingerprint: v.connectorKeyFingerprint as string,
-  };
+  return { path, transport, connectorUuid, connectorKeyFingerprint: fingerprint };
 }
 
 // deno-lint-ignore no-explicit-any

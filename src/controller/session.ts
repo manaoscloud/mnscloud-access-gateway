@@ -257,24 +257,33 @@ export class Session {
     }
   }
 
+  /** Session network or connector bridge; false when the connection was already finished. */
+  async #prepareTransport(): Promise<boolean> {
+    const a = this.assignment;
+    if (a.transport !== 'connector') {
+      if (this.deps.networks) {
+        this.#net = await this.deps.networks.create(a.connectionUUID, a.target);
+      }
+      return true;
+    }
+    const stream = await this.#openConnectorStream();
+    if (!stream) return false;
+    try {
+      this.#bridge = await startBridge(stream, this.deps.bridgeDir);
+    } catch (error) {
+      stream.close();
+      throw error;
+    }
+    return true;
+  }
+
   async #run() {
     const a = this.assignment;
     this.#event('state', { state: 'starting' });
     this.#eventTimer = setInterval(() => this.#flushEvents(), 1000);
     this.#control({ type: 'state', state: 'connecting' });
     try {
-      if (a.transport === 'connector') {
-        const stream = await this.#openConnectorStream();
-        if (!stream) return;
-        try {
-          this.#bridge = await startBridge(stream, this.deps.bridgeDir);
-        } catch (error) {
-          stream.close();
-          throw error;
-        }
-      } else if (this.deps.networks) {
-        this.#net = await this.deps.networks.create(a.connectionUUID, a.target);
-      }
+      if (!(await this.#prepareTransport())) return;
       this.#worker = await this.deps.launcher.launch(
         a.target,
         this.#net,

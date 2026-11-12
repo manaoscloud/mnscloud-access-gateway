@@ -191,8 +191,8 @@ Deno.test('open: a confirmed connection is piped to the device', async () => {
   assertEquals(h.sent.at(-1)?.type, FrameType.OPEN_OK);
   h.mux.receive(encodeFrame(FrameType.DATA, 3, new TextEncoder().encode('ping')));
   await new Promise((r) => setTimeout(r, 50));
-  const data = h.sent.filter((f) => f.type === FrameType.DATA && f.stream === 3);
-  assertEquals(new TextDecoder().decode(data[0].payload), 'ping');
+  const data = h.sent.find((f) => f.type === FrameType.DATA && f.stream === 3);
+  assertEquals(new TextDecoder().decode(data?.payload), 'ping');
   h.mux.receive(encodeFrame(FrameType.CLOSE, 3));
   await done;
   echo.close();
@@ -205,7 +205,7 @@ Deno.test('config: local file, relay URL and remote configuration are validated'
     keyFile: '/etc/mnscloud-access-connector/key.pkcs8',
   }));
   assertEquals(local.apiUrl, 'https://api.example.com/api/v1');
-  for (const bad of [{ keyFile: '/etc/../x' }, { connectorUuid: 'x' }, { apiUrl: 'ftp://a' }]) {
+  for (const bad of [{ keyFile: '/etc/../x' }, { connectorUuid: 'x' }, { apiUrl: 'ssh://a' }]) {
     let threw = false;
     try {
       parseLocalConfig(JSON.stringify({

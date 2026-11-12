@@ -12,8 +12,12 @@ export const PASSWORD = 'Dev1ce-Pa55word!';
 
 export type Behaviour = 'normal' | 'flood' | 'escapes' | 'inject';
 
+/** ssh2's generator occasionally (about 1 in 400) emits a key its own parser rejects: retry. */
 export function generateHostKey(): string {
-  return utils.generateKeyPairSync('ed25519').private;
+  for (;;) {
+    const key = utils.generateKeyPairSync('ed25519').private;
+    if (!(utils.parseKey(key) instanceof Error)) return key;
+  }
 }
 
 export function fingerprintOf(privateKey: string): string {

@@ -430,9 +430,9 @@ export class Mux implements StreamHost {
       throw new TunnelProtocolError('bad stream id');
     }
     const spec = decodeOpen(payload);
-    const refusal = spec
-      ? (this.streamCount >= this.options.maxStreams ? 'too_many_streams' : null)
-      : 'invalid_open';
+    let refusal: string | null = null;
+    if (!spec) refusal = 'invalid_open';
+    else if (this.streamCount >= this.options.maxStreams) refusal = 'too_many_streams';
     if (refusal) {
       this.sendFrame(FrameType.OPEN_FAIL, id, encoder.encode(JSON.stringify({ code: refusal })));
       return;

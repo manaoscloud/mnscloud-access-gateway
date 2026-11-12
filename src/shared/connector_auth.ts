@@ -6,11 +6,15 @@ export const REQUEST_SIGNATURE_VERSION = 'mns-connector-v1';
 export const TUNNEL_SIGNATURE_VERSION = 'mns-connector-tunnel-v1';
 
 const encoder = new TextEncoder();
+const TO_URL: Record<string, string> = { '+': '-', '/': '_' };
+const FROM_URL: Record<string, string> = { '-': '+', '_': '/' };
+const mapChars = (text: string, map: Record<string, string>) =>
+  Array.from(text, (c) => map[c] ?? c).join('');
 
 export function b64urlEncode(bytes: Uint8Array): string {
   let binary = '';
   for (const byte of bytes) binary += String.fromCodePoint(byte);
-  const text = btoa(binary).replaceAll('+', '-').replaceAll('/', '_');
+  const text = mapChars(btoa(binary), TO_URL);
   let end = text.length;
   while (end > 0 && text[end - 1] === '=') end--;
   return text.slice(0, end);
@@ -18,7 +22,7 @@ export function b64urlEncode(bytes: Uint8Array): string {
 
 export function b64urlDecode(text: string): Uint8Array | null {
   if (!/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) return null;
-  const padded = text.replaceAll('-', '+').replaceAll('_', '/') +
+  const padded = mapChars(text, FROM_URL) +
     '='.repeat((4 - text.length % 4) % 4);
   try {
     return Uint8Array.from(atob(padded), (c) => c.codePointAt(0)!);

@@ -84,7 +84,7 @@ export async function pipe(conn: Deno.Conn, stream: TunnelStream) {
 }
 
 /** Asks the API to confirm the connection; returns a refusal code, or null when confirmed. */
-async function confirm(
+async function confirmWithApi(
   spec: OpenSpec,
   deps: OpenDeps,
   signal: AbortSignal,
@@ -129,7 +129,7 @@ export async function handleOpen(mux: Mux, id: number, spec: OpenSpec, deps: Ope
     ? checkConnectorDestination(spec.host, spec.port, deps.policy())
     : 'invalid_open';
   if (early) return refuse(early);
-  const refused = await confirm(spec, deps, signal);
+  const refused = await confirmWithApi(spec, deps, signal);
   if (signal.aborted) return;
   if (refused) return refuse(refused);
   const dialed = await dial(spec, deps, signal);
