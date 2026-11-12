@@ -6,10 +6,11 @@ import type {
   FinishBody,
   HostKeyResponse,
 } from './contract.ts';
-import type { ControlPlane } from './control_plane.ts';
+import { type ControlPlane, ControlPlaneRejected } from './control_plane.ts';
+import type { ConnectorRuntimeApi } from './connector_hub.ts';
 import type { RuntimeEvent, SessionApi } from './session.ts';
 
-export class RuntimeApi implements SessionApi {
+export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
   constructor(private readonly cp: ControlPlane) {}
 
   config() {
@@ -21,6 +22,25 @@ export class RuntimeApi implements SessionApi {
       query: { cursor, wait: waitSeconds, free },
       timeoutMs: (waitSeconds + 15) * 1000,
     });
+  }
+
+  /** Public key of an active, operational connector of this environment (null when not usable). */
+  async connector(uuid: string) {
+    try {
+      const data = await this.cp.call<{ publicKey?: unknown } | null>('GET', `/connectors/${uuid}`);
+      return typeof data?.publicKey === 'string' ? { publicKey: data.publicKey } : null;
+    } catch (error) {
+      if (error instanceof ControlPlaneRejected && [403, 404].includes(error.status)) return null;
+      throw error;
+    }
+  }
+
+  async connectorAttach(uuid: string) {
+    await this.cp.call('POST', `/connectors/${uuid}/attach`, {});
+  }
+
+  async connectorDetach(uuid: string) {
+    await this.cp.call('POST', `/connectors/${uuid}/detach`, {});
   }
 
   heartbeat(body: Record<string, unknown>) {

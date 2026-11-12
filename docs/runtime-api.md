@@ -153,7 +153,10 @@ ends them (finish reason `cancelled`).
   "connectionUUID": "uuid",
   "mode": "console | test",
   "protocol": "ssh | routeros_api",
-  "path": "public",
+  "path": "public | connector",
+  "transport": "direct | connector",
+  "connectorUuid": "uuid (required, and only allowed, when transport is connector)",
+  "connectorKeyFingerprint": "SHA256:<44 base64 chars incl. padding> (required with transport connector)",
   "target": { "address": "<IP literal resolved by the API with the rebinding guard>", "port": 22 },
   "shellDialect": "routeros | linux | proxmox | vrp | other",
   "username": "<device login, no CR/LF/NUL, <=128>",
@@ -178,8 +181,19 @@ ends them (finish reason `cancelled`).
   ticket is 32 random bytes from the API, base64url without padding (43 characters). The gateway
   accepts it once, until `min(expiresAt, received + 60 s)`.
 - `protocol` `routeros_api` is accepted only with `mode: test` and port 8729 semantics (TLS). Port 23
-  and 8728, `telnet`, and any `path` other than `public` are refused in this release.
+  and 8728, `telnet`, and any `path` other than `public` and `connector` are refused in this
+  release. `transport` defaults to `connector` when `path` is `connector` and to `direct` otherwise;
+  `path: connector` requires `transport: connector` (and the reverse), otherwise `path_unsupported`.
+  `connectorKeyFingerprint` is the fingerprint of the connector public key the API has on file
+  (`SHA256:` + base64 of sha256(raw key), as in `AcnPublicKeyFingerprint`); the gateway refuses the
+  connection (`refused`, `connector_key_mismatch`) when the tunnel authenticated with another key,
+  and drops any tunnel whose key it can no longer confirm with `GET /connectors/:uuid` (checked
+  every 60 s: a disabled, deleted or re-installed connector loses its tunnel).
 - The gateway refuses (finish `refused`) any target in the denylist unless it is a DEV lab target.
+  For `transport: connector` the public denylist does not apply (tenant private ranges are the
+  point); the gateway still refuses loopback, link-local, multicast, unspecified, broadcast and
+  IPv4-mapped targets and ports 23/8728, and finishes `failed` with `connector_offline` when the
+  connector has no tunnel attached to this gateway (see "Remote access connector").
 - `level` drives the manual-mode policy (`src/worker/policy.ts`).
 
 ## 4. `POST /connections/:uuid/hostkey`
@@ -259,7 +273,7 @@ Exactly once per connection (also for refused and expired assignments).
 ```json
 {
   "state": "closed | failed | refused | expired",
-  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
+  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | connector_offline | connector_key_mismatch | connector_open_failed | not_allowed | api_refused | api_unavailable | connect_timeout | open_timeout | too_many_streams | tunnel_closed | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
   "bytesFromDevice": 0,
   "bytesToDevice": 0,
   "durationMs": 0,
@@ -305,6 +319,20 @@ Every 30 s:
 `/config` (host firewall and limits are applied at once; a changed listener restarts the
 controller). `drain` is informative (the API stops assigning).
 
+## 10. Connector routes of the gateway (host Agent identity, same router)
+
+Used by the connector tunnel (section "Remote access connector"). Base `/api/v1/access/runtime`.
+
+- `GET /connectors/:connectorUuid`: `data` `{ "connectorUuid": "uuid", "publicKey": "<base64url Ed25519, 43 chars>" }`
+  for a connector that is `active` + `operational` and belongs to this gateway's environment. Any
+  other state (disabled, deleted, awaiting installation, other environment): `403
+  ACCESS_GATEWAY_CONNECTOR_FORBIDDEN` or `404 ACCESS_GATEWAY_CONNECTOR_NOT_FOUND` (the gateway treats
+  both as an authentication failure of the tunnel).
+- `POST /connectors/:connectorUuid/attach` (body `{}`): the authenticated tunnel is now attached to
+  this gateway (stores gateway and `AcnTunnelConnectedAt`). A newer tunnel simply overwrites it.
+- `POST /connectors/:connectorUuid/detach` (body `{}`): the tunnel closed; clear the attachment only
+  when it still points to this gateway.
+
 ## WebSocket (browser <-> edge <-> gateway)
 
 `wss://<app domain>/access-gateway/<gatewayKey>/ws?ticket=<ticket>` (nginx; it must not log the
@@ -341,3 +369,165 @@ Control messages (`3:`):
 must carry the current `step`. Close codes: 4401 credential refused/unavailable, 4403 host key not
 accepted, 4408 idle/maximum duration, 4409 host key changed, 4413 output limit, 4500 other failure,
 1000 normal; HTTP 401 before upgrade for an invalid, used or expired ticket.
+
+## Remote access connector (tenant network path)
+
+A connector is a runtime the tenant installs in its own network (Debian 12/13, Ubuntu 22.04/24.04,
+amd64/arm64). It opens an outbound tunnel to the access gateway the platform assigned to it, so the
+gateway can reach LAN and CGNAT devices (private addresses). It holds no platform secret: its
+identity is an Ed25519 key generated on the tenant host; only the public key is known to the platform.
+
+### Installation
+
+The App shows one command (single-use token, 24 h). The script is downloaded to a private temporary
+file and pinned by the SHA-256 the API computes from the raw file of the release tag
+(`scripts/install-connector.sh` at `<tag>`); the commit is verified again after the clone. The token
+travels on **stdin** (never in the environment or on a command line, where it would show up in
+`/proc`, shell history and sudo logs):
+
+```text
+f=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/manaoscloud/mnscloud-access-gateway/<tag>/scripts/install-connector.sh -o "$f" \
+  && echo "<sha256 of the script at <tag>>  $f" | sha256sum -c - \
+  && printf '%s' '<token>' | sudo env MNSCLOUD_API_URL=<public api base> MNSCLOUD_CONNECTOR_RELEASE=<tag> MNSCLOUD_CONNECTOR_COMMIT=<40 hex> bash "$f"; rm -f "$f"
+```
+
+- Token: `^[A-Za-z0-9_-]{32,128}$` (the API issues 32 random bytes, base64url, 43 chars). The script
+  refuses a token in the environment; with nothing on stdin and a terminal available it prompts
+  (`read -rs`). It passes the token to the claim on stdin only.
+- `MNSCLOUD_API_URL`: `https://<host>[:port][/api[/v1]]`; the connector normalizes it to `.../api/v1`.
+- `MNSCLOUD_CONNECTOR_RELEASE`: `vX.Y.Z` tag of this repository; `MNSCLOUD_CONNECTOR_COMMIT`: the
+  commit the tag must resolve to (the script refuses a mismatch). The same two values come back as
+  `release` in the config for updates; the updater also refuses a tag older than the running
+  `VERSION`.
+- The script installs Deno from `mnscloud-runtime-kit` (same pin as the gateway), clones this
+  repository to `/opt/mnscloud-access-connector`, creates the system user `mns-connector`, generates
+  the key (`/etc/mnscloud-access-connector/key.pkcs8`, 0600, owner `mns-connector`), claims, writes
+  `/etc/mnscloud-access-connector/connector.json` (API URL, connector UUID, key path; no secret) and
+  installs `mnscloud-access-connector.service` (unprivileged) plus
+  `mnscloud-access-connector-update.timer` (root oneshot `scripts/update-connector.sh`).
+  `scripts/uninstall-connector.sh` removes everything (the connector must also be deleted in the App).
+
+### `POST /access/connector/claim` (unsigned, token only)
+
+Request `{ "token": "<install token>", "publicKey": "<base64url raw Ed25519, 43 chars>",
+"host": "<hostname>", "version": "<VERSION>" }`; response `data` `{ "connectorUuid": "uuid" }`. The
+API checks the SHA-256 of the token (single use, 24 h), stores the key and fingerprint, marks the
+connector `operational`. Any non-2xx aborts the installation.
+
+### Signed requests (every other connector route)
+
+Base `https://<api>/api/v1/access/connector`. Headers:
+
+| Header            | Value                                                                    |
+| ----------------- | ------------------------------------------------------------------------ |
+| `X-MNS-Connector` | connector UUID                                                           |
+| `X-MNS-Timestamp` | unix seconds (the API accepts +-60 s)                                    |
+| `X-MNS-Nonce`     | 24 url-safe characters (the API accepts 16-64), single use per connector |
+| `X-MNS-Signature` | base64url (no padding) Ed25519 signature of the string below             |
+
+```text
+"mns-connector-v1\n" + METHOD + "\n" + path + "\n" + timestamp + "\n" + nonce + "\n" + hex(sha256(body))
+```
+
+`METHOD` upper case; `path` is the URL path exactly as sent **including `/api/v1`** and without the
+query string (the connector sends none); `timestamp` the decimal header value; `body` the raw request
+bytes (empty for `GET`, the JSON bytes for `POST`; its sha256 is lower-case hex). Test vector (the
+fixed Ed25519 seed is the 32 bytes `00 01 02 ... 1f`; Ed25519 is deterministic):
+
+```text
+public key (base64url): A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg
+fingerprint:            SHA256:Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw=
+method:                 POST
+path:                   /api/v1/access/connector/heartbeat
+timestamp:              1767225600
+nonce:                  AAAAAAAAAAAAAAAAAAAAAAAA
+body:                   {"version":"0.1.4","host":"conn-test","addresses":["10.20.30.40"],"tunnelState":"connected"}
+sha256(body):           a5ffc9889f114dd83583f045a6d268af73c983100eafa6b1f29fdfda49110e7e
+signed string:          "mns-connector-v1\nPOST\n/api/v1/access/connector/heartbeat\n1767225600\nAAAAAAAAAAAAAAAAAAAAAAAA\na5ffc9889f114dd83583f045a6d268af73c983100eafa6b1f29fdfda49110e7e"
+signature (base64url):  r3m4OzeEPpN_UgmO7F8E2eogxE-1__t_3iba29og8UxgDOYPohtnZpqPc_ihHmUpK7o2CuEWIZuvVXKGZwSyCQ
+```
+
+The same vector is asserted by `tests/connector_auth_test.ts`. Errors: non-2xx (the connector acts
+only on the status): `403` disabled/deleted/unknown connector or bad signature/skew/nonce reuse.
+
+- `POST /heartbeat` every 30 s: `{ "version", "host", "addresses": ["<IP>", ... max 16, informational],
+  "tunnelState": "connected | disconnected" }`. `data` ignored.
+- `GET /config` every 60 s: `data`
+
+```json
+{
+  "allowedCidrs": ["10.20.0.0/16"],
+  "gateway": {
+    "key": "gw-dev1",
+    "relayUrl": "wss://<public host>/access-gateway/gw-dev1/connector"
+  },
+  "release": { "tag": "v0.1.4", "commit": "<40 hex>" }
+}
+```
+
+`allowedCidrs` (max 64, may be empty/absent), `gateway` (`null` when none is assigned; instead of
+`relayUrl` the API may send `relayPath` `/access-gateway/<key>/connector`, resolved against the
+API origin) and `release` (`null` when the platform asks for no update) are validated; a response
+that does not match is ignored and the previous configuration kept. The relay URL must be `wss`,
+without credentials or query, and its path exactly `/access-gateway/<key>/connector`.
+
+- `POST /connections/:connectionUuid/accept`: `{ "destination": "<IP>", "port": 22 }`. `2xx` only
+  when this exact connection belongs to this connector (destination and port equal, state
+  assigned/connecting, not accepted before, not expired); the API stores the acceptance (single
+  use). Any non-2xx is a refusal: the connector never dials.
+
+### Tunnel (`wss://<host>/access-gateway/<gatewayKey>/connector`)
+
+Same edge hosts and listener rules as `/ws` (the edge adds a location next to `/ws` with the pinned
+upstream, WebSocket upgrade and a read timeout above 75 s). Text handshake, then binary frames:
+
+1. gateway -> connector: `{"t":"challenge","challenge":"<32 random bytes, base64url, 43 chars>"}`.
+2. connector -> gateway: `{"t":"hello","connectorUuid":"<uuid>","signature":"<base64url>"}` where the
+   signature covers `"mns-connector-tunnel-v1\n" + gatewayKey + "\n" + challenge` (the connector uses
+   the key of the gateway it meant to reach, from its config). Vector with the same key: gatewayKey
+   `gw-dev1`, challenge `bm9uY2Utbm9uY2Utbm9uY2Utbm9uY2Utbm9uY2UtMTI`, signature
+   `2kJt7jDaV6-w8EzMom7VZhtkezpjEZyGNlaonk091NrmAGBdbqEZJGD41GAHWbsMSX7DY2I_8P7oWXle0vhKAw`.
+3. gateway: `GET /access/runtime/connectors/:uuid` (section 10), verifies, `POST .../attach`, answers
+   `{"t":"ready","maxStreams":<capacity>,"window":262144}`. Close codes: 4401 not authenticated, 4400
+   protocol violation, 4408 handshake timeout (3 s), 4429 busy (per-source and global handshake caps; the source is `X-Real-IP` / the last `X-Forwarded-For` entry set by the edge), 4409 replaced by a newer tunnel, 4503 attach
+   refused or gateway shutdown. One tunnel per connector; a newly authenticated one replaces the old.
+   The gateway calls `detach` when its tunnel closes (not when it was replaced).
+
+Binary frames: `[type u8][stream u32 big endian][payload]`, whole frame <= 65536 bytes.
+
+| Type | Name      | From      | Payload                                                         |
+| ---- | --------- | --------- | --------------------------------------------------------------- |
+| 1    | OPEN      | gateway   | JSON `{"connectionUuid","host","port"}` (host is an IP literal) |
+| 2    | OPEN_OK   | connector | empty                                                           |
+| 3    | OPEN_FAIL | connector | JSON `{"code"}`                                                 |
+| 4    | DATA      | both      | bytes, <= 32 KiB per frame                                      |
+| 5    | CLOSE     | both      | empty                                                           |
+| 6    | CREDIT    | both      | u32 BE bytes the receiver may be sent again                     |
+| 7    | PING      | both      | stream 0                                                        |
+| 8    | PONG      | both      | stream 0                                                        |
+
+Only the gateway sends OPEN; a connector that does, any unknown type, an oversized frame, DATA beyond
+the granted window or credit above 256 KiB ends the tunnel. Every stream starts with a 256 KiB
+window per direction; a receiver returns credit as it consumes data. At most `maxStreams` (the
+gateway capacity) streams per tunnel (the connector itself allows 64). Idle ping every 20 s (answered with at most one PONG per 2 s); a
+tunnel without any frame for 60 s is dead, and one whose socket buffers more than 2 MiB is closed.
+Empty DATA frames and more than 256 queued chunks per stream are protocol violations. OPEN_FAIL codes: `destination_refused`, `not_allowed`
+(outside `allowedCidrs`), `protocol_refused`, `invalid_address`, `invalid_port`, `invalid_open`,
+`api_refused` (4xx from `accept`), `api_unavailable`, `connect_failed`, `connect_timeout` (10 s),
+`too_many_streams`.
+
+On OPEN the connector: validates the destination locally (loopback, link-local incl.
+169.254.169.254, multicast, unspecified, broadcast and its own addresses are always refused;
+`allowedCidrs` narrows; ports 23 and 8728 refused), calls `accept`, dials TCP (10 s) and pipes with
+credit flow control. It never executes commands and never listens on a port.
+
+On the gateway the worker of a `transport: connector` connection has no network: systemd
+`PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, and Deno permissions
+only for one controller-owned unix socket (`--allow-net=unix:<socket>`); `/run` is an empty tmpfs
+in the unit with only that socket bound in under a fixed name, D-Bus and systemd paths are
+inaccessible, and the worker must present a per-session secret (sent on its stdin, never argv)
+before the controller pipes the socket to the tunnel stream. The stream ends inside the worker's own SSH/TLS client: host key
+pinning, redaction, recording and command policy are unchanged. The gateway finishes a connector
+connection with `connector_offline` (state `failed`) when no tunnel is attached, or with the OPEN_FAIL
+code of the connector (`refused` for the refusal codes, `failed` for the others; any code outside the fixed list is
+reported as `connector_open_failed`).

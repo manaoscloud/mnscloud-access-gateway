@@ -5,6 +5,7 @@
 import { parseCidr } from '../shared/ip.ts';
 import { type GatewayConfig, parseConfig } from './contract.ts';
 import { ControlPlane, loadAgentIdentity, privateRead } from './control_plane.ts';
+import { ConnectorHub } from './connector_hub.ts';
 import { buildDenylist } from './denylist.ts';
 import { readEnvFile, requireBinding } from './env.ts';
 import { Gateway } from './gateway.ts';
@@ -70,7 +71,14 @@ async function main() {
     config.sessionNetwork.ipv4,
     config.sessionNetwork.ipv6,
   );
+  const hub = new ConnectorHub({
+    gatewayKey: config.gatewayKey,
+    api,
+    maxStreams: () => config.capacity.maxSessions,
+    log,
+  });
   const gateway = new Gateway({
+    hub,
     gatewayKey: config.gatewayKey,
     listenAddress: config.listen.address,
     edgeSources: config.edgeSources,
@@ -79,6 +87,7 @@ async function main() {
     version,
     deps: {
       api,
+      connectors: hub,
       unwrap: openVaultUnwrapper(config.openvault.address, config.openvault.caCertificatePem),
       launcher: new SystemdLauncher(ROOT),
       networks,

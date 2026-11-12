@@ -4,6 +4,7 @@
 // The certificate is self-signed on most devices, so trust is a SHA-256 pin of the leaf
 // certificate (pinned on first use by the API), checked before any credential is sent.
 
+import net from 'node:net';
 import tls from 'node:tls';
 
 export class RouterOsApiError extends Error {
@@ -254,11 +255,17 @@ export function connectApiSsl(
   address: string,
   port: number,
   timeoutMs: number,
+  /** Connector transport: unix socket of the controller bridge (no network). */
+  bridge?: { path: string; secret: string },
 ): Promise<TlsConnection> {
   return new Promise((resolve, reject) => {
+    let raw: net.Socket | undefined;
+    if (bridge) {
+      raw = net.createConnection({ path: bridge.path });
+      raw.write(bridge.secret);
+    }
     const socket = tls.connect({
-      host: address,
-      port,
+      ...(raw ? { socket: raw } : { host: address, port }),
       rejectUnauthorized: false,
       // RouterOS certificates rarely name the address; the pin replaces hostname checks.
       checkServerIdentity: () => undefined,

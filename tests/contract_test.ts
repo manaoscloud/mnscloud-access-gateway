@@ -9,7 +9,47 @@ import { ASSIGNMENT } from './fixtures.ts';
 Deno.test('contract: assignment validation refuses what the gateway must not do', () => {
   assertEquals(parseAssignment(ASSIGNMENT).target, { address: '203.0.113.10', port: 22 });
   assertThrows(() => parseAssignment({ ...ASSIGNMENT, protocol: 'telnet' }), /protocol_refused/);
-  assertThrows(() => parseAssignment({ ...ASSIGNMENT, path: 'connector' }), /path_unsupported/);
+  assertThrows(() => parseAssignment({ ...ASSIGNMENT, path: 'mgmt_vpn' }), /path_unsupported/);
+  // Connector path: transport and connector UUID must agree.
+  assertThrows(() => parseAssignment({ ...ASSIGNMENT, path: 'connector' }), /connectorUuid/);
+  assertThrows(
+    () => parseAssignment({ ...ASSIGNMENT, path: 'connector', transport: 'direct' }),
+    /path_unsupported/,
+  );
+  assertThrows(
+    () =>
+      parseAssignment({
+        ...ASSIGNMENT,
+        transport: 'connector',
+        connectorUuid: ASSIGNMENT.connectionUUID,
+      }),
+    /path_unsupported/,
+  );
+  const viaConnector = parseAssignment({
+    ...ASSIGNMENT,
+    path: 'connector',
+    transport: 'connector',
+    connectorUuid: ASSIGNMENT.connectionUUID,
+    connectorKeyFingerprint: 'SHA256:Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw=',
+    target: { address: '10.20.30.40', port: 22 },
+  });
+  assertEquals(
+    [viaConnector.path, viaConnector.transport, viaConnector.connectorUuid],
+    ['connector', 'connector', ASSIGNMENT.connectionUUID],
+  );
+  // The API must pin the connector key: a connector assignment without it is refused.
+  assertThrows(
+    () =>
+      parseAssignment({
+        ...ASSIGNMENT,
+        path: 'connector',
+        connectorUuid: ASSIGNMENT.connectionUUID,
+      }),
+    /connectorKeyFingerprint/,
+  );
+  assertEquals(viaConnector.connectorKeyFingerprint?.length, 51);
+  assertEquals(parseAssignment(ASSIGNMENT).transport, 'direct');
+  assertEquals(parseAssignment(ASSIGNMENT).connectorUuid, null);
   assertThrows(
     () => parseAssignment({ ...ASSIGNMENT, target: { address: 'router.example.com', port: 22 } }),
     /address/,

@@ -11,10 +11,12 @@ import {
 } from '../shared/framing.ts';
 import type { CommandEvent, Facts, WorkerInit, WorkerToController } from '../shared/ipc.ts';
 import type { Assignment, FinishBody, HostKeyResponse } from './contract.ts';
+import { type Bridge, startBridge } from './bridge.ts';
 import type { SessionNet } from './netns.ts';
 import type { Unwrapper } from './openvault.ts';
 import { RecordingUploader } from './recording.ts';
 import type { SandboxLimits } from './sandbox.ts';
+import { OpenError, type OpenSpec, type TunnelStream } from '../shared/tunnel.ts';
 import type { WorkerHandle, WorkerLauncher } from './worker_launcher.ts';
 
 export interface RuntimeEvent {
@@ -70,8 +72,50 @@ export interface BrowserSocket {
   onerror: ((event: Event) => void) | null;
 }
 
+/** Tunnels of the tenant connectors attached to this gateway (`ConnectorHub`). */
+export interface ConnectorTransport {
+  has(connectorUuid: string): boolean;
+  open(connectorUuid: string, spec: OpenSpec, fingerprint?: string | null): Promise<TunnelStream>;
+}
+
+/**
+ * Finish reasons a connector may cause. The connector is outside the platform's trust boundary, so
+ * it cannot choose the reason text: anything not listed becomes `connector_open_failed`.
+ */
+const REFUSED_OPEN = new Set([
+  'destination_refused',
+  'not_allowed',
+  'protocol_refused',
+  'api_refused',
+  'invalid_address',
+  'invalid_port',
+  'invalid_open',
+  'connector_key_mismatch',
+]);
+const FAILED_OPEN = new Set([
+  'connector_offline',
+  'api_unavailable',
+  'connect_failed',
+  'connect_timeout',
+  'open_timeout',
+  'too_many_streams',
+  'tunnel_closed',
+  'tunnel_exhausted',
+]);
+
+/** Maps an open failure to the fixed (state, reason) pair reported to the API. */
+export function openFailure(code: string): { state: 'refused' | 'failed'; reason: string } {
+  if (REFUSED_OPEN.has(code)) return { state: 'refused', reason: code };
+  if (FAILED_OPEN.has(code)) return { state: 'failed', reason: code };
+  return { state: 'failed', reason: 'connector_open_failed' };
+}
+
 export interface SessionDeps {
   api: SessionApi;
+  /** Connector transport (null when the node does not serve connectors). */
+  connectors?: ConnectorTransport | null;
+  /** Directory of the worker bridge sockets (tests use a temporary one). */
+  bridgeDir?: string;
   unwrap: Unwrapper;
   launcher: WorkerLauncher;
   networks: SessionNetworkManager | null;
@@ -93,6 +137,7 @@ export class Session {
   readonly startedAt = Date.now();
   #worker: WorkerHandle | null = null;
   #net: SessionNet | null = null;
+  #bridge: Bridge | null = null;
   #browser: BrowserSocket | null = null;
   #browserQueue: string[] = [];
   #events: RuntimeEvent[] = [];
@@ -189,19 +234,62 @@ export class Session {
     }, 5000);
   }
 
+  /** Opens the tunnel stream of a connector connection; finishes the connection and returns null on failure. */
+  async #openConnectorStream(): Promise<TunnelStream | null> {
+    const a = this.assignment;
+    try {
+      if (!this.deps.connectors) throw new OpenError('connector_offline');
+      return await this.deps.connectors.open(a.connectorUuid!, {
+        connectionUuid: a.connectionUUID,
+        host: a.target.address,
+        port: a.target.port,
+      }, a.connectorKeyFingerprint);
+    } catch (error) {
+      const failure = openFailure(error instanceof OpenError ? error.code : 'connector_failed');
+      await this.#finish({
+        t: 'exit',
+        state: failure.state,
+        reason: failure.reason,
+        bytesIn: 0,
+        bytesOut: 0,
+      });
+      return null;
+    }
+  }
+
+  /** Session network or connector bridge; false when the connection was already finished. */
+  async #prepareTransport(): Promise<boolean> {
+    const a = this.assignment;
+    if (a.transport !== 'connector') {
+      if (this.deps.networks) {
+        this.#net = await this.deps.networks.create(a.connectionUUID, a.target);
+      }
+      return true;
+    }
+    const stream = await this.#openConnectorStream();
+    if (!stream) return false;
+    try {
+      this.#bridge = await startBridge(stream, this.deps.bridgeDir);
+    } catch (error) {
+      stream.close();
+      throw error;
+    }
+    return true;
+  }
+
   async #run() {
     const a = this.assignment;
     this.#event('state', { state: 'starting' });
     this.#eventTimer = setInterval(() => this.#flushEvents(), 1000);
     this.#control({ type: 'state', state: 'connecting' });
     try {
-      if (this.deps.networks) {
-        this.#net = await this.deps.networks.create(a.connectionUUID, a.target);
-      }
-      this.#worker = await this.deps.launcher.launch(a.target, this.#net, {
-        ...this.deps.sandbox,
-        maxSessionSeconds: a.limits.maxSessionSeconds,
-      });
+      if (!(await this.#prepareTransport())) return;
+      this.#worker = await this.deps.launcher.launch(
+        a.target,
+        this.#net,
+        { ...this.deps.sandbox, maxSessionSeconds: a.limits.maxSessionSeconds },
+        this.#bridge ? { connectionUUID: a.connectionUUID, path: this.#bridge.path } : null,
+      );
     } catch (error) {
       this.deps.log(`connection ${this.uuid}: sandbox failed: ${(error as Error).message}`);
       await this.#finish({
@@ -231,6 +319,13 @@ export class Session {
       mode: a.mode,
       protocol: a.protocol,
       target: a.target,
+      ...(this.#bridge
+        ? {
+          transport: 'connector' as const,
+          bridge: this.#worker.bridgePath ?? this.#bridge.path,
+          bridgeSecret: this.#bridge.secret,
+        }
+        : {}),
       shellDialect: a.shellDialect,
       username: a.username,
       level: a.level,
@@ -403,6 +498,7 @@ export class Session {
         this.#browser.close(code, text);
       } catch { /* closed */ }
     }
+    this.#bridge?.close();
     if (this.#net && this.deps.networks) {
       await this.deps.networks.destroy(this.#net, this.assignment.target).catch(() => {});
     }

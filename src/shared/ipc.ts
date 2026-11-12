@@ -4,6 +4,13 @@
 
 import type { CommandClass, ConfirmMessage, ControlMessage } from './framing.ts';
 
+/** Bridge socket paths the controller creates (and the only ones a worker may be given). */
+export function validBridgePath(path: unknown): path is string {
+  return typeof path === 'string' && path.length <= 200 &&
+    /^\/[A-Za-z0-9._/-]+\.sock$/.test(path) &&
+    !path.includes('..') && !path.includes('//');
+}
+
 export type ShellDialect = 'routeros' | 'linux' | 'proxmox' | 'vrp' | 'other';
 export type SupportLevel = 'n1' | 'n2' | 'n3';
 
@@ -13,6 +20,11 @@ export interface WorkerInit {
   mode: 'console' | 'test';
   protocol: 'ssh' | 'routeros_api';
   target: { address: string; port: number };
+  /** `connector`: connect to the unix socket `bridge` instead of the network. */
+  transport?: 'direct' | 'connector';
+  bridge?: string;
+  /** 64 hex characters the worker writes first on the bridge socket. */
+  bridgeSecret?: string;
   shellDialect: ShellDialect;
   username: string;
   level: SupportLevel;

@@ -24,7 +24,12 @@ export interface Assignment {
   connectionUUID: string;
   mode: 'console' | 'test';
   protocol: 'ssh' | 'routeros_api';
-  path: 'public';
+  path: 'public' | 'connector';
+  /** `connector`: the worker has no network; the stream goes through the tenant connector. */
+  transport: 'direct' | 'connector';
+  connectorUuid: string | null;
+  /** Fingerprint of the connector key the API expects (`SHA256:` + base64); null for direct. */
+  connectorKeyFingerprint: string | null;
   target: { address: string; port: number };
   shellDialect: ShellDialect;
   username: string;
@@ -159,6 +164,48 @@ export function parseConfig(value: unknown): GatewayConfig {
   };
 }
 
+type Route = Pick<
+  Assignment,
+  'path' | 'transport' | 'connectorUuid' | 'connectorKeyFingerprint'
+>;
+
+/** Path, transport and connector identity (a connector assignment pins the key it expects). */
+function parseRoute(v: Record<string, unknown>): Route {
+  const path = v.path ?? 'public';
+  if (path !== 'public' && path !== 'connector') throw new ContractError('path_unsupported');
+  const transport = v.transport ?? (path === 'connector' ? 'connector' : 'direct');
+  if (transport !== 'direct' && transport !== 'connector') {
+    throw new ContractError('path_unsupported');
+  }
+  if ((path === 'connector') !== (transport === 'connector')) {
+    throw new ContractError('path_unsupported');
+  }
+  if (transport === 'direct') {
+    return { path, transport, connectorUuid: null, connectorKeyFingerprint: null };
+  }
+  const connectorUuid = typeof v.connectorUuid === 'string' ? v.connectorUuid : '';
+  const fingerprint = typeof v.connectorKeyFingerprint === 'string'
+    ? v.connectorKeyFingerprint
+    : '';
+  if (!UUID.test(connectorUuid)) throw new ContractError('Invalid connectorUuid');
+  if (!/^SHA256:[A-Za-z0-9+/]{43}=$/.test(fingerprint)) {
+    throw new ContractError('Invalid connectorKeyFingerprint');
+  }
+  return { path, transport, connectorUuid, connectorKeyFingerprint: fingerprint };
+}
+
+// deno-lint-ignore no-explicit-any
+function parseTicket(v: Record<string, any>): Assignment['ticket'] {
+  if (v.mode !== 'console') return null;
+  if (
+    !/^[0-9a-f]{64}$/.test(String(v.ticket?.sha256)) ||
+    Number.isNaN(Date.parse(String(v.ticket?.expiresAt)))
+  ) {
+    throw new ContractError('Invalid ticket');
+  }
+  return { sha256: v.ticket.sha256, expiresAt: v.ticket.expiresAt };
+}
+
 export function parseAssignment(value: unknown): Assignment {
   // deno-lint-ignore no-explicit-any
   const v = value as Record<string, any>;
@@ -168,7 +215,7 @@ export function parseAssignment(value: unknown): Assignment {
   if (v.protocol !== 'ssh' && v.protocol !== 'routeros_api') {
     throw new ContractError('protocol_refused');
   }
-  if ((v.path ?? 'public') !== 'public') throw new ContractError('path_unsupported');
+  const route = parseRoute(v);
   const address = parseAddress(v.target?.address);
   if (!address) throw new ContractError('Invalid target address');
   if (!DIALECTS.includes(v.shellDialect)) throw new ContractError('Invalid shellDialect');
@@ -179,21 +226,12 @@ export function parseAssignment(value: unknown): Assignment {
     throw new ContractError('Invalid username');
   }
   if (!['n1', 'n2', 'n3'].includes(v.level)) throw new ContractError('Invalid level');
-  let ticket: Assignment['ticket'] = null;
-  if (v.mode === 'console') {
-    if (
-      !/^[0-9a-f]{64}$/.test(String(v.ticket?.sha256)) ||
-      Number.isNaN(Date.parse(String(v.ticket?.expiresAt)))
-    ) {
-      throw new ContractError('Invalid ticket');
-    }
-    ticket = { sha256: v.ticket.sha256, expiresAt: v.ticket.expiresAt };
-  }
+  const ticket = parseTicket(v);
   return {
     connectionUUID: v.connectionUUID,
     mode: v.mode,
     protocol: v.protocol,
-    path: 'public',
+    ...route,
     target: { address: address.text, port: int(v.target.port, 1, 65535, 'port') },
     shellDialect: v.shellDialect,
     username: v.username,

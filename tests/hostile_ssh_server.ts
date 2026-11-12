@@ -12,8 +12,12 @@ export const PASSWORD = 'Dev1ce-Pa55word!';
 
 export type Behaviour = 'normal' | 'flood' | 'escapes' | 'inject';
 
+/** ssh2's generator occasionally (about 1 in 400) emits a key its own parser rejects: retry. */
 export function generateHostKey(): string {
-  return utils.generateKeyPairSync('ed25519').private;
+  for (;;) {
+    const key = utils.generateKeyPairSync('ed25519').private;
+    if (!(utils.parseKey(key) instanceof Error)) return key;
+  }
 }
 
 export function fingerprintOf(privateKey: string): string {
@@ -28,7 +32,11 @@ export interface FakeDevice {
   close(): Promise<void>;
 }
 
-export function startDevice(hostKey: string, behaviour: Behaviour = 'normal'): Promise<FakeDevice> {
+export function startDevice(
+  hostKey: string,
+  behaviour: Behaviour = 'normal',
+  host = '127.0.0.1',
+): Promise<FakeDevice> {
   const received: string[] = [];
   const state = { authAttempts: 0 };
   // deno-lint-ignore no-explicit-any
@@ -116,7 +124,7 @@ export function startDevice(hostKey: string, behaviour: Behaviour = 'normal'): P
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(0, host, () => {
       resolve({
         port: server.address().port,
         received,
