@@ -22,12 +22,19 @@ export const MGMT_SYNC_MS = 60000;
 export const MGMT_KEY_FILE = '/var/lib/mnscloud/access-gateway/mgmt-vpn.key';
 
 const WG_KEY = /^[A-Za-z0-9+/]{43}=$/;
-const HOSTNAME =
-  /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+const HOSTNAME_LABEL = /^[A-Za-z0-9-]{1,63}$/;
+
+/** DNS hostname, checked label by label (no nested quantifiers, so no backtracking blow-up). */
+function validHostname(host: string): boolean {
+  if (host.length > 253) return false;
+  return host.split('.').every((label) =>
+    HOSTNAME_LABEL.test(label) && !label.startsWith('-') && !label.endsWith('-')
+  );
+}
 
 function ipv4Cidr(value: unknown, label: string): Cidr {
   const cidr = parseCidr(value);
-  if (!cidr || cidr.family !== 4 || cidr.text !== value) {
+  if (cidr?.family !== 4 || cidr.text !== value) {
     throw new ContractError(`Invalid ${label}`);
   }
   return cidr;
@@ -42,7 +49,7 @@ export function validEndpoint(value: unknown): boolean {
   if (port < 1 || port > 65535 || match[2] !== String(port)) return false;
   const host = match[1];
   if (host.startsWith('[')) return parseAddress(host.slice(1, -1))?.family === 6;
-  return parseAddress(host)?.family === 4 || (!/^[0-9.]+$/.test(host) && HOSTNAME.test(host));
+  return parseAddress(host)?.family === 4 || (!/^[0-9.]+$/.test(host) && validHostname(host));
 }
 
 /**
@@ -77,7 +84,7 @@ export function parseMgmtVpn(value: unknown): MgmtVpnDesired | null {
   const seen = new Set<string>();
   for (const source of sources) {
     const address = parseAddress(source);
-    if (!address || address.family !== 4 || address.text !== source) {
+    if (address?.family !== 4 || address.text !== source) {
       throw new ContractError('Invalid source');
     }
     if (!cidrContains(gatewayNet, address)) throw new ContractError('source is outside gatewayNet');
@@ -91,7 +98,7 @@ export function parseMgmtVpn(value: unknown): MgmtVpnDesired | null {
       mgmtNet: mgmtNet.text,
       gatewayNet: gatewayNet.text,
     },
-    sources: [...seen].sort(),
+    sources: [...seen].sort((a, b) => a.localeCompare(b)),
   };
 }
 
@@ -139,8 +146,10 @@ export function renderMgmtVpnApply(
   for (const address of have) {
     if (!wanted.has(address)) commands.push(['ip', 'addr', 'del', address, 'dev', MGMT_IF]);
   }
-  commands.push(['ip', 'link', 'set', 'dev', MGMT_IF, 'up']);
-  commands.push(['ip', 'route', 'replace', hub.mgmtNet, 'dev', MGMT_IF]);
+  commands.push(
+    ['ip', 'link', 'set', 'dev', MGMT_IF, 'up'],
+    ['ip', 'route', 'replace', hub.mgmtNet, 'dev', MGMT_IF],
+  );
   return commands;
 }
 
@@ -350,6 +359,33 @@ export class MgmtVpn implements MgmtGate {
     this.#nftNet = mgmtNet;
   }
 
+  /** No hub: close the firewall range first, then remove the interface. */
+  async #down() {
+    await this.#setNft(null);
+    const state = await this.#read();
+    if (state.exists) await this.#runAll(renderMgmtVpnRemove());
+    this.#applied = null;
+  }
+
+  async #up(desired: MgmtVpnDesired) {
+    const state = await this.#read();
+    await this.#runAll(renderMgmtVpnApply(desired, state, this.options.keys.path));
+    const old = this.#applied?.hub.mgmtNet;
+    if (old && old !== desired.hub.mgmtNet) {
+      await this.options.run(['ip', 'route', 'del', old, 'dev', MGMT_IF]).catch(() => {});
+    }
+    this.#applied = desired;
+    await this.#setNft(desired.hub.mgmtNet);
+  }
+
+  /** Runs the commands in order: each one depends on the previous (interface, then keys, ...). */
+  async #runAll(commands: string[][]) {
+    for (const argv of commands) {
+      // deno-lint-ignore no-await-in-loop
+      await this.#must(argv); // NOSONAR: ordered on purpose
+    }
+  }
+
   async #sync(): Promise<boolean> {
     try {
       const pub = await this.#publicKey();
@@ -358,24 +394,8 @@ export class MgmtVpn implements MgmtGate {
         this.#reportedKey = pub;
       }
       const desired = parseMgmtVpn(await this.options.api.mgmtVpn());
-      if (!desired) {
-        // Close the firewall range first, then remove the interface.
-        await this.#setNft(null);
-        const state = await this.#read();
-        if (state.exists) { for (const argv of renderMgmtVpnRemove()) await this.#must(argv); }
-        this.#applied = null;
-      } else {
-        const state = await this.#read();
-        for (const argv of renderMgmtVpnApply(desired, state, this.options.keys.path)) {
-          await this.#must(argv);
-        }
-        const old = this.#applied?.hub.mgmtNet;
-        if (old && old !== desired.hub.mgmtNet) {
-          await this.options.run(['ip', 'route', 'del', old, 'dev', MGMT_IF]).catch(() => {});
-        }
-        this.#applied = desired;
-        await this.#setNft(desired.hub.mgmtNet);
-      }
+      if (desired) await this.#up(desired);
+      else await this.#down();
       this.error = null;
       this.#lastError = '';
       return true;

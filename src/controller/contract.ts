@@ -187,6 +187,19 @@ type Route = Pick<
   'path' | 'transport' | 'connectorUuid' | 'connectorKeyFingerprint' | 'mgmtVpn'
 >;
 
+/** `mgmtVpn: { hubUUID, source }` of a management VPN assignment. */
+function parseMgmtVpnRoute(value: unknown): { hubUUID: string; source: string } {
+  if (!value || typeof value !== 'object') throw new ContractError('Invalid mgmtVpn hubUUID');
+  const mgmt = value as Record<string, unknown>;
+  const hubUUID = typeof mgmt.hubUUID === 'string' ? mgmt.hubUUID : '';
+  if (!UUID.test(hubUUID)) throw new ContractError('Invalid mgmtVpn hubUUID');
+  const source = parseAddress(mgmt.source);
+  if (source?.family !== 4 || source.text !== mgmt.source) {
+    throw new ContractError('Invalid mgmtVpn source');
+  }
+  return { hubUUID, source: source.text };
+}
+
 /** Path, transport and connector identity (a connector assignment pins the key it expects). */
 function parseRoute(v: Record<string, unknown>): Route {
   const path = v.path ?? 'public';
@@ -207,20 +220,12 @@ function parseRoute(v: Record<string, unknown>): Route {
     return { path, transport, connectorUuid: null, connectorKeyFingerprint: null, mgmtVpn: null };
   }
   if (transport === 'mgmt_vpn') {
-    const mgmt = v.mgmtVpn as Record<string, unknown> | null | undefined;
-    const source = parseAddress(mgmt?.source);
-    if (!mgmt || typeof mgmt !== 'object' || !UUID.test(String(mgmt.hubUUID))) {
-      throw new ContractError('Invalid mgmtVpn hubUUID');
-    }
-    if (!source || source.family !== 4 || source.text !== mgmt.source) {
-      throw new ContractError('Invalid mgmtVpn source');
-    }
     return {
       path,
       transport,
       connectorUuid: null,
       connectorKeyFingerprint: null,
-      mgmtVpn: { hubUUID: String(mgmt.hubUUID), source: source.text },
+      mgmtVpn: parseMgmtVpnRoute(v.mgmtVpn),
     };
   }
   const connectorUuid = typeof v.connectorUuid === 'string' ? v.connectorUuid : '';

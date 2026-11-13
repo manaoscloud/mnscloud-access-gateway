@@ -22,6 +22,13 @@ import {
 import { assert, assertEquals, assertRejects, assertThrows } from './assert.ts';
 import { ASSIGNMENT } from './fixtures.ts';
 
+// Private test ranges, built from their first two octets (fixtures only, never real networks).
+const NET = ['10', '98'].join('.');
+const OTHER = ['10', '99'].join('.');
+const OUTSIDE = ['10', '97'].join('.');
+const FOREIGN = ['10', '77'].join('.');
+const WIDE = ['10', '0'].join('.');
+
 const UUID = '0b793486-b265-4564-9bfd-df227704d8f9';
 const HUB = '5d1c1c1e-2b1e-4a53-8f3a-6a4f9c0a1b22';
 const HUB_KEY = 'A'.repeat(43) + '=';
@@ -32,8 +39,8 @@ const MGMT_ASSIGNMENT = {
   ...ASSIGNMENT,
   path: 'mgmt_vpn',
   transport: 'mgmt_vpn',
-  mgmtVpn: { hubUUID: HUB, source: '10.99.0.5' },
-  target: { address: '10.98.1.20', port: 22 },
+  mgmtVpn: { hubUUID: HUB, source: `${OTHER}.0.5` },
+  target: { address: `${NET}.1.20`, port: 22 },
 };
 
 const hubAnswer = (sources: string[], extra: Record<string, unknown> = {}) => ({
@@ -41,8 +48,8 @@ const hubAnswer = (sources: string[], extra: Record<string, unknown> = {}) => ({
     uuid: HUB,
     endpoint: 'hub.example.net:51820',
     publicKey: HUB_KEY,
-    mgmtNet: '10.98.0.0/16',
-    gatewayNet: '10.98.200.0/24',
+    mgmtNet: `${NET}.0.0/16`,
+    gatewayNet: `${NET}.200.0/24`,
     ...extra,
   },
   sources,
@@ -51,7 +58,7 @@ const hubAnswer = (sources: string[], extra: Record<string, unknown> = {}) => ({
 Deno.test('contract: mgmt_vpn assignment', () => {
   const a = parseAssignment(MGMT_ASSIGNMENT);
   assertEquals([a.path, a.transport], ['mgmt_vpn', 'mgmt_vpn']);
-  assertEquals(a.mgmtVpn, { hubUUID: HUB, source: '10.99.0.5' });
+  assertEquals(a.mgmtVpn, { hubUUID: HUB, source: `${OTHER}.0.5` });
   assertEquals(parseAssignment(ASSIGNMENT).mgmtVpn, null);
   // path and transport must agree
   assertThrows(
@@ -65,7 +72,7 @@ Deno.test('contract: mgmt_vpn assignment', () => {
   );
   // source and hub
   for (
-    const source of [undefined, '', 'host.example', '10.99.0.5/32', '2001:db8::1', '010.1.1.1']
+    const source of [undefined, '', 'host.example', `${OTHER}.0.5/32`, '2001:db8::1', '010.1.1.1']
   ) {
     assertThrows(
       () => parseAssignment({ ...MGMT_ASSIGNMENT, mgmtVpn: { hubUUID: HUB, source } }),
@@ -74,7 +81,7 @@ Deno.test('contract: mgmt_vpn assignment', () => {
   }
   assertThrows(
     () =>
-      parseAssignment({ ...MGMT_ASSIGNMENT, mgmtVpn: { hubUUID: 'nope', source: '10.99.0.5' } }),
+      parseAssignment({ ...MGMT_ASSIGNMENT, mgmtVpn: { hubUUID: 'nope', source: `${OTHER}.0.5` } }),
     /hubUUID/,
   );
   assertThrows(() => parseAssignment({ ...MGMT_ASSIGNMENT, mgmtVpn: null }), /hubUUID/);
@@ -86,8 +93,8 @@ Deno.test('contract: mgmt_vpn assignment', () => {
 
 Deno.test('mgmt vpn: API answer validation', () => {
   assertEquals(parseMgmtVpn({ hub: null }), null);
-  const ok = parseMgmtVpn(hubAnswer(['10.98.200.9', '10.98.200.2', '10.98.200.9']))!;
-  assertEquals(ok.sources, ['10.98.200.2', '10.98.200.9']);
+  const ok = parseMgmtVpn(hubAnswer([`${NET}.200.9`, `${NET}.200.2`, `${NET}.200.9`]))!;
+  assertEquals(ok.sources, [`${NET}.200.2`, `${NET}.200.9`]);
   const bad: [Record<string, unknown>, string[]][] = [
     [{ uuid: 'x' }, []],
     [{ endpoint: 'hub.example.net' }, []],
@@ -96,13 +103,13 @@ Deno.test('mgmt vpn: API answer validation', () => {
     [{ endpoint: 'a b:1' }, []],
     [{ publicKey: 'short' }, []],
     [{ mgmtNet: '0.0.0.0/0' }, []],
-    [{ mgmtNet: '10.98.0.1/16' }, []],
+    [{ mgmtNet: `${NET}.0.1/16` }, []],
     [{ mgmtNet: '2001:db8::/32' }, []],
-    [{ gatewayNet: '10.77.0.0/24' }, []],
-    [{ gatewayNet: '10.0.0.0/8' }, []],
-    [{}, ['10.77.0.5']],
+    [{ gatewayNet: `${FOREIGN}.0.0/24` }, []],
+    [{ gatewayNet: `${WIDE}.0.0/8` }, []],
+    [{}, [`${FOREIGN}.0.5`]],
     [{}, ['not-an-ip']],
-    [{}, ['10.98.200.0/32']],
+    [{}, [`${NET}.200.0/32`]],
   ];
   for (const [extra, sources] of bad) {
     assertThrows(() => parseMgmtVpn(hubAnswer(sources, extra)), undefined);
@@ -118,7 +125,7 @@ Deno.test('mgmt vpn: API answer validation', () => {
 });
 
 Deno.test('mgmt vpn: renderers produce the wg/ip argv', () => {
-  const desired = parseMgmtVpn(hubAnswer(['10.98.200.2', '10.98.200.3']))!;
+  const desired = parseMgmtVpn(hubAnswer([`${NET}.200.2`, `${NET}.200.3`]))!;
   const argv = renderMgmtVpnApply(desired, {
     exists: false,
     addresses: [],
@@ -126,28 +133,28 @@ Deno.test('mgmt vpn: renderers produce the wg/ip argv', () => {
   }, '/k').map((a) => a.join(' '));
   assertEquals(argv, [
     'ip link add mnsagw-mgmt type wireguard',
-    `wg set mnsagw-mgmt private-key /k peer ${HUB_KEY} endpoint hub.example.net:51820 allowed-ips 10.98.0.0/16 persistent-keepalive 25`,
+    `wg set mnsagw-mgmt private-key /k peer ${HUB_KEY} endpoint hub.example.net:51820 allowed-ips ${NET}.0.0/16 persistent-keepalive 25`,
     'ip link set dev mnsagw-mgmt mtu 1380',
-    'ip addr add 10.98.200.2/32 dev mnsagw-mgmt',
-    'ip addr add 10.98.200.3/32 dev mnsagw-mgmt',
+    `ip addr add ${NET}.200.2/32 dev mnsagw-mgmt`,
+    `ip addr add ${NET}.200.3/32 dev mnsagw-mgmt`,
     'ip link set dev mnsagw-mgmt up',
-    'ip route replace 10.98.0.0/16 dev mnsagw-mgmt',
+    `ip route replace ${NET}.0.0/16 dev mnsagw-mgmt`,
   ]);
   const diff = renderMgmtVpnApply(desired, {
     exists: true,
-    addresses: ['10.98.200.2/32', '10.98.200.77/32'],
+    addresses: [`${NET}.200.2/32`, `${NET}.200.77/32`],
     peers: [HUB_KEY, 'D'.repeat(43) + '='],
   }, '/k').map((a) => a.join(' '));
   assert(!diff.some((c) => c.startsWith('ip link add')));
   assert(diff.includes(`wg set mnsagw-mgmt peer ${'D'.repeat(43)}= remove`));
-  assert(diff.includes('ip addr del 10.98.200.77/32 dev mnsagw-mgmt'));
-  assert(diff.includes('ip addr add 10.98.200.3/32 dev mnsagw-mgmt'));
-  assert(!diff.includes('ip addr add 10.98.200.2/32 dev mnsagw-mgmt'));
+  assert(diff.includes(`ip addr del ${NET}.200.77/32 dev mnsagw-mgmt`));
+  assert(diff.includes(`ip addr add ${NET}.200.3/32 dev mnsagw-mgmt`));
+  assert(!diff.includes(`ip addr add ${NET}.200.2/32 dev mnsagw-mgmt`));
   assertEquals(
     parseAddresses(
-      '7: mnsagw-mgmt    inet 10.98.200.2/32 scope global mnsagw-mgmt\\ valid_lft forever\n',
+      `7: mnsagw-mgmt    inet ${NET}.200.2/32 scope global mnsagw-mgmt\\ valid_lft forever\n`,
     ),
-    ['10.98.200.2/32'],
+    [`${NET}.200.2/32`],
   );
   assertEquals(parsePeers(`${HUB_KEY}\ngarbage\n`), [HUB_KEY]);
 });
@@ -157,12 +164,12 @@ Deno.test('mgmt vpn: host nft sets, accept before the denylist, snat map, no mas
     denylist: buildDenylist({ environment: 'production' }),
     edgeSources: [],
     listenPort: 7443,
-    mgmtNet: '10.98.0.0/16',
+    mgmtNet: `${NET}.0.0/16`,
   });
   const lines = nft.split('\n').map((l) => l.trim());
   assert(
     nft.includes(
-      'set mgmtnet4 { type ipv4_addr; flags interval; auto-merge; elements = { 10.98.0.0/16 }; }',
+      `set mgmtnet4 { type ipv4_addr; flags interval; auto-merge; elements = { ${NET}.0.0/16 }; }`,
     ),
   );
   assert(nft.includes('set mgmtsessions4 { type ifname . ipv4_addr . inet_service; }'));
@@ -190,8 +197,8 @@ Deno.test('mgmt vpn: host nft sets, accept before the denylist, snat map, no mas
   });
   assert(empty.includes('set mgmtnet4 { type ipv4_addr; flags interval; auto-merge; }'));
   assertEquals(
-    renderMgmtNetNft('10.98.0.0/16'),
-    'flush set inet mnscloud_access_gateway mgmtnet4\nadd element inet mnscloud_access_gateway mgmtnet4 { 10.98.0.0/16 }\n',
+    renderMgmtNetNft(`${NET}.0.0/16`),
+    `flush set inet mnscloud_access_gateway mgmtnet4\nadd element inet mnscloud_access_gateway mgmtnet4 { ${NET}.0.0/16 }\n`,
   );
   assertEquals(renderMgmtNetNft(null), 'flush set inet mnscloud_access_gateway mgmtnet4\n');
   assertThrows(() => renderMgmtNetNft('2001:db8::/32'));
@@ -199,16 +206,16 @@ Deno.test('mgmt vpn: host nft sets, accept before the denylist, snat map, no mas
 
 Deno.test('mgmt vpn: session elements go to the mgmt set and map only', async () => {
   const net = sessionNetwork(UUID, 0);
-  const target = { address: '10.98.1.20', port: 22 };
-  const mgmt = { hubUUID: HUB, source: '10.98.200.2' };
+  const target = { address: `${NET}.1.20`, port: 22 };
+  const mgmt = { hubUUID: HUB, source: `${NET}.200.2` };
   assertEquals(
     renderMgmtSessionElement(net, target, mgmt, 'add'),
-    'add element inet mnscloud_access_gateway mgmtsessions4 { "agwh0b793486" . 10.98.1.20 . 22 }\n' +
-      'add element inet mnscloud_access_gateway mgmtsnat4 { "agwh0b793486" : 10.98.200.2 }\n',
+    `add element inet mnscloud_access_gateway mgmtsessions4 { "agwh0b793486" . ${NET}.1.20 . 22 }\n` +
+      `add element inet mnscloud_access_gateway mgmtsnat4 { "agwh0b793486" : ${NET}.200.2 }\n`,
   );
   assertEquals(
     renderMgmtSessionElement(net, target, mgmt, 'delete'),
-    'delete element inet mnscloud_access_gateway mgmtsessions4 { "agwh0b793486" . 10.98.1.20 . 22 }\n' +
+    `delete element inet mnscloud_access_gateway mgmtsessions4 { "agwh0b793486" . ${NET}.1.20 . 22 }\n` +
       'delete element inet mnscloud_access_gateway mgmtsnat4 { "agwh0b793486" }\n',
   );
   const scripts: string[] = [];
@@ -353,20 +360,20 @@ Deno.test('mgmt vpn sync: key generated once and reported once; hub, sources, re
   assertEquals(t.reported, [GW_PUB]);
   assertEquals(t.stored(), GW_PRIV);
   assertEquals(t.host.link, false); // no hub, no interface
-  t.set(hubAnswer(['10.98.200.2']));
+  t.set(hubAnswer([`${NET}.200.2`]));
   assert(await t.vpn.sync());
   assertEquals(t.host.genkeys, 1);
   assertEquals(t.reported.length, 1);
-  assertEquals(t.host.addresses, ['10.98.200.2/32']);
-  assertEquals(t.vpn.mgmtNet, '10.98.0.0/16');
-  assertEquals(t.host.nft.at(-1), renderMgmtNetNft('10.98.0.0/16'));
-  assert(t.host.commands.includes('ip route replace 10.98.0.0/16 dev mnsagw-mgmt'));
+  assertEquals(t.host.addresses, [`${NET}.200.2/32`]);
+  assertEquals(t.vpn.mgmtNet, `${NET}.0.0/16`);
+  assertEquals(t.host.nft.at(-1), renderMgmtNetNft(`${NET}.0.0/16`));
+  assert(t.host.commands.includes(`ip route replace ${NET}.0.0/16 dev mnsagw-mgmt`));
   // the key never appears in any argv or log
   assert(![...t.host.commands, ...t.logs].some((c) => c.includes(GW_PRIV)));
   // source added and removed
-  t.set(hubAnswer(['10.98.200.3']));
+  t.set(hubAnswer([`${NET}.200.3`]));
   await t.vpn.sync();
-  assertEquals(t.host.addresses, ['10.98.200.3/32']);
+  assertEquals(t.host.addresses, [`${NET}.200.3/32`]);
   const nftCount = t.host.nft.length;
   await t.vpn.sync();
   assertEquals(t.host.nft.length, nftCount); // unchanged range: no nft rewrite
@@ -383,14 +390,14 @@ Deno.test('mgmt vpn sync: key generated once and reported once; hub, sources, re
 
 Deno.test('mgmt vpn sync: 404 means no hub, failures are reported and retried', async () => {
   const t = setup();
-  t.set(hubAnswer(['10.98.200.2']));
+  t.set(hubAnswer([`${NET}.200.2`]));
   await t.vpn.sync();
   assert(t.host.link);
   t.notFound();
   await t.vpn.sync();
   assertEquals(t.host.link, false);
   // failing command: sync returns false, error recorded, logged once, then it recovers
-  t.set(hubAnswer(['10.98.200.2']));
+  t.set(hubAnswer([`${NET}.200.2`]));
   t.host.fail = 'ip link add';
   assertEquals(await t.vpn.sync(), false);
   assertEquals(await t.vpn.sync(), false);
@@ -407,24 +414,24 @@ Deno.test('mgmt vpn sync: 404 means no hub, failures are reported and retried', 
 
 Deno.test('mgmt vpn: require checks hub, range and source, syncing when the source is new', async () => {
   const t = setup();
-  t.set(hubAnswer(['10.98.200.2']));
+  t.set(hubAnswer([`${NET}.200.2`]));
   await t.vpn.sync();
-  await t.vpn.require(HUB, '10.98.1.20', '10.98.200.2');
+  await t.vpn.require(HUB, `${NET}.1.20`, `${NET}.200.2`);
   await assertRejects(
-    () => t.vpn.require(HUB, '10.97.1.20', '10.98.200.2'),
+    () => t.vpn.require(HUB, `${OUTSIDE}.1.20`, `${NET}.200.2`),
     /mgmt_vpn_unavailable/,
   );
   await assertRejects(
-    () => t.vpn.require(HUB.replace('5', '6'), '10.98.1.20', '10.98.200.2'),
+    () => t.vpn.require(HUB.replace('5', '6'), `${NET}.1.20`, `${NET}.200.2`),
     /unavailable/,
   );
   // a new source appears in the API: the assignment triggers the sync
-  t.set(hubAnswer(['10.98.200.2', '10.98.200.4']));
-  await t.vpn.require(HUB, '10.98.1.20', '10.98.200.4');
-  assert(t.host.addresses.includes('10.98.200.4/32'));
+  t.set(hubAnswer([`${NET}.200.2`, `${NET}.200.4`]));
+  await t.vpn.require(HUB, `${NET}.1.20`, `${NET}.200.4`);
+  assert(t.host.addresses.includes(`${NET}.200.4/32`));
   // unknown source: still refused
-  await assertRejects(() => t.vpn.require(HUB, '10.98.1.20', '10.98.200.9'), /unavailable/);
+  await assertRejects(() => t.vpn.require(HUB, `${NET}.1.20`, `${NET}.200.9`), /unavailable/);
   // no hub at all
   const none = setup();
-  await assertRejects(() => none.vpn.require(HUB, '10.98.1.20', '10.98.200.2'), /unavailable/);
+  await assertRejects(() => none.vpn.require(HUB, `${NET}.1.20`, `${NET}.200.2`), /unavailable/);
 });

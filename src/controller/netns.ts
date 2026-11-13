@@ -170,7 +170,7 @@ export function renderMgmtNetNft(mgmtNet: string | null): string {
   const lines = [`flush set inet ${HOST_TABLE} mgmtnet4`];
   if (mgmtNet !== null) {
     const cidr = parseCidr(mgmtNet);
-    if (!cidr || cidr.family !== 4) throw new Error('Invalid management network');
+    if (cidr?.family !== 4) throw new Error('Invalid management network');
     lines.push(`add element inet ${HOST_TABLE} mgmtnet4 { ${cidr.text} }`);
   }
   return lines.join('\n') + '\n';
@@ -195,8 +195,8 @@ export function renderMgmtSessionElement(
 ): string {
   const address = parseAddress(target.address);
   const source = parseAddress(mgmt.source);
-  if (!address || address.family !== 4) throw new Error('Invalid target address');
-  if (!source || source.family !== 4) throw new Error('Invalid management source');
+  if (address?.family !== 4) throw new Error('Invalid target address');
+  if (source?.family !== 4) throw new Error('Invalid management source');
   const t = HOST_TABLE;
   const snat = action === 'add' ? `"${net.hostIf}" : ${source.text}` : `"${net.hostIf}"`;
   return `${action} element inet ${t} mgmtsessions4 { "${net.hostIf}" . ${address.text} . ${target.port} }\n` +
