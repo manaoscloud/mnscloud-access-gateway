@@ -66,6 +66,10 @@ export type BrowserRole = 'operator' | 'observer';
 
 /** Output kept for a browser that attaches again (bounded memory). */
 export const REPLAY_BYTES = 256 * 1024;
+/** Output chunks of the replay ring are merged up to this size. */
+const RING_CHUNK_BYTES = 4096;
+/** Observers allowed per session. */
+export const MAX_OBSERVERS = 4;
 
 interface Client {
   socket: BrowserSocket;
@@ -163,10 +167,15 @@ export class Session {
   #net: SessionNet | null = null;
   #bridge: Bridge | null = null;
   #clients: Client[] = [];
-  #ring: { frame: string; bytes: number }[] = [];
+  // Replay ring (detachable sessions only): merged chunks in a deque with a moving head.
+  #ring: { data: string; bytes: number }[] = [];
+  #ringHead = 0;
   #ringBytes = 0;
   #ready = false;
   #lastState: string | null = null;
+  #lastHostkey: string | null = null;
+  #pendingVerdict: { id: string; frame: string } | null = null;
+  #detachTimer: ReturnType<typeof setTimeout> | null = null;
   #events: RuntimeEvent[] = [];
   #seq = 0;
   #eventTimer: ReturnType<typeof setInterval> | null = null;
@@ -198,11 +207,30 @@ export class Session {
     void this.#run();
   }
 
+  /** Bytes held by the replay ring (tests). */
+  get replayBytes() {
+    return this.#ringBytes;
+  }
+
+  get replayChunks() {
+    return this.#ring.length - this.#ringHead;
+  }
+
+  get observerCount() {
+    return this.#clients.filter((c) => c.role === 'observer').length;
+  }
+
   /** Support session: a browser attaches again (operator) or watches (observer). */
   attachClient(socket: BrowserSocket, role: BrowserRole) {
-    if (this.#finished) {
+    if (this.#finished || !this.assignment.detachable) {
       try {
         socket.close(1000, 'Console closed.');
+      } catch { /* closed */ }
+      return;
+    }
+    if (role === 'observer' && this.observerCount >= MAX_OBSERVERS) {
+      try {
+        socket.close(4429, 'Too many observers.');
       } catch { /* closed */ }
       return;
     }
@@ -223,10 +251,21 @@ export class Session {
     }
     const client: Client = { socket, role, queue: [] };
     this.#clients.push(client);
+    if (role === 'operator' && this.#detachTimer) {
+      clearTimeout(this.#detachTimer);
+      this.#detachTimer = null;
+    }
     if (replay) {
-      if (this.#ready) client.queue.push(READY_FRAME);
-      for (const entry of this.#ring) client.queue.push(entry.frame);
       if (this.#lastState) client.queue.push(this.#lastState);
+      if (this.#ready) client.queue.push(READY_FRAME);
+      for (let i = this.#ringHead; i < this.#ring.length; i++) {
+        client.queue.push(outputFrame(this.#ring[i].data));
+      }
+      // Pending decisions go to the operator only; observers never see command lines.
+      if (role === 'operator') {
+        if (this.#lastHostkey) client.queue.push(this.#lastHostkey);
+        if (this.#pendingVerdict) client.queue.push(this.#pendingVerdict.frame);
+      }
     }
     const previousOpen = socket.onopen;
     socket.onopen = (event) => {
@@ -253,6 +292,11 @@ export class Session {
     this.#clients = this.#clients.filter((c) => c !== client);
     if (client.role !== 'operator') return;
     if (this.assignment.detachable) {
+      // Nobody drives the console: it ends like an idle one even if the device keeps talking.
+      this.#detachTimer ??= setTimeout(
+        () => this.close('idle_timeout'),
+        this.assignment.limits.idleSeconds * 1000,
+      );
       void this.deps.api.detach(this.uuid).catch((error) =>
         this.deps.log(`detach of ${this.uuid} not delivered: ${(error as Error).message}`)
       );
@@ -280,21 +324,42 @@ export class Session {
     for (const frame of client.queue.splice(0)) client.socket.send(frame);
   }
 
-  #output(data: string) {
-    const frame = outputFrame(data);
+  /** Sanitized device output to every browser and the replay ring (public for tests). */
+  emitOutput(data: string) {
+    if (this.assignment.detachable) this.#remember(data);
+    this.#toClients(outputFrame(data));
+  }
+
+  #remember(data: string) {
     const bytes = utf8Length(data);
-    this.#ring.push({ frame, bytes });
-    this.#ringBytes += bytes;
-    while (this.#ringBytes > REPLAY_BYTES && this.#ring.length > 1) {
-      this.#ringBytes -= this.#ring.shift()!.bytes;
+    const last = this.#ring.at(-1);
+    if (this.#ring.length > this.#ringHead && last && last.bytes < RING_CHUNK_BYTES) {
+      last.data += data;
+      last.bytes += bytes;
+      this.#ringBytes += bytes;
+    } else {
+      // Frame header included in the count.
+      this.#ring.push({ data, bytes: bytes + 12 });
+      this.#ringBytes += bytes + 12;
     }
-    this.#toClients(frame);
+    while (this.#ringBytes > REPLAY_BYTES && this.#ring.length - this.#ringHead > 1) {
+      this.#ringBytes -= this.#ring[this.#ringHead++].bytes;
+    }
+    if (this.#ringHead >= 256 && this.#ringHead * 2 >= this.#ring.length) {
+      this.#ring.splice(0, this.#ringHead);
+      this.#ringHead = 0;
+    }
   }
 
   /** Observers see only state and notice controls (never commands or verdicts). */
   #control(message: ControlMessage) {
     const frame = controlFrame(message);
     if (message.type === 'state') this.#lastState = frame;
+    else if (message.type === 'hostkey') this.#lastHostkey = frame;
+    else if (message.type === 'verdict') this.#pendingVerdict = { id: message.id, frame };
+    else if (message.type === 'resolved' && this.#pendingVerdict?.id === message.id) {
+      this.#pendingVerdict = null;
+    }
     this.#toClients(frame, message.type === 'state' || message.type === 'notice');
   }
 
@@ -485,7 +550,7 @@ export class Session {
     const worker = this.#worker!;
     switch (message.t) {
       case 'output':
-        this.#output(message.d);
+        this.emitOutput(message.d);
         break;
       case 'control':
         this.#control(message.m);
@@ -586,6 +651,7 @@ export class Session {
     if (this.#finished) return;
     this.#finished = true;
     if (this.#maxTimer) clearTimeout(this.#maxTimer);
+    if (this.#detachTimer) clearTimeout(this.#detachTimer);
     if (this.#eventTimer) clearInterval(this.#eventTimer);
     const reason = this.#closeReason && exit.reason === 'gateway_closed'
       ? this.#closeReason

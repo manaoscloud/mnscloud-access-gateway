@@ -12,7 +12,7 @@ import {
 } from './contract.ts';
 import type { ConnectorHub } from './connector_hub.ts';
 import { checkDestination, type Denylist } from './denylist.ts';
-import { Session, type SessionDeps } from './session.ts';
+import { MAX_OBSERVERS, Session, type SessionDeps } from './session.ts';
 import { TicketBook, ticketHash } from './ticket.ts';
 
 export interface GatewayOptions {
@@ -185,9 +185,11 @@ export class Gateway {
    */
   addAttachTickets(list: AttachTicket[]) {
     for (const item of list) {
-      if (!this.sessions.has(item.connectionUUID) || this.attachTickets.knows(item.sha256)) {
-        continue;
-      }
+      // Only detachable consoles of support sessions can be attached to.
+      if (
+        !this.sessions.get(item.connectionUUID)?.assignment.detachable ||
+        this.attachTickets.knows(item.sha256)
+      ) continue;
       this.attachTickets.add(item.sha256, Date.parse(item.expiresAt), {
         connectionUUID: item.connectionUUID,
         role: item.role,
@@ -266,11 +268,13 @@ export class Gateway {
         headers: { 'Cache-Control': 'no-store' },
       });
     const session = this.sessions.get(value.connectionUUID);
-    if (!session) return refused();
+    if (!session?.assignment.detachable) return refused();
+    if (value.role === 'observer' && session.observerCount >= MAX_OBSERVERS) return refused();
     let role: AttachTicket['role'];
     try {
       role = (await this.options.deps.api.attach(value.connectionUUID, await ticketHash(ticket)))
         .role;
+      if (role !== value.role) throw new Error('role mismatch');
     } catch (error) {
       this.options.deps.log(
         `attach to ${value.connectionUUID} refused: ${(error as Error).message}`,

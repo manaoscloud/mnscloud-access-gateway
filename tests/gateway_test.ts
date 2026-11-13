@@ -345,7 +345,7 @@ Deno.test({
     const frames: string[] = [];
     second.onmessage = (e) => frames.push(String(e.data));
     await waitFor(() => frames.join('').includes('service=pppoe'));
-    assertEquals(frames[0], 'OK');
+    assertEquals(frames[1], 'OK');
     assertEquals(roles.at(-1), await ticketHash(good));
     // Observer input is ignored; the same ticket cannot be used again.
     second.send('0:6:/quit\r');
@@ -362,6 +362,83 @@ Deno.test({
     second.close();
     g.sessions.get(uuid)?.close('test');
     await g.sessions.get(uuid)?.done;
+    await g.drain('test', 100);
+    await server.shutdown();
+    await device.close();
+  },
+});
+
+Deno.test({
+  name: 'gateway: attach tickets are refused for non-detachable consoles and on a role mismatch',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const key = generateHostKey();
+    const device = await startDevice(key);
+    const finished = new Map<string, FinishBody>();
+    const g = gateway(
+      finished,
+      'development',
+      ['127.0.0.1/32'],
+      () => Promise.resolve({ role: 'operator' }),
+    );
+    const server = Deno.serve(
+      { hostname: '127.0.0.1', port: 0, onListen: () => {} },
+      (request, info) => g.handle(request, (info.remoteAddr as Deno.NetAddr).hostname),
+    );
+    const base = `ws://127.0.0.1:${server.addr.port}/access-gateway/gw-test1/ws?ticket=`;
+    const open = async (detachable: boolean) => {
+      const ticket = newTicket();
+      const uuid = crypto.randomUUID();
+      await g.accept({
+        ...ASSIGNMENT,
+        connectionUUID: uuid,
+        username: 'support',
+        detachable,
+        target: { address: '127.0.0.1', port: device.port },
+        hostKey: { pinned: fingerprintOf(key) },
+        ticket: {
+          sha256: await ticketHash(ticket),
+          expiresAt: new Date(Date.now() + 30000).toISOString(),
+        },
+      });
+      const socket = new WebSocket(base + ticket);
+      await new Promise((resolve) => {
+        socket.onmessage = (e) => e.data === 'OK' && resolve(null);
+      });
+      return { uuid, socket };
+    };
+    const entry = async (uuid: string, role: 'operator' | 'observer') => {
+      const ticket = newTicket();
+      g.addAttachTickets([{
+        connectionUUID: uuid,
+        sha256: await ticketHash(ticket),
+        expiresAt: new Date(Date.now() + 30000).toISOString(),
+        role,
+      }]);
+      return ticket;
+    };
+    const status = (ticket: string) =>
+      new Promise<string>((resolve) => {
+        const s = new WebSocket(base + ticket);
+        s.onerror = () => resolve('error');
+        s.onopen = () => {
+          s.close();
+          resolve('open');
+        };
+      });
+    const plain = await open(false);
+    await entry(plain.uuid, 'operator');
+    assertEquals(g.attachTickets.size, 0);
+    const live = await open(true);
+    // The API says operator but the ticket was issued for an observer: refused.
+    assertEquals(await status(await entry(live.uuid, 'observer')), 'error');
+    assertEquals(await status(await entry(live.uuid, 'operator')), 'open');
+    for (const c of [plain, live]) {
+      c.socket.close();
+      g.sessions.get(c.uuid)?.close('test');
+      await g.sessions.get(c.uuid)?.done;
+    }
     await g.drain('test', 100);
     await server.shutdown();
     await device.close();
