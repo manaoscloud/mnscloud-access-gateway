@@ -214,7 +214,9 @@ ends them (finish reason `cancelled`).
 - `detachable` (optional, default `false`, honored only for `console`): the connection belongs to a
   support session. When the operator browser closes, the gateway does not end the connection: it
   calls `POST /connections/:uuid/detach` (section 12) and keeps the device connected; the idle and
-  maximum duration limits still end it. Without it (or `false`) a closed browser finishes the
+  maximum duration limits still end it, and a detachable connection with no operator attached for
+  `limits.idleSeconds` (reattaching resets it) ends with reason `idle_timeout` (close 4408) even if
+  the device keeps producing output. Without it (or `false`) a closed browser finishes the
   connection with `browser_closed`, as before.
 - `level` drives the manual-mode policy (`src/worker/policy.ts`).
 
@@ -420,12 +422,15 @@ parse `0:` for output so device text can never be read as `3:` control.
 
 Attach tickets (support sessions): the same URL with `ticket=<attach ticket>`. The gateway finds it
 in its attach book, calls `POST /connections/:uuid/attach` (section 12) and upgrades with the role
-the API returned. On attach the browser first receives `OK` (when the shell is ready), then the
-last 256 KB of redacted output as `0:` frames, then the last `state` control, then live frames.
+the API returned (it must equal the role of the ticket, else `401`). Attach tickets are kept and
+honored only for `detachable` connections. On attach the browser first receives the last `state`
+control, then `OK` (when the shell is ready), then the last 256 KB of redacted output as `0:` frames
+(kept only for detachable connections), then, for an `operator` only, the last `hostkey` control and
+a still pending `verdict`; then live frames.
 
 - `operator`: the single input browser. A previous operator socket is closed with code **4410**,
   reason `replaced`, and its close does not detach or end the session.
-- `observer`: receives output, `OK` and `state`/`notice` controls only (never verdicts or command
+- `observer`: at most 4 per connection (more get `401`, or close 4429); receives output, `OK` and `state`/`notice` controls only (never verdicts or command
   lines); every input, resize and confirm frame is ignored and its close never ends the session.
 
 Control messages (`3:`):
