@@ -11,10 +11,17 @@ connector_require_root
 umask 0077
 [[ -f "$CONNECTOR_CONFIG" ]] || cdie 'the connector is not installed'
 install -d -m 0700 "$CONNECTOR_ROOT_CACHE_DIR"
-desired="$(DENO_DIR="$CONNECTOR_ROOT_CACHE_DIR" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 "$DENO_BIN" run \
+# Same sys grants as the service unit: reading the key file checks its owner (Deno.uid()).
+# A failure is reported with its reason, never mistaken for an invalid announcement.
+desired_err="$(mktemp)"
+trap 'rm -f "$desired_err"' EXIT
+if ! desired="$(DENO_DIR="$CONNECTOR_ROOT_CACHE_DIR" DENO_NO_UPDATE_CHECK=1 NO_COLOR=1 "$DENO_BIN" run \
  --cached-only --frozen --no-prompt "--config=$CONNECTOR_APP_DIR/deno.json" \
  "--allow-read=$CONNECTOR_APP_DIR,$CONNECTOR_CONF_DIR" --allow-net \
- "$CONNECTOR_APP_DIR/src/connector/main.ts" desired --config "$CONNECTOR_CONFIG" 2>/dev/null || true)"
+ --allow-sys=hostname,networkInterfaces,uid \
+ "$CONNECTOR_APP_DIR/src/connector/main.ts" desired --config "$CONNECTOR_CONFIG" 2>"$desired_err")"; then
+ cdie "could not read the desired release: $({ printf '%s\n' "${desired:-}"; cat "$desired_err"; } | grep -v '^$' | tail -n 1 | tr -d '\r' | cut -c1-200)"
+fi
 [[ -n "$desired" ]] || { clog 'no desired release announced'; exit 0; }
 tag="$(printf '%s' "$desired" | sed -n 's/.*"tag":"\(v[0-9.]*\)".*/\1/p')"
 commit="$(printf '%s' "$desired" | sed -n 's/.*"commit":"\([0-9a-f]\{40\}\)".*/\1/p')"

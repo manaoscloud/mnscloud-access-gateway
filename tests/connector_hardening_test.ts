@@ -435,7 +435,14 @@ Deno.test('finding 2: connector workers see a private /run with the bridge under
   const props = new Set(argv.flatMap((a, i) => (argv[i - 1] === '-p' ? [a] : [])));
   assert(props.has('TemporaryFileSystem=/run:ro'));
   assert(props.has(`BindPaths=${real}:/run/bridge.sock`));
-  assert(props.has('InaccessiblePaths=-/run/dbus -/run/systemd'));
+  // systemd needs /run/systemd/inaccessible to set up InaccessiblePaths: hiding it fails the
+  // unit with 226/NAMESPACE before the worker starts. The empty /run tmpfs already hides it.
+  assert(
+    ![...props].some((p) =>
+      p.startsWith('InaccessiblePaths=') && /(^|[\s=-])\/run\/systemd(\s|$)/.test(p)
+    ),
+    'no InaccessiblePaths entry hides /run/systemd',
+  );
   const denoArgs = argv.slice(argv.indexOf('--') + 1);
   assert(!denoArgs.some((a) => a.includes(real)), 'real socket name is not on the worker argv');
   assertEquals(
@@ -583,6 +590,15 @@ Deno.test('lab finding: the service unit grants every sys API the connector runt
   }
   assert(used.has('uid'), 'key file owner check uses Deno.uid()');
   for (const name of used) assert(granted.has(name), `--allow-sys lacks ${name}`);
+  // The updater runs the same runtime (`main.ts desired`), which reads the key file too.
+  const updater = read('scripts/update-connector.sh').match(/--allow-sys=([A-Za-z,]+)/);
+  assert(updater, 'updater desired call has no --allow-sys');
+  const updaterGranted = new Set(updater[1].split(','));
+  for (const name of used) assert(updaterGranted.has(name), `updater --allow-sys lacks ${name}`);
+  assert(
+    !/main\.ts" desired[^\n]*2>\/dev\/null \|\| true/.test(read('scripts/update-connector.sh')),
+    'the updater does not swallow a failure of the desired call',
+  );
 });
 
 Deno.test('lab finding: a tunnel the API no longer records is attached again, or closed', async () => {
