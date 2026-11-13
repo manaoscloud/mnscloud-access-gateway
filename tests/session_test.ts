@@ -330,7 +330,7 @@ class Closable extends FakeBrowser {
 
 Deno.test({
   name:
-    'session: detachable survives the operator closing; a new operator gets the screen replay and replaces the old one (4409); observers cannot write',
+    'session: detachable survives the operator closing; a new operator gets the screen replay and replaces the old one (4410); observers cannot write',
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
@@ -369,10 +369,10 @@ Deno.test({
     second.type(':put secret\r');
     await second.waitFor(() => second.output().includes(' ok'));
     await watcher2.waitFor(() => watcher2.output().includes(' ok'));
-    // Replacement: the previous operator is closed with 4409 and its close does not detach.
+    // Replacement: the previous operator is closed with 4410 and its close does not detach.
     const third = new Closable();
     session.attachClient(third, 'operator');
-    assertEquals(second.closed, [4409, 'replaced']);
+    assertEquals(second.closed, [4410, 'replaced']);
     second.hangUp();
     assertEquals(api.calls.filter((c) => c === 'detach').length, 1);
     third.type('/quit\r');

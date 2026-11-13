@@ -217,7 +217,7 @@ export class Session {
         this.#clients = this.#clients.filter((c) => c !== previous);
         previous.socket.onclose = previous.socket.onerror = previous.socket.onmessage = null;
         try {
-          previous.socket.close(4409, 'replaced');
+          previous.socket.close(4410, 'replaced');
         } catch { /* closed */ }
       }
     }

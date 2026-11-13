@@ -423,7 +423,7 @@ in its attach book, calls `POST /connections/:uuid/attach` (section 12) and upgr
 the API returned. On attach the browser first receives `OK` (when the shell is ready), then the
 last 256 KB of redacted output as `0:` frames, then the last `state` control, then live frames.
 
-- `operator`: the single input browser. A previous operator socket is closed with code **4409**,
+- `operator`: the single input browser. A previous operator socket is closed with code **4410**,
   reason `replaced`, and its close does not detach or end the session.
 - `observer`: receives output, `OK` and `state`/`notice` controls only (never verdicts or command
   lines); every input, resize and confirm frame is ignored and its close never ends the session.
@@ -441,7 +441,7 @@ Control messages (`3:`):
 
 `double_confirm` sends a second `verdict` with `step: 2` after the first confirmation; each confirm
 must carry the current `step`. Close codes: 4401 credential refused/unavailable, 4403 host key not
-accepted, 4408 idle/maximum duration, 4409 host key changed (or `replaced`: the operator was replaced by a new attach), 4413 output limit, 4500 other failure,
+accepted, 4408 idle/maximum duration, 4409 host key changed, 4410 operator replaced by a new attach, 4413 output limit, 4500 other failure,
 1000 normal; HTTP 401 before upgrade for an invalid, used or expired ticket.
 
 ## Remote access connector (tenant network path)
