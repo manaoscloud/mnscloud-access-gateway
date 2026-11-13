@@ -140,8 +140,15 @@ repeating a cursor re-delivers what was not acknowledged by a later poll.
 `data`:
 
 ```json
-{ "cursor": "<opaque, <=256 chars>", "assignments": [ <Assignment> ], "cancelled": ["<connectionUUID>"] }
+{ "cursor": "<opaque, <=256 chars>", "assignments": [ <Assignment> ], "cancelled": ["<connectionUUID>"],
+  "attachTickets": [ { "connectionUUID": "uuid", "sha256": "<64 hex>", "expiresAt": "ISO", "role": "operator | observer" } ] }
 ```
+
+`attachTickets` (optional, absent = none): extra single-use tickets for a browser to attach to a
+connection that is already live on this gateway (support sessions, section 12). `sha256` is the hex
+SHA-256 of the ASCII ticket, like `ticket.sha256`; the gateway keeps one only for a live connection of
+its own (duplicates by hash are ignored, an expired one is dropped silently) and accepts it once, until
+`min(expiresAt, received + 60 s)`. Invalid items are skipped.
 
 `cancelled`: connections the user closed (tenant `DELETE` connection) or the API revoked; the gateway
 ends them (finish reason `cancelled`).
@@ -165,6 +172,7 @@ ends them (finish reason `cancelled`).
   "hostKey": { "pinned": "SHA256:... | null" },
   "tls": { "pinned": "SHA256:... | null" },
   "ticket": { "sha256": "<64 hex>", "expiresAt": "ISO" },
+  "detachable": false,
   "terminal": { "cols": 120, "rows": 32 },
   "limits": {
     "maxSessionSeconds": 14400,
@@ -203,6 +211,11 @@ ends them (finish reason `cancelled`).
   refused. The gateway finishes `failed` with `mgmt_vpn_unavailable` when it has no hub, the hub
   differs from `hubUUID`, the destination is outside `mgmtNet`, or `source` is not on the interface
   (after one immediate synchronisation).
+- `detachable` (optional, default `false`, honored only for `console`): the connection belongs to a
+  support session. When the operator browser closes, the gateway does not end the connection: it
+  calls `POST /connections/:uuid/detach` (section 12) and keeps the device connected; the idle and
+  maximum duration limits still end it. Without it (or `false`) a closed browser finishes the
+  connection with `browser_closed`, as before.
 - `level` drives the manual-mode policy (`src/worker/policy.ts`).
 
 ## 4. `POST /connections/:uuid/hostkey`
@@ -307,6 +320,21 @@ Exactly once per connection (also for refused and expired assignments).
 `recording` and `facts` may be `null`. `facts` comes from "Testar acesso" (RouterOS API-SSL
 `/system/identity/print` and `/system/resource/print`; SSH test only proves login). `data`: ignored.
 
+## 12. Attach and detach (support sessions)
+
+### `POST /connections/:uuid/attach`
+
+Sent by the gateway when a browser presents an attach ticket (`attachTickets`, section 3) before the
+WebSocket upgrade. Request: `{ "sha256": "<64 hex of the presented ticket>" }`. The API consumes the
+ticket for that connection (single use) and answers `data: { "role": "operator | observer" }`. Any
+error (4xx/5xx, network, invalid `role`) makes the gateway answer the browser `401` without
+upgrading; the ticket stays spent.
+
+### `POST /connections/:uuid/detach`
+
+Request `{}`. Sent best effort (failures are only logged) when the operator browser of a
+`detachable` connection closed or errored. Audit only: the connection stays live.
+
 ## 9. `POST /heartbeat`
 
 Every 30 s:
@@ -390,6 +418,16 @@ nftables and the controller both check). Text frames only:
 Device output is always a `0:` frame, unlike the VPS console where output is raw: the App must
 parse `0:` for output so device text can never be read as `3:` control.
 
+Attach tickets (support sessions): the same URL with `ticket=<attach ticket>`. The gateway finds it
+in its attach book, calls `POST /connections/:uuid/attach` (section 12) and upgrades with the role
+the API returned. On attach the browser first receives `OK` (when the shell is ready), then the
+last 256 KB of redacted output as `0:` frames, then the last `state` control, then live frames.
+
+- `operator`: the single input browser. A previous operator socket is closed with code **4409**,
+  reason `replaced`, and its close does not detach or end the session.
+- `observer`: receives output, `OK` and `state`/`notice` controls only (never verdicts or command
+  lines); every input, resize and confirm frame is ignored and its close never ends the session.
+
 Control messages (`3:`):
 
 ```json
@@ -403,7 +441,7 @@ Control messages (`3:`):
 
 `double_confirm` sends a second `verdict` with `step: 2` after the first confirmation; each confirm
 must carry the current `step`. Close codes: 4401 credential refused/unavailable, 4403 host key not
-accepted, 4408 idle/maximum duration, 4409 host key changed, 4413 output limit, 4500 other failure,
+accepted, 4408 idle/maximum duration, 4409 host key changed (or `replaced`: the operator was replaced by a new attach), 4413 output limit, 4500 other failure,
 1000 normal; HTTP 401 before upgrade for an invalid, used or expired ticket.
 
 ## Remote access connector (tenant network path)

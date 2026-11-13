@@ -3,7 +3,7 @@
 // long-polls assignments and sends heartbeats. Sessions run in their own sandboxes.
 
 import { parseCidr } from '../shared/ip.ts';
-import { type GatewayConfig, parseConfig } from './contract.ts';
+import { type GatewayConfig, parseAttachTickets, parseConfig } from './contract.ts';
 import { ControlPlane, loadAgentIdentity, privateRead } from './control_plane.ts';
 import { ConnectorHub } from './connector_hub.ts';
 import { buildDenylist } from './denylist.ts';
@@ -178,6 +178,7 @@ async function main() {
       cursor = typeof batch?.cursor === 'string' ? batch.cursor.slice(0, 256) : cursor;
       for (const uuid of batch?.cancelled ?? []) gateway.cancel(String(uuid));
       for (const raw of batch?.assignments ?? []) await gateway.accept(raw);
+      gateway.addAttachTickets(parseAttachTickets(batch?.attachTickets));
     } catch (error) {
       log(`assignments poll failed: ${(error as Error).message}`);
       await new Promise((resolve) => setTimeout(resolve, 5000));

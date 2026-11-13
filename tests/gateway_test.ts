@@ -14,7 +14,10 @@ import { fingerprintOf, generateHostKey, PASSWORD, startDevice } from './hostile
 
 const ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 
-function api(finished: Map<string, FinishBody>): SessionApi {
+function api(
+  finished: Map<string, FinishBody>,
+  attach: SessionApi['attach'] = () => Promise.resolve({ role: 'operator' }),
+): SessionApi {
   return {
     hostKey: () => Promise.resolve({ decision: 'accept', pinned: true }),
     credential: () =>
@@ -26,6 +29,8 @@ function api(finished: Map<string, FinishBody>): SessionApi {
     credentialResult: () => Promise.resolve(),
     events: () => Promise.resolve(),
     recordingPart: () => Promise.resolve(),
+    attach,
+    detach: () => Promise.resolve(),
     finish: (uuid, body) => {
       finished.set(uuid, body);
       return Promise.resolve();
@@ -37,6 +42,7 @@ function gateway(
   finished: Map<string, FinishBody>,
   environment = 'production',
   labTargets: string[] = [],
+  attach?: SessionApi['attach'],
 ) {
   return new Gateway({
     gatewayKey: 'gw-test1',
@@ -46,7 +52,7 @@ function gateway(
     version: '0.1.0',
     ticketArrivalMs: 300,
     deps: {
-      api: api(finished),
+      api: api(finished, attach),
       unwrap: () => Promise.resolve({ username: 'support', password: PASSWORD }),
       launcher: new DirectLauncher(ROOT),
       networks: null,
@@ -244,6 +250,118 @@ Deno.test({
     assertEquals(refused, 'error');
     await new Promise((r) => setTimeout(r, 100));
     assertEquals(finished.get(uuid)?.reason, 'device_closed');
+    await g.drain('test', 100);
+    await server.shutdown();
+    await device.close();
+  },
+});
+
+Deno.test({
+  name:
+    'gateway: attach tickets reattach a detachable console with a replay; the API can refuse; a spent ticket is gone',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const key = generateHostKey();
+    const device = await startDevice(key);
+    const finished = new Map<string, FinishBody>();
+    const roles: string[] = [];
+    let refuse = false;
+    const g = gateway(finished, 'development', ['127.0.0.1/32'], (_uuid, sha) => {
+      roles.push(sha);
+      return refuse ? Promise.reject(new Error('refused')) : Promise.resolve({ role: 'observer' });
+    });
+    const server = Deno.serve(
+      { hostname: '127.0.0.1', port: 0, onListen: () => {} },
+      (request, info) => g.handle(request, (info.remoteAddr as Deno.NetAddr).hostname),
+    );
+    const base = `ws://127.0.0.1:${server.addr.port}/access-gateway/gw-test1/ws?ticket=`;
+    const ticket = newTicket();
+    const uuid = crypto.randomUUID();
+    await g.accept({
+      ...ASSIGNMENT,
+      connectionUUID: uuid,
+      username: 'support',
+      detachable: true,
+      target: { address: '127.0.0.1', port: device.port },
+      hostKey: { pinned: fingerprintOf(key) },
+      ticket: {
+        sha256: await ticketHash(ticket),
+        expiresAt: new Date(Date.now() + 30000).toISOString(),
+      },
+    });
+    const first = new WebSocket(base + ticket);
+    const firstFrames: string[] = [];
+    first.onmessage = (e) => {
+      firstFrames.push(String(e.data));
+      if (e.data === 'OK') first.send('0:8:/export\r');
+    };
+    const waitFor = async (predicate: () => boolean) => {
+      for (let i = 0; i < 500 && !predicate(); i++) await new Promise((r) => setTimeout(r, 20));
+      assert(predicate(), 'condition');
+    };
+    await waitFor(() => firstFrames.join('').includes('service=pppoe'));
+    // The browser leaves: the session stays (detachable).
+    first.close();
+    await new Promise((r) => setTimeout(r, 200));
+    assertEquals(finished.has(uuid), false);
+    assertEquals(g.sessions.has(uuid), true);
+
+    // An attach ticket for a connection that is not live here is ignored.
+    const stranger = newTicket();
+    g.addAttachTickets([{
+      connectionUUID: crypto.randomUUID(),
+      sha256: await ticketHash(stranger),
+      expiresAt: new Date(Date.now() + 30000).toISOString(),
+      role: 'operator',
+    }]);
+    assertEquals(g.attachTickets.size, 0);
+
+    const attachTicket = newTicket();
+    const entry = {
+      connectionUUID: uuid,
+      sha256: await ticketHash(attachTicket),
+      expiresAt: new Date(Date.now() + 30000).toISOString(),
+      role: 'observer' as const,
+    };
+    g.addAttachTickets([entry, entry]);
+    assertEquals(g.attachTickets.size, 1);
+    // The API refuses: 401 before any upgrade.
+    refuse = true;
+    const refused = new WebSocket(base + attachTicket);
+    assertEquals(
+      await new Promise<string>((resolve) => {
+        refused.onerror = () => resolve('error');
+        refused.onopen = () => resolve('open');
+      }),
+      'error',
+    );
+    // The refused ticket was spent: a second try is also 401 (single use on the gateway too).
+    refuse = false;
+    g.addAttachTickets([{ ...entry, sha256: await ticketHash(newTicket()) }]);
+    const good = newTicket();
+    g.addAttachTickets([{ ...entry, sha256: await ticketHash(good) }]);
+    const second = new WebSocket(base + good);
+    const frames: string[] = [];
+    second.onmessage = (e) => frames.push(String(e.data));
+    await waitFor(() => frames.join('').includes('service=pppoe'));
+    assertEquals(frames[0], 'OK');
+    assertEquals(roles.at(-1), await ticketHash(good));
+    // Observer input is ignored; the same ticket cannot be used again.
+    second.send('0:6:/quit\r');
+    await new Promise((r) => setTimeout(r, 200));
+    assertEquals(finished.has(uuid), false);
+    const again = new WebSocket(base + good);
+    assertEquals(
+      await new Promise<string>((resolve) => {
+        again.onerror = () => resolve('error');
+        again.onopen = () => resolve('open');
+      }),
+      'error',
+    );
+    second.close();
+    g.sessions.get(uuid)?.close('test');
+    await g.sessions.get(uuid)?.done;
     await g.drain('test', 100);
     await server.shutdown();
     await device.close();

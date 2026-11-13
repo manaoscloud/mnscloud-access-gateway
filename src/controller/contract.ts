@@ -43,6 +43,11 @@ export interface Assignment {
   hostKey: { pinned: string | null };
   tls: { pinned: string | null };
   ticket: { sha256: string; expiresAt: string } | null;
+  /**
+   * Console of a support session: a closed browser does not end the connection, a browser can
+   * attach again later (attach tickets). False when the API does not send it.
+   */
+  detachable: boolean;
   terminal: { cols: number; rows: number };
   limits: {
     maxSessionSeconds: number;
@@ -65,10 +70,43 @@ export interface MgmtVpnDesired {
   sources: string[];
 }
 
+/** Extra single-use ticket to attach a browser to a live connection (support sessions). */
+export interface AttachTicket {
+  connectionUUID: string;
+  sha256: string;
+  expiresAt: string;
+  role: 'operator' | 'observer';
+}
+
 export interface AssignmentsResponse {
   cursor: string;
   assignments: unknown[];
   cancelled: string[];
+  /** Absent on an API that does not know support sessions. */
+  attachTickets?: unknown[];
+}
+
+/** Valid attach tickets of a raw list; malformed items are skipped, never fixed. */
+export function parseAttachTickets(value: unknown): AttachTicket[] {
+  if (!Array.isArray(value)) return [];
+  const out: AttachTicket[] = [];
+  for (const item of value.slice(0, 256)) {
+    const v = item as Record<string, unknown> | null;
+    if (!v || typeof v !== 'object') continue;
+    if (
+      typeof v.connectionUUID !== 'string' || !UUID.test(v.connectionUUID) ||
+      typeof v.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(v.sha256) ||
+      typeof v.expiresAt !== 'string' || Number.isNaN(Date.parse(v.expiresAt)) ||
+      (v.role !== 'operator' && v.role !== 'observer')
+    ) continue;
+    out.push({
+      connectionUUID: v.connectionUUID,
+      sha256: v.sha256,
+      expiresAt: v.expiresAt,
+      role: v.role,
+    });
+  }
+  return out;
 }
 
 export interface CredentialResponse {
@@ -287,6 +325,7 @@ export function parseAssignment(value: unknown): Assignment {
     hostKey: { pinned: pin(v.hostKey?.pinned) },
     tls: { pinned: pin(v.tls?.pinned) },
     ticket,
+    detachable: v.mode === 'console' && v.detachable === true,
     terminal: {
       cols: int(v.terminal?.cols ?? 120, 20, 500, 'cols'),
       rows: int(v.terminal?.rows ?? 32, 5, 200, 'rows'),

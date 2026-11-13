@@ -132,6 +132,8 @@ Deno.test({
             },
             events: () => Promise.resolve(),
             recordingPart: () => Promise.resolve(),
+            attach: () => Promise.resolve({ role: 'operator' as const }),
+            detach: () => Promise.resolve(),
             finish: (_c, body) => {
               finished = body;
               return Promise.resolve();

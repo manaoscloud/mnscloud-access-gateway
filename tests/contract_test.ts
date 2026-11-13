@@ -1,4 +1,4 @@
-import { parseAssignment, parseConfig } from '../src/controller/contract.ts';
+import { parseAssignment, parseAttachTickets, parseConfig } from '../src/controller/contract.ts';
 import { AsciicastWriter } from '../src/shared/asciicast.ts';
 import { canonicalApi, parseIni } from '../src/controller/control_plane.ts';
 import { parseEnv, renderEnv, requireBinding } from '../src/controller/env.ts';
@@ -121,4 +121,21 @@ Deno.test('asciicast: v2 header, output, marker and resize events', () => {
   assertEquals(JSON.parse(w.output('hi', 1001_500)), [1.5, 'o', 'hi']);
   assertEquals(JSON.parse(w.marker('allowed read: ls', 1002_000)), [2, 'm', 'allowed read: ls']);
   assertEquals(JSON.parse(w.resize(100, 30, 1003_000)), [3, 'r', '100x30']);
+});
+
+Deno.test('contract: detachable and attachTickets default to the previous behavior', () => {
+  assertEquals(parseAssignment(ASSIGNMENT).detachable, false);
+  assertEquals(parseAssignment({ ...ASSIGNMENT, detachable: true }).detachable, true);
+  assertEquals(parseAssignment({ ...ASSIGNMENT, detachable: 'yes' }).detachable, false);
+  assertEquals(parseAttachTickets(undefined), []);
+  const ok = {
+    connectionUUID: ASSIGNMENT.connectionUUID,
+    sha256: 'b'.repeat(64),
+    expiresAt: new Date().toISOString(),
+    role: 'observer',
+  };
+  assertEquals(
+    parseAttachTickets([ok, { ...ok, role: 'root' }, { ...ok, sha256: 'x' }, null, 7]),
+    [ok],
+  );
 });

@@ -12,7 +12,7 @@ import {
   type ConnectorRuntimeApi,
 } from './connector_hub.ts';
 import { type ControlPlane, ControlPlaneRejected } from './control_plane.ts';
-import type { RuntimeEvent, SessionApi } from './session.ts';
+import type { BrowserRole, RuntimeEvent, SessionApi } from './session.ts';
 
 export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
   constructor(private readonly cp: ControlPlane) {}
@@ -104,6 +104,24 @@ export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
       headers: { 'Content-Type': 'application/x-asciicast', 'X-MNSCloud-Part-SHA256': sha256 },
       timeoutMs: 60000,
     });
+  }
+
+  /** Consumes an attach ticket of a live support connection; throws when the API refuses. */
+  async attach(connection: string, sha256: string) {
+    const data = await this.cp.call<{ role?: unknown } | null>(
+      'POST',
+      `/connections/${connection}/attach`,
+      { sha256 },
+    );
+    if (data?.role !== 'operator' && data?.role !== 'observer') {
+      throw new Error('Invalid attach role');
+    }
+    return { role: data.role as BrowserRole };
+  }
+
+  /** The operator browser left a detachable connection (best effort, audit only). */
+  async detach(connection: string) {
+    await this.cp.call('POST', `/connections/${connection}/detach`, {});
   }
 
   async finish(connection: string, body: FinishBody) {
