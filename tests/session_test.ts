@@ -54,6 +54,13 @@ class FakeApi implements SessionApi {
     this.parts.push(bytes);
     return Promise.resolve();
   }
+  attach() {
+    return Promise.resolve({ role: 'operator' as const });
+  }
+  detach() {
+    this.calls.push('detach');
+    return Promise.resolve();
+  }
   finish(_c: string, body: FinishBody) {
     this.finished = body;
     this.calls.push(`finish:${body.reason}`);
@@ -112,6 +119,7 @@ async function open(options: {
   level?: 'n1' | 'n2' | 'n3';
   dialect?: string;
   limits?: Record<string, number>;
+  detachable?: boolean;
 }) {
   const key = generateHostKey();
   const device = await startDevice(key, options.behaviour ?? 'normal');
@@ -129,6 +137,7 @@ async function open(options: {
     level: options.level ?? 'n2',
     shellDialect: options.dialect ?? 'routeros',
     hostKey: { pinned },
+    ...(options.detachable ? { detachable: true } : {}),
     limits: { ...ASSIGNMENT.limits, ...(options.limits ?? {}) },
     recording: { enabled: true, partBytes: 65536, partSeconds: 5 },
   });
@@ -308,5 +317,223 @@ Deno.test({
     await session.done;
     assert(api.finished !== null);
     await device.close();
+  },
+});
+
+class Closable extends FakeBrowser {
+  /** The browser side ends the socket. */
+  hangUp() {
+    this.readyState = 3;
+    this.onclose?.({} as CloseEvent);
+  }
+}
+
+Deno.test({
+  name:
+    'session: detachable survives the operator closing; a new operator gets the screen replay and replaces the old one (4410); observers cannot write',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { session, browser, api, device } = await open({ detachable: true });
+    await browser.waitFor(() => browser.frames.includes('OK'));
+    browser.type('/export\r');
+    await browser.waitFor(() => browser.output().includes('service=pppoe'));
+    await browser.waitFor(() => browser.output().endsWith('> '));
+    const seen = browser.output();
+    // Operator leaves: the connection stays, the API is told.
+    (browser as unknown as Closable).readyState = 3;
+    browser.onclose?.({} as CloseEvent);
+    await new Promise((r) => setTimeout(r, 50));
+    assertEquals(api.finished, null);
+    assertEquals(api.calls.filter((c) => c === 'detach').length, 1);
+    // A new operator repaints the screen from the ring.
+    const second = new Closable();
+    session.attachClient(second, 'operator');
+    assertEquals(second.frames[1], 'OK');
+    assertEquals(second.output(), seen);
+    // An observer gets the replay too, but its input is ignored and its close is harmless.
+    const watcher = new Closable();
+    session.attachClient(watcher, 'observer');
+    assertEquals(watcher.output(), seen);
+    const before = device.received.join('');
+    watcher.type('/quit\r');
+    watcher.frame('1:50:10:');
+    await new Promise((r) => setTimeout(r, 100));
+    assertEquals(device.received.join(''), before);
+    watcher.hangUp();
+    await new Promise((r) => setTimeout(r, 50));
+    assertEquals(api.finished, null);
+    // Live output reaches the operator and a watcher that is still there.
+    const watcher2 = new Closable();
+    session.attachClient(watcher2, 'observer');
+    second.type(':put secret\r');
+    await second.waitFor(() => second.output().includes(' ok'));
+    await watcher2.waitFor(() => watcher2.output().includes(' ok'));
+    // Replacement: the previous operator is closed with 4410 and its close does not detach.
+    const third = new Closable();
+    session.attachClient(third, 'operator');
+    assertEquals(second.closed, [4410, 'replaced']);
+    second.hangUp();
+    assertEquals(api.calls.filter((c) => c === 'detach').length, 1);
+    third.type('/quit\r');
+    await session.done;
+    assertEquals(api.finished?.reason, 'device_closed');
+    // A finished session refuses a late attach.
+    const late = new Closable();
+    session.attachClient(late, 'operator');
+    assertEquals(late.closed?.[0], 1000);
+    await device.close();
+  },
+});
+
+Deno.test({
+  name: 'session: a non-detachable console still ends when the browser closes',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { session, browser, api, device } = await open({});
+    await browser.waitFor(() => browser.frames.includes('OK'));
+    browser.readyState = 3;
+    browser.onclose?.({} as CloseEvent);
+    await session.done;
+    assertEquals(api.finished?.reason, 'browser_closed');
+    assertEquals(api.calls.includes('detach'), false);
+    await device.close();
+  },
+});
+
+Deno.test({
+  name: 'session: the replay ring keeps at most 256 KB of output',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { session, browser, device } = await open({
+      detachable: true,
+      behaviour: 'flood',
+      limits: { maxOutputBytesPerSecond: 16777216 },
+    });
+    await browser.waitFor(() => browser.frames.includes('OK'));
+    browser.type('/export\r');
+    await browser.waitFor(() => browser.output().length > 300 * 1024, 30000).catch(() => {});
+    const late = new Closable();
+    session.attachClient(late, 'observer');
+    assert(late.output().length <= 256 * 1024 + 64 * 1024, 'bounded replay');
+    session.close('test');
+    await session.done;
+    await device.close();
+  },
+});
+
+Deno.test({
+  name:
+    'session: a pending verdict is replayed to a reattaching operator, never to observers; resolved ones are not',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { session, browser, api, device } = await open({
+      pinned: 'match',
+      level: 'n3',
+      detachable: true,
+    });
+    await browser.waitFor(() => browser.frames.includes('OK'));
+    browser.type('/system reboot\r');
+    await browser.waitFor(() => browser.controls().some((c) => c.type === 'verdict'));
+    const verdict = browser.controls().find((c) => c.type === 'verdict') as unknown as {
+      id: string;
+    };
+    browser.readyState = 3;
+    browser.onclose?.({} as CloseEvent);
+    const watcher = new Closable();
+    session.attachClient(watcher, 'observer');
+    assertEquals(watcher.controls().some((c) => c.type === 'verdict'), false);
+    assertEquals(watcher.controls().some((c) => c.type === 'hostkey'), false);
+    const operator = new Closable();
+    session.attachClient(operator, 'operator');
+    const types = operator.controls().map((c) => c.type);
+    assertEquals(types[0], 'state');
+    assert(types.includes('hostkey'));
+    assertEquals(types.at(-1), 'verdict');
+    assertEquals(operator.frames[1], 'OK');
+    operator.frame(`4:${JSON.stringify({ type: 'confirm', id: verdict.id })}`);
+    await operator.waitFor(() => operator.controls().some((c) => c.type === 'resolved'));
+    const next = new Closable();
+    session.attachClient(next, 'operator');
+    assertEquals(next.controls().some((c) => c.type === 'verdict'), false);
+    assertEquals(api.calls.includes('detach'), true);
+    next.type('/quit\r');
+    await session.done;
+    await device.close();
+  },
+});
+
+Deno.test({
+  name: 'session: the replay ring stays bounded with many tiny chunks and only for detachable',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { session, device, browser } = await open({ detachable: true });
+    await browser.waitFor(() => browser.frames.includes('OK'));
+    for (let i = 0; i < 400_000; i++) session.emitOutput('x');
+    assert(session.replayBytes <= 256 * 1024 + 8192, `ring ${session.replayBytes}`);
+    assert(session.replayChunks < 200, `chunks ${session.replayChunks}`);
+    session.close('test');
+    await session.done;
+    await device.close();
+    const plain = await open({});
+    await plain.browser.waitFor(() => plain.browser.frames.includes('OK'));
+    plain.session.emitOutput('hello');
+    assertEquals(plain.session.replayBytes, 0);
+    plain.session.close('test');
+    await plain.session.done;
+    await plain.device.close();
+  },
+});
+
+Deno.test({
+  name:
+    'session: a detachable console with no operator ends as idle even if the device keeps talking; reattach resets it',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { session, browser, api, device } = await open({ detachable: true, behaviour: 'flood' });
+    await browser.waitFor(() => browser.frames.includes('OK'));
+    session.assignment.limits.idleSeconds = 1;
+    browser.readyState = 3;
+    browser.onclose?.({} as CloseEvent);
+    await new Promise((r) => setTimeout(r, 400));
+    const operator = new Closable();
+    session.attachClient(operator, 'operator');
+    await new Promise((r) => setTimeout(r, 1300));
+    assertEquals(api.finished, null);
+    operator.hangUp();
+    await session.done;
+    assertEquals(api.finished?.reason, 'idle_timeout');
+    await device.close();
+  },
+});
+
+Deno.test({
+  name: 'session: at most four observers; a non-detachable session accepts no attach',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { session, browser, device } = await open({ detachable: true });
+    await browser.waitFor(() => browser.frames.includes('OK'));
+    const watchers = Array.from({ length: 5 }, () => new Closable());
+    for (const w of watchers) session.attachClient(w, 'observer');
+    assertEquals(watchers.slice(0, 4).map((w) => w.closed), [null, null, null, null]);
+    assertEquals(watchers[4].closed?.[0], 4429);
+    session.close('test');
+    await session.done;
+    await device.close();
+    const plain = await open({});
+    await plain.browser.waitFor(() => plain.browser.frames.includes('OK'));
+    const extra = new Closable();
+    plain.session.attachClient(extra, 'operator');
+    assertEquals(extra.closed?.[0], 1000);
+    assertEquals(plain.browser.closed, null);
+    plain.session.close('test');
+    await plain.session.done;
+    await plain.device.close();
   },
 });

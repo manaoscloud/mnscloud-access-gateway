@@ -8,6 +8,7 @@ import {
   outputFrame,
   parseBrowserFrame,
   READY_FRAME,
+  utf8Length,
 } from '../shared/framing.ts';
 import type { CommandEvent, Facts, WorkerInit, WorkerToController } from '../shared/ipc.ts';
 import type { Assignment, FinishBody, HostKeyResponse } from './contract.ts';
@@ -55,6 +56,25 @@ export interface SessionApi {
     sha256: string,
   ): Promise<void>;
   finish(connection: string, body: FinishBody): Promise<void>;
+  /** Consumes an attach ticket of a live support connection; rejects when the API refuses. */
+  attach(connection: string, sha256: string): Promise<{ role: BrowserRole }>;
+  /** The operator browser left a detachable connection (best effort). */
+  detach(connection: string): Promise<void>;
+}
+
+export type BrowserRole = 'operator' | 'observer';
+
+/** Output kept for a browser that attaches again (bounded memory). */
+export const REPLAY_BYTES = 256 * 1024;
+/** Output chunks of the replay ring are merged up to this size. */
+const RING_CHUNK_BYTES = 4096;
+/** Observers allowed per session. */
+export const MAX_OBSERVERS = 4;
+
+interface Client {
+  socket: BrowserSocket;
+  role: BrowserRole;
+  queue: string[];
 }
 
 export interface SessionNetworkManager {
@@ -146,8 +166,16 @@ export class Session {
   #worker: WorkerHandle | null = null;
   #net: SessionNet | null = null;
   #bridge: Bridge | null = null;
-  #browser: BrowserSocket | null = null;
-  #browserQueue: string[] = [];
+  #clients: Client[] = [];
+  // Replay ring (detachable sessions only): merged chunks in a deque with a moving head.
+  #ring: { data: string; bytes: number }[] = [];
+  #ringHead = 0;
+  #ringBytes = 0;
+  #ready = false;
+  #lastState: string | null = null;
+  #lastHostkey: string | null = null;
+  #pendingVerdict: { id: string; frame: string } | null = null;
+  #detachTimer: ReturnType<typeof setTimeout> | null = null;
   #events: RuntimeEvent[] = [];
   #seq = 0;
   #eventTimer: ReturnType<typeof setInterval> | null = null;
@@ -175,14 +203,77 @@ export class Session {
 
   /** Console mode: the browser presented the ticket of this assignment. */
   attachBrowser(socket: BrowserSocket) {
-    this.#browser = socket;
-    const previous = socket.onopen;
+    this.#addClient(socket, 'operator', false);
+    void this.#run();
+  }
+
+  /** Bytes held by the replay ring (tests). */
+  get replayBytes() {
+    return this.#ringBytes;
+  }
+
+  get replayChunks() {
+    return this.#ring.length - this.#ringHead;
+  }
+
+  get observerCount() {
+    return this.#clients.filter((c) => c.role === 'observer').length;
+  }
+
+  /** Support session: a browser attaches again (operator) or watches (observer). */
+  attachClient(socket: BrowserSocket, role: BrowserRole) {
+    if (this.#finished || !this.assignment.detachable) {
+      try {
+        socket.close(1000, 'Console closed.');
+      } catch { /* closed */ }
+      return;
+    }
+    if (role === 'observer' && this.observerCount >= MAX_OBSERVERS) {
+      try {
+        socket.close(4429, 'Too many observers.');
+      } catch { /* closed */ }
+      return;
+    }
+    this.#addClient(socket, role, true);
+  }
+
+  #addClient(socket: BrowserSocket, role: BrowserRole, replay: boolean) {
+    if (role === 'operator') {
+      const previous = this.#clients.find((c) => c.role === 'operator');
+      if (previous) {
+        // The replaced browser must not end or detach the session when its socket closes.
+        this.#clients = this.#clients.filter((c) => c !== previous);
+        previous.socket.onclose = previous.socket.onerror = previous.socket.onmessage = null;
+        try {
+          previous.socket.close(4410, 'replaced');
+        } catch { /* closed */ }
+      }
+    }
+    const client: Client = { socket, role, queue: [] };
+    this.#clients.push(client);
+    if (role === 'operator' && this.#detachTimer) {
+      clearTimeout(this.#detachTimer);
+      this.#detachTimer = null;
+    }
+    if (replay) {
+      if (this.#lastState) client.queue.push(this.#lastState);
+      if (this.#ready) client.queue.push(READY_FRAME);
+      for (let i = this.#ringHead; i < this.#ring.length; i++) {
+        client.queue.push(outputFrame(this.#ring[i].data));
+      }
+      // Pending decisions go to the operator only; observers never see command lines.
+      if (role === 'operator') {
+        if (this.#lastHostkey) client.queue.push(this.#lastHostkey);
+        if (this.#pendingVerdict) client.queue.push(this.#pendingVerdict.frame);
+      }
+    }
+    const previousOpen = socket.onopen;
     socket.onopen = (event) => {
-      previous?.(event);
-      this.#flushBrowser();
+      previousOpen?.(event);
+      this.#flush(client);
     };
     socket.onmessage = (event) => {
-      if (typeof event.data !== 'string') return;
+      if (client.role !== 'operator' || typeof event.data !== 'string') return;
       const frame = parseBrowserFrame(event.data);
       if (!frame || !this.#worker) return;
       if (frame.kind === 'input') this.#worker.send({ t: 'input', d: frame.data });
@@ -190,9 +281,28 @@ export class Session {
         this.#worker.send({ t: 'resize', cols: frame.cols, rows: frame.rows });
       } else if (frame.kind === 'confirm') this.#worker.send({ t: 'confirm', m: frame.message });
     };
-    socket.onclose = () => this.close('browser_closed');
-    socket.onerror = () => this.close('browser_closed');
-    void this.#run();
+    socket.onclose = () => this.#left(client);
+    socket.onerror = () => this.#left(client);
+    this.#flush(client);
+  }
+
+  /** A browser socket ended. Only the current operator of a non-detachable session ends it. */
+  #left(client: Client) {
+    if (!this.#clients.includes(client)) return;
+    this.#clients = this.#clients.filter((c) => c !== client);
+    if (client.role !== 'operator') return;
+    if (this.assignment.detachable) {
+      // Nobody drives the console: it ends like an idle one even if the device keeps talking.
+      this.#detachTimer ??= setTimeout(
+        () => this.close('idle_timeout'),
+        this.assignment.limits.idleSeconds * 1000,
+      );
+      void this.deps.api.detach(this.uuid).catch((error) =>
+        this.deps.log(`detach of ${this.uuid} not delivered: ${(error as Error).message}`)
+      );
+      return;
+    }
+    this.close('browser_closed');
   }
 
   /** Test mode ("Testar acesso"): no browser. */
@@ -200,19 +310,57 @@ export class Session {
     void this.#run();
   }
 
-  #toBrowser(frame: string) {
-    if (!this.#browser || this.#browser.readyState > 1) return;
-    this.#browserQueue.push(frame);
-    this.#flushBrowser();
+  #toClients(frame: string, observers = true) {
+    for (const client of this.#clients) {
+      if (client.socket.readyState > 1) continue;
+      if (client.role === 'observer' && !observers) continue;
+      client.queue.push(frame);
+      this.#flush(client);
+    }
   }
 
-  #flushBrowser() {
-    if (!this.#browser || this.#browser.readyState !== 1) return;
-    for (const frame of this.#browserQueue.splice(0)) this.#browser.send(frame);
+  #flush(client: Client) {
+    if (client.socket.readyState !== 1) return;
+    for (const frame of client.queue.splice(0)) client.socket.send(frame);
   }
 
+  /** Sanitized device output to every browser and the replay ring (public for tests). */
+  emitOutput(data: string) {
+    if (this.assignment.detachable) this.#remember(data);
+    this.#toClients(outputFrame(data));
+  }
+
+  #remember(data: string) {
+    const bytes = utf8Length(data);
+    const last = this.#ring.at(-1);
+    if (this.#ring.length > this.#ringHead && last && last.bytes < RING_CHUNK_BYTES) {
+      last.data += data;
+      last.bytes += bytes;
+      this.#ringBytes += bytes;
+    } else {
+      // Frame header included in the count.
+      this.#ring.push({ data, bytes: bytes + 12 });
+      this.#ringBytes += bytes + 12;
+    }
+    while (this.#ringBytes > REPLAY_BYTES && this.#ring.length - this.#ringHead > 1) {
+      this.#ringBytes -= this.#ring[this.#ringHead++].bytes;
+    }
+    if (this.#ringHead >= 256 && this.#ringHead * 2 >= this.#ring.length) {
+      this.#ring.splice(0, this.#ringHead);
+      this.#ringHead = 0;
+    }
+  }
+
+  /** Observers see only state and notice controls (never commands or verdicts). */
   #control(message: ControlMessage) {
-    this.#toBrowser(controlFrame(message));
+    const frame = controlFrame(message);
+    if (message.type === 'state') this.#lastState = frame;
+    else if (message.type === 'hostkey') this.#lastHostkey = frame;
+    else if (message.type === 'verdict') this.#pendingVerdict = { id: message.id, frame };
+    else if (message.type === 'resolved' && this.#pendingVerdict?.id === message.id) {
+      this.#pendingVerdict = null;
+    }
+    this.#toClients(frame, message.type === 'state' || message.type === 'notice');
   }
 
   #event(type: RuntimeEvent['type'], fields: Record<string, unknown>) {
@@ -402,7 +550,7 @@ export class Session {
     const worker = this.#worker!;
     switch (message.t) {
       case 'output':
-        this.#toBrowser(outputFrame(message.d));
+        this.emitOutput(message.d);
         break;
       case 'control':
         this.#control(message.m);
@@ -411,7 +559,8 @@ export class Session {
         }
         break;
       case 'ready':
-        this.#toBrowser(READY_FRAME);
+        this.#ready = true;
+        this.#toClients(READY_FRAME);
         break;
       case 'cast':
         this.#recording?.add(message.line);
@@ -502,6 +651,7 @@ export class Session {
     if (this.#finished) return;
     this.#finished = true;
     if (this.#maxTimer) clearTimeout(this.#maxTimer);
+    if (this.#detachTimer) clearTimeout(this.#detachTimer);
     if (this.#eventTimer) clearInterval(this.#eventTimer);
     const reason = this.#closeReason && exit.reason === 'gateway_closed'
       ? this.#closeReason
@@ -515,18 +665,21 @@ export class Session {
     this.#event('state', { state: exit.state, reason });
     const recording = (await this.#recording?.finish()) ?? null;
     await this.#flushEvents();
-    if (this.#browser && this.#browser.readyState <= 1) {
+    if (this.#clients.length) {
       this.#control({
         type: 'state',
         state: exit.state === 'closed' ? 'closed' : 'failed',
         reason,
       });
-      this.#flushBrowser();
       const [code, text] = CLOSE_REASONS[reason] ??
         [exit.state === 'closed' ? 1000 : 4500, 'Console closed.'];
-      try {
-        this.#browser.close(code, text);
-      } catch { /* closed */ }
+      const clients = this.#clients;
+      this.#clients = [];
+      for (const client of clients) {
+        try {
+          client.socket.close(code, text);
+        } catch { /* closed */ }
+      }
     }
     this.#bridge?.close();
     if (this.#net && this.deps.networks) {

@@ -51,6 +51,12 @@ export class TicketBook<T> {
     this.#entries = this.#entries.filter((entry) => !predicate(entry.value));
   }
 
+  /** True when the hash is registered or was consumed recently (dedupe of re-delivered tickets). */
+  knows(hash: string): boolean {
+    return this.#used.has(hash) ||
+      this.#entries.some((entry) => constantTimeEqual(entry.hash, hash));
+  }
+
   get size() {
     return this.#entries.length;
   }

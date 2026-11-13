@@ -3,11 +3,17 @@
 
 import { checkConnectorDestination } from '../shared/destination.ts';
 import { cidrContains, parseAddress, parseCidr } from '../shared/ip.ts';
-import { type Assignment, ContractError, type FinishBody, parseAssignment } from './contract.ts';
+import {
+  type Assignment,
+  type AttachTicket,
+  ContractError,
+  type FinishBody,
+  parseAssignment,
+} from './contract.ts';
 import type { ConnectorHub } from './connector_hub.ts';
 import { checkDestination, type Denylist } from './denylist.ts';
-import { Session, type SessionDeps } from './session.ts';
-import { TicketBook } from './ticket.ts';
+import { MAX_OBSERVERS, Session, type SessionDeps } from './session.ts';
+import { TicketBook, ticketHash } from './ticket.ts';
 
 export interface GatewayOptions {
   gatewayKey: string;
@@ -49,6 +55,8 @@ function refusal(
 export class Gateway {
   readonly sessions = new Map<string, Session>();
   readonly tickets = new TicketBook<Assignment>();
+  /** Attach tickets of live support connections of this gateway (reattach, observers). */
+  readonly attachTickets = new TicketBook<Pick<AttachTicket, 'connectionUUID' | 'role'>>();
   #pending = new Set<string>();
   #draining = false;
   #sweeper: ReturnType<typeof setInterval>;
@@ -161,12 +169,31 @@ export class Gateway {
 
   /** Expired console tickets: the connection never opened. */
   sweep(now = Date.now()) {
+    this.attachTickets.sweep(now);
     for (const assignment of this.tickets.sweep(now)) {
       this.#pending.delete(assignment.connectionUUID);
       void this.options.deps.api.finish(
         assignment.connectionUUID,
         refusal(assignment, 'ticket_expired', 'expired'),
       ).catch(() => {});
+    }
+  }
+
+  /**
+   * Attach tickets from the API: kept only for a connection that is a live session here
+   * (deduplicated by hash; an expired one is dropped silently by the sweep).
+   */
+  addAttachTickets(list: AttachTicket[]) {
+    for (const item of list) {
+      // Only detachable consoles of support sessions can be attached to.
+      if (
+        !this.sessions.get(item.connectionUUID)?.assignment.detachable ||
+        this.attachTickets.knows(item.sha256)
+      ) continue;
+      this.attachTickets.add(item.sha256, Date.parse(item.expiresAt), {
+        connectionUUID: item.connectionUUID,
+        role: item.role,
+      });
     }
   }
 
@@ -208,17 +235,55 @@ export class Gateway {
   }
 
   /**
-   * Consumes the ticket; one the book does not know yet (only `unknown`: never a used, expired or
-   * malformed one) is retried until its assignment arrives or the wait ends.
+   * Consumes the ticket from the assignment book or the attach book; one neither book knows yet
+   * (only `unknown`: never a used, expired or malformed one) is retried until its assignment
+   * arrives or the wait ends.
    */
-  async #awaitTicket(ticket: string | null) {
+  async #awaitTicket(ticket: string | null): Promise<
+    | { ok: true; kind: 'assignment'; value: Assignment }
+    | { ok: true; kind: 'attach'; value: Pick<AttachTicket, 'connectionUUID' | 'role'> }
+    | { ok: false }
+  > {
     const deadline = Date.now() + (this.options.ticketArrivalMs ?? TICKET_ARRIVAL_MS);
-    let result = await this.tickets.consume(ticket);
-    while (!result.ok && result.reason === 'unknown' && Date.now() < deadline && !this.#draining) {
+    for (;;) {
+      const result = await this.tickets.consume(ticket);
+      if (result.ok) return { ok: true, kind: 'assignment', value: result.value };
+      const attach = await this.attachTickets.consume(ticket);
+      if (attach.ok) return { ok: true, kind: 'attach', value: attach.value };
+      const unknown = result.reason === 'unknown' && attach.reason === 'unknown';
+      if (!unknown || Date.now() >= deadline || this.#draining) return { ok: false };
       await new Promise((resolve) => setTimeout(resolve, TICKET_RETRY_MS));
-      result = await this.tickets.consume(ticket);
     }
-    return result;
+  }
+
+  /** Attach ticket: the API consumes it for the connection and names the role (or refuses). */
+  async #attach(
+    request: Request,
+    ticket: string,
+    value: Pick<AttachTicket, 'connectionUUID' | 'role'>,
+  ): Promise<Response> {
+    const refused = () =>
+      new Response('Console ticket is invalid or expired.', {
+        status: 401,
+        headers: { 'Cache-Control': 'no-store' },
+      });
+    const session = this.sessions.get(value.connectionUUID);
+    if (!session?.assignment.detachable) return refused();
+    if (value.role === 'observer' && session.observerCount >= MAX_OBSERVERS) return refused();
+    let role: AttachTicket['role'];
+    try {
+      role = (await this.options.deps.api.attach(value.connectionUUID, await ticketHash(ticket)))
+        .role;
+      if (role !== value.role) throw new Error('role mismatch');
+    } catch (error) {
+      this.options.deps.log(
+        `attach to ${value.connectionUUID} refused: ${(error as Error).message}`,
+      );
+      return refused();
+    }
+    const { socket, response } = Deno.upgradeWebSocket(request, { idleTimeout: 60 });
+    session.attachClient(socket, role);
+    return response;
   }
 
   /** HTTP handler of the 7443 listener. */
@@ -249,6 +314,9 @@ export class Gateway {
         status: 401,
         headers: { 'Cache-Control': 'no-store' },
       });
+    }
+    if (result.kind === 'attach') {
+      return this.#attach(request, url.searchParams.get('ticket')!, result.value);
     }
     this.#pending.delete(result.value.connectionUUID);
     const { socket, response } = Deno.upgradeWebSocket(request, { idleTimeout: 60 });
