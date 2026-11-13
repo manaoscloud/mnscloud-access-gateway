@@ -44,6 +44,7 @@ function gateway(
     denylist: buildDenylist({ environment, labTargets }),
     capacity: 2,
     version: '0.1.0',
+    ticketArrivalMs: 300,
     deps: {
       api: api(finished),
       unwrap: () => Promise.resolve({ username: 'support', password: PASSWORD }),
@@ -88,6 +89,43 @@ Deno.test({
       (await g.handle(new Request(`https://gw/ws?ticket=${newTicket()}`, ws), '10.0.0.5')).status,
       401,
     );
+    await g.drain('test', 100);
+  },
+});
+
+Deno.test({
+  name:
+    'gateway: a browser that arrives before its assignment waits for it; used tickets never wait',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const finished = new Map<string, FinishBody>();
+    const g = gateway(finished, 'development', ['127.0.0.1/32']);
+    const ticket = newTicket();
+    const ws = { headers: { upgrade: 'websocket' } };
+    // Unknown first; the assignment lands 150 ms later (inside the 300 ms test wait).
+    const early = g.handle(new Request(`https://gw/ws?ticket=${ticket}`, ws), '10.0.0.5');
+    setTimeout(async () => {
+      await g.accept({
+        ...ASSIGNMENT,
+        connectionUUID: crypto.randomUUID(),
+        target: { address: '127.0.0.1', port: 1 },
+        ticket: {
+          sha256: await ticketHash(ticket),
+          expiresAt: new Date(Date.now() + 30000).toISOString(),
+        },
+      });
+    }, 150);
+    // Not 401: the ticket was found (the upgrade itself needs a real socket, so it throws here).
+    const outcome = await early.then((r) => r.status, () => 'upgrade');
+    assertEquals(outcome, 'upgrade');
+    // The same ticket again is "used": refused at once, without waiting.
+    const started = Date.now();
+    assertEquals(
+      (await g.handle(new Request(`https://gw/ws?ticket=${ticket}`, ws), '10.0.0.5')).status,
+      401,
+    );
+    assert(Date.now() - started < 200);
     await g.drain('test', 100);
   },
 });
