@@ -3,9 +3,9 @@
   "repository": "manaoscloud/mnscloud-access-gateway",
   "channels": {
     "stable": {
-      "version": "0.1.0",
-      "ref": "v0.1.0",
-      "releasedAt": null,
+      "version": "0.1.11",
+      "ref": "v0.1.11",
+      "releasedAt": "2026-11-13T13:46:36Z",
       "minimumVersion": "0.1.0"
     }
   }
