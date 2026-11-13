@@ -503,6 +503,21 @@ Deno.test('findings 6, 8, 12, 13, 14: install, update and unit hardening', () =>
   assertMatch(read('scripts/uninstall-connector.sh'), /mnscloud-access-connector-runtime-kit/);
 });
 
+Deno.test('lab finding: the uninstaller removes nothing when given any argument', async () => {
+  // `uninstall-connector.sh --help` used to uninstall at once. The argument check runs before
+  // the root check and before any removal, so this is safe to run anywhere.
+  for (const arg of ['--help', '-h', 'status']) {
+    const out = await new Deno.Command('bash', {
+      args: [`${ROOT}/scripts/uninstall-connector.sh`, arg],
+      stdout: 'piped',
+      stderr: 'piped',
+    }).output();
+    assertEquals(out.code, 2, `${arg}: usage exit code`);
+    assertMatch(new TextDecoder().decode(out.stderr), /^usage: sudo /);
+    assertEquals(new TextDecoder().decode(out.stdout), '');
+  }
+});
+
 Deno.test('lab finding: the service user must be able to execute Deno (installer bin dir 0700)', () => {
   const lib = read('scripts/lib/connector.sh');
   assertMatch(
