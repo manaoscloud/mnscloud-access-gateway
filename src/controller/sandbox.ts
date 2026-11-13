@@ -170,12 +170,14 @@ export function renderConnectorSystemdRun(
   // /run is replaced by an empty tmpfs: the worker sees neither D-Bus, journald, systemd's transient
   // unit files nor other sessions' bridges. Only its own socket is bound in, under a fixed name, so
   // neither argv nor unit properties readable from inside carry the real path.
+  // The empty /run already hides D-Bus and /run/systemd. Never list /run/systemd in
+  // InaccessiblePaths: systemd mounts its inaccessible nodes from /run/systemd/inaccessible, and the
+  // unit then fails before the worker starts (status 226/NAMESPACE, seen as worker_failed).
   return systemdRun(`${UNIT_PREFIX}${id}`, [
     'PrivateNetwork=yes',
     'RestrictAddressFamilies=AF_UNIX',
     'TemporaryFileSystem=/run:ro',
     `BindPaths=${bridge}:${BRIDGE_IN_UNIT}`,
-    'InaccessiblePaths=-/run/dbus -/run/systemd',
     ...sandboxProperties(runtimeRoot, limits),
   ], workerDenoArgs(runtimeRoot, target, limits.memoryMaxMB, BRIDGE_IN_UNIT));
 }

@@ -435,7 +435,14 @@ Deno.test('finding 2: connector workers see a private /run with the bridge under
   const props = new Set(argv.flatMap((a, i) => (argv[i - 1] === '-p' ? [a] : [])));
   assert(props.has('TemporaryFileSystem=/run:ro'));
   assert(props.has(`BindPaths=${real}:/run/bridge.sock`));
-  assert(props.has('InaccessiblePaths=-/run/dbus -/run/systemd'));
+  // systemd needs /run/systemd/inaccessible to set up InaccessiblePaths: hiding it fails the
+  // unit with 226/NAMESPACE before the worker starts. The empty /run tmpfs already hides it.
+  assert(
+    ![...props].some((p) =>
+      p.startsWith('InaccessiblePaths=') && /(^|[\s=-])\/run\/systemd(\s|$)/.test(p)
+    ),
+    'no InaccessiblePaths entry hides /run/systemd',
+  );
   const denoArgs = argv.slice(argv.indexOf('--') + 1);
   assert(!denoArgs.some((a) => a.includes(real)), 'real socket name is not on the worker argv');
   assertEquals(
