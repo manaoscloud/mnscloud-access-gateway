@@ -30,6 +30,7 @@ apply() {
  check_runtime
  bash "$ROOT_DIR/scripts/render-units.sh"
  command -v nft >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q nftables </dev/null >/dev/null
+ command -v wg >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q wireguard-tools </dev/null >/dev/null
  systemctl restart "$CONTROLLER_UNIT"
  "$ROOT_DIR/scripts/validate-access-gateway.sh" --env "$ENV_FILE" --wait 60
 }

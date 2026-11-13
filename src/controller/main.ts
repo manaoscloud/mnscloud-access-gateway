@@ -9,6 +9,7 @@ import { ConnectorHub } from './connector_hub.ts';
 import { buildDenylist } from './denylist.ts';
 import { readEnvFile, requireBinding } from './env.ts';
 import { Gateway } from './gateway.ts';
+import { denoCapture, FileKeyStore, MgmtVpn } from './mgmt_vpn.ts';
 import { denoRunner, NETNS_PREFIX, renderHostNft, SessionNetworks } from './netns.ts';
 import { openVaultUnwrapper } from './openvault.ts';
 import { RuntimeApi } from './runtime_api.ts';
@@ -22,16 +23,18 @@ function log(message: string) {
   console.log(`[mnscloud-access-gateway] ${message}`);
 }
 
-async function applyHostFirewall(config: GatewayConfig) {
+async function applyHostFirewall(config: GatewayConfig, mgmtVpn?: MgmtVpn) {
   const script = renderHostNft({
     denylist: buildDenylist(config),
     edgeSources: config.edgeSources.map((c) => parseCidr(c)!),
     listenPort: config.listen.port,
     pool4: config.sessionNetwork.ipv4,
     pool6: config.sessionNetwork.ipv6,
+    mgmtNet: mgmtVpn?.mgmtNet ?? null,
   });
   const result = await denoRunner(['nft', '-f', '-'], script);
   if (result.code !== 0) throw new Error(`host firewall not applied: ${result.stderr}`);
+  mgmtVpn?.markNftApplied(mgmtVpn.mgmtNet);
 }
 
 /** Leftovers of a previous controller (crash, kill): no worker or namespace survives it. */
@@ -64,12 +67,20 @@ async function main() {
     throw new Error('Configuration belongs to another gateway');
   }
   await cleanupLeftovers();
+  const mgmtVpn = new MgmtVpn({
+    api,
+    run: denoRunner,
+    capture: denoCapture,
+    keys: new FileKeyStore(),
+    log,
+  });
   await applyHostFirewall(config);
   const networks = new SessionNetworks(
     denoRunner,
     config.capacity.maxSessions,
     config.sessionNetwork.ipv4,
     config.sessionNetwork.ipv6,
+    mgmtVpn,
   );
   const hub = new ConnectorHub({
     gatewayKey: config.gatewayKey,
@@ -110,6 +121,7 @@ async function main() {
   const stop = async () => {
     if (!running) return;
     running = false;
+    mgmtVpn.stop();
     log('stopping: closing sessions');
     await gateway.drain('gateway_shutdown');
     await server.shutdown();
@@ -142,7 +154,7 @@ async function main() {
           await stop();
           return;
         }
-        await applyHostFirewall(next);
+        await applyHostFirewall(next, mgmtVpn);
         gateway.update({
           edgeSources: next.edgeSources,
           denylist: buildDenylist(next),
@@ -155,6 +167,7 @@ async function main() {
       log(`heartbeat failed: ${(error as Error).message}`);
     }
   };
+  mgmtVpn.start();
   await heartbeat();
   setInterval(heartbeat, 30000);
 

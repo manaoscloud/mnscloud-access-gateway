@@ -106,6 +106,26 @@ The connector code is `src/connector/`, the gateway side is `src/controller/conn
 `src/controller/bridge.ts`, the frame format `src/shared/tunnel.ts`. Wire contract, signatures and
 test vectors: `docs/runtime-api.md` → Remote access connector.
 
+## Management VPN path (`mgmt_vpn`)
+
+Devices reachable only through the platform's management network are reached through a WireGuard
+tunnel to a hub. The controller keeps the interface `mnsagw-mgmt` in sync with the API
+(`GET /mgmt-vpn`, `docs/runtime-api.md` section 11): the peer is the hub (`allowed-ips = mgmtNet`),
+every owner's source address is a `/32` on the interface, `mgmtNet` is routed through it, MTU 1380.
+Without a hub the interface does not exist. The private key is generated on the host (0600, never
+logged or sent); only the public key is reported to the API.
+
+- **Isolation**: a `mgmt_vpn` session's destination is added only to the `mgmtsessions4` set, which
+  the forward chain accepts (to `mgmtnet4`, out of `mnsagw-mgmt`) before the denylist; a direct
+  session can never reach the VPN range (the denylist still drops it), and nothing else may leave by
+  the VPN interface (a forward `drop`).
+- **Per-tenant source**: traffic leaving through `mnsagw-mgmt` is `snat`ed to the owner's source
+  address by a map keyed by the session's host-side interface (`mgmtsnat4`), never masqueraded. The
+  hub forwards a tenant's source only to that tenant's `/32` addresses, so a session cannot reach
+  another tenant's device even with a bug in the layers above.
+- The worker is unchanged: it still gets a single `IP:port` permission.
+- Needs `wireguard-tools` (installed by the install and update scripts).
+
 ## Update and rollback
 
 MNSCloud delivery (maintainers and AI agents) is the Agent rollout:
@@ -130,14 +150,14 @@ sudo /opt/mnscloud/mnscloud-access-gateway/scripts/validate-access-gateway.sh
 
 ## Files on the host
 
-| Path                                            | Content                                                                           |
-| ----------------------------------------------- | --------------------------------------------------------------------------------- |
-| `/opt/mnscloud/mnscloud-access-gateway`         | this repository at the approved tag (world-readable, not writable)                |
-| `/etc/mnscloud/access-gateway.env`              | binding: API base, gateway UUID/key, listen address/port (0600, no secret)        |
-| `/etc/mnscloud/access-gateway/tls/`             | listener certificate and key (0600; the public certificate is pinned by the edge) |
-| `/var/lib/mnscloud/access-gateway/`             | last good release commit                                                          |
-| `/etc/sysctl.d/90-mnscloud-access-gateway.conf` | IPv4/IPv6 forwarding for the session namespaces                                   |
-| nftables `inet mnscloud_access_gateway`         | host table (listener, forward denylist, session allow sets, masquerade)           |
+| Path                                            | Content                                                                                      |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `/opt/mnscloud/mnscloud-access-gateway`         | this repository at the approved tag (world-readable, not writable)                           |
+| `/etc/mnscloud/access-gateway.env`              | binding: API base, gateway UUID/key, listen address/port (0600, no secret)                   |
+| `/etc/mnscloud/access-gateway/tls/`             | listener certificate and key (0600; the public certificate is pinned by the edge)            |
+| `/var/lib/mnscloud/access-gateway/`             | last good release commit, `mgmt-vpn.key` (0600, WireGuard private key)                       |
+| `/etc/sysctl.d/90-mnscloud-access-gateway.conf` | IPv4/IPv6 forwarding for the session namespaces                                              |
+| nftables `inet mnscloud_access_gateway`         | host table (listener, forward denylist, session allow sets, masquerade, management VPN sets) |
 
 `scripts/cleanup-sessions.sh` (run after the controller stops) removes every session unit and
 namespace: no session survives the controller.

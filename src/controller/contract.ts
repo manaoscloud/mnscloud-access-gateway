@@ -24,9 +24,15 @@ export interface Assignment {
   connectionUUID: string;
   mode: 'console' | 'test';
   protocol: 'ssh' | 'routeros_api';
-  path: 'public' | 'connector';
-  /** `connector`: the worker has no network; the stream goes through the tenant connector. */
-  transport: 'direct' | 'connector';
+  path: 'public' | 'connector' | 'mgmt_vpn';
+  /**
+   * `connector`: the worker has no network; the stream goes through the tenant connector.
+   * `mgmt_vpn`: a direct session whose only way out is the management VPN interface, with the
+   * owner's source address.
+   */
+  transport: 'direct' | 'connector' | 'mgmt_vpn';
+  /** `mgmt_vpn` only: the hub it must be on and the source address of the owner; else null. */
+  mgmtVpn: { hubUUID: string; source: string } | null;
   connectorUuid: string | null;
   /** Fingerprint of the connector key the API expects (`SHA256:` + base64); null for direct. */
   connectorKeyFingerprint: string | null;
@@ -45,6 +51,18 @@ export interface Assignment {
     maxOutputBytes: number;
   };
   recording: { enabled: boolean; partBytes: number; partSeconds: number };
+}
+
+/** Desired state of the management VPN interface (`GET /mgmt-vpn`). */
+export interface MgmtVpnDesired {
+  hub: {
+    uuid: string;
+    endpoint: string;
+    publicKey: string;
+    mgmtNet: string;
+    gatewayNet: string;
+  };
+  sources: string[];
 }
 
 export interface AssignmentsResponse {
@@ -166,22 +184,44 @@ export function parseConfig(value: unknown): GatewayConfig {
 
 type Route = Pick<
   Assignment,
-  'path' | 'transport' | 'connectorUuid' | 'connectorKeyFingerprint'
+  'path' | 'transport' | 'connectorUuid' | 'connectorKeyFingerprint' | 'mgmtVpn'
 >;
 
 /** Path, transport and connector identity (a connector assignment pins the key it expects). */
 function parseRoute(v: Record<string, unknown>): Route {
   const path = v.path ?? 'public';
-  if (path !== 'public' && path !== 'connector') throw new ContractError('path_unsupported');
-  const transport = v.transport ?? (path === 'connector' ? 'connector' : 'direct');
-  if (transport !== 'direct' && transport !== 'connector') {
+  if (path !== 'public' && path !== 'connector' && path !== 'mgmt_vpn') {
+    throw new ContractError('path_unsupported');
+  }
+  const transport = v.transport ?? (path === 'public' ? 'direct' : path);
+  if (transport !== 'direct' && transport !== 'connector' && transport !== 'mgmt_vpn') {
     throw new ContractError('path_unsupported');
   }
   if ((path === 'connector') !== (transport === 'connector')) {
     throw new ContractError('path_unsupported');
   }
+  if ((path === 'mgmt_vpn') !== (transport === 'mgmt_vpn')) {
+    throw new ContractError('path_unsupported');
+  }
   if (transport === 'direct') {
-    return { path, transport, connectorUuid: null, connectorKeyFingerprint: null };
+    return { path, transport, connectorUuid: null, connectorKeyFingerprint: null, mgmtVpn: null };
+  }
+  if (transport === 'mgmt_vpn') {
+    const mgmt = v.mgmtVpn as Record<string, unknown> | null | undefined;
+    const source = parseAddress(mgmt?.source);
+    if (!mgmt || typeof mgmt !== 'object' || !UUID.test(String(mgmt.hubUUID))) {
+      throw new ContractError('Invalid mgmtVpn hubUUID');
+    }
+    if (!source || source.family !== 4 || source.text !== mgmt.source) {
+      throw new ContractError('Invalid mgmtVpn source');
+    }
+    return {
+      path,
+      transport,
+      connectorUuid: null,
+      connectorKeyFingerprint: null,
+      mgmtVpn: { hubUUID: String(mgmt.hubUUID), source: source.text },
+    };
   }
   const connectorUuid = typeof v.connectorUuid === 'string' ? v.connectorUuid : '';
   const fingerprint = typeof v.connectorKeyFingerprint === 'string'
@@ -191,7 +231,7 @@ function parseRoute(v: Record<string, unknown>): Route {
   if (!/^SHA256:[A-Za-z0-9+/]{43}=$/.test(fingerprint)) {
     throw new ContractError('Invalid connectorKeyFingerprint');
   }
-  return { path, transport, connectorUuid, connectorKeyFingerprint: fingerprint };
+  return { path, transport, connectorUuid, connectorKeyFingerprint: fingerprint, mgmtVpn: null };
 }
 
 // deno-lint-ignore no-explicit-any
@@ -226,6 +266,9 @@ export function parseAssignment(value: unknown): Assignment {
     throw new ContractError('Invalid username');
   }
   if (!['n1', 'n2', 'n3'].includes(v.level)) throw new ContractError('Invalid level');
+  if (route.transport === 'mgmt_vpn' && address.family !== 4) {
+    throw new ContractError('Invalid target address');
+  }
   const ticket = parseTicket(v);
   return {
     connectionUUID: v.connectionUUID,
