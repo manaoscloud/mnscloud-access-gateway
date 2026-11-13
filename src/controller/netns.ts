@@ -21,6 +21,7 @@ export const SESSION_TABLE = 'mnscloud_session';
 export const NETNS_PREFIX = 'mnsagw-';
 export const HOST_IF_PREFIX = 'agwh';
 export const NS_IF_PREFIX = 'agwn';
+export const MGMT_IF = 'mnsagw-mgmt';
 export const DEFAULT_POOL_IPV4 = '100.127.192.0/18';
 export const DEFAULT_POOL_IPV6 = 'fd6d:6e73:6177::/48';
 
@@ -160,6 +161,46 @@ export interface HostFirewallInput {
   listenPort: number;
   pool4?: string;
   pool6?: string;
+  /** Hub management range (`mgmt_vpn`); null/absent while no hub is configured. */
+  mgmtNet?: string | null;
+}
+
+/** nft commands that replace the content of the hub range set (one atomic transaction). */
+export function renderMgmtNetNft(mgmtNet: string | null): string {
+  const lines = [`flush set inet ${HOST_TABLE} mgmtnet4`];
+  if (mgmtNet !== null) {
+    const cidr = parseCidr(mgmtNet);
+    if (cidr?.family !== 4) throw new Error('Invalid management network');
+    lines.push(`add element inet ${HOST_TABLE} mgmtnet4 { ${cidr.text} }`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+/** A `mgmt_vpn` session: where it may leave (hub range, VPN interface) and its source address. */
+export interface MgmtSessionTarget {
+  hubUUID: string;
+  source: string;
+}
+
+/**
+ * Host elements of a `mgmt_vpn` session: its destination goes only into `mgmtsessions4` (never
+ * `sessions4`, so the denylist keeps dropping it on any other path) and the per-interface source
+ * address into the `mgmtsnat4` map.
+ */
+export function renderMgmtSessionElement(
+  net: SessionNet,
+  target: SessionTarget,
+  mgmt: MgmtSessionTarget,
+  action: 'add' | 'delete',
+): string {
+  const address = parseAddress(target.address);
+  const source = parseAddress(mgmt.source);
+  if (address?.family !== 4) throw new Error('Invalid target address');
+  if (source?.family !== 4) throw new Error('Invalid management source');
+  const t = HOST_TABLE;
+  const snat = action === 'add' ? `"${net.hostIf}" : ${source.text}` : `"${net.hostIf}"`;
+  return `${action} element inet ${t} mgmtsessions4 { "${net.hostIf}" . ${address.text} . ${target.port} }\n` +
+    `${action} element inet ${t} mgmtsnat4 { ${snat} }\n`;
 }
 
 /**
@@ -187,6 +228,11 @@ export function renderHostNft(input: HostFirewallInput): string {
     `  set edge6 { type ipv6_addr; flags interval; auto-merge;${elements(input.edgeSources, 6)} }`,
     '  set sessions4 { type ifname . ipv4_addr . inet_service; }',
     '  set sessions6 { type ifname . ipv6_addr . inet_service; }',
+    `  set mgmtnet4 { type ipv4_addr; flags interval; auto-merge;${
+      input.mgmtNet ? elements([parseCidr(input.mgmtNet)!], 4) : ''
+    } }`,
+    '  set mgmtsessions4 { type ifname . ipv4_addr . inet_service; }',
+    '  map mgmtsnat4 { type ifname : ipv4_addr; }',
     '  chain input {',
     '    type filter hook input priority filter - 5; policy accept;',
     `    iifname "${HOST_IF_PREFIX}*" drop`,
@@ -203,6 +249,10 @@ export function renderHostNft(input: HostFirewallInput): string {
     '    meta l4proto != tcp drop',
     '    iifname . ip daddr . tcp dport @sessions4 ip daddr @lab4 accept',
     '    iifname . ip6 daddr . tcp dport @sessions6 ip6 daddr @lab6 accept',
+    // Management VPN: only a mgmt_vpn session, to the hub range, out of the VPN interface. Nothing
+    // else may leave by that interface, whatever the other sets say.
+    `    iifname . ip daddr . tcp dport @mgmtsessions4 ip daddr @mgmtnet4 oifname "${MGMT_IF}" accept`,
+    `    oifname "${MGMT_IF}" drop`,
     '    ip daddr @deny4 drop',
     '    ip6 daddr @deny6 drop',
     '    iifname . ip daddr . tcp dport @sessions4 accept',
@@ -210,8 +260,11 @@ export function renderHostNft(input: HostFirewallInput): string {
     '  }',
     '  chain postrouting {',
     '    type nat hook postrouting priority srcnat; policy accept;',
-    `    ip saddr ${pool4.text} oifname != "${HOST_IF_PREFIX}*" masquerade`,
-    `    ip6 saddr ${pool6.text} oifname != "${HOST_IF_PREFIX}*" masquerade`,
+    // Per-session source address of the owner; never masqueraded (the hub forwards a tenant's
+    // source only to that tenant's addresses).
+    `    oifname "${MGMT_IF}" snat ip to iifname map @mgmtsnat4`,
+    `    ip saddr ${pool4.text} oifname != "${HOST_IF_PREFIX}*" oifname != "${MGMT_IF}" masquerade`,
+    `    ip6 saddr ${pool6.text} oifname != "${HOST_IF_PREFIX}*" oifname != "${MGMT_IF}" masquerade`,
     '  }',
     '}',
     '',
@@ -248,6 +301,19 @@ export const denoRunner: Runner = async (argv, stdin) => {
   return { code: output.code, stderr: new TextDecoder().decode(output.stderr).slice(0, 500) };
 };
 
+/** Why a `mgmt_vpn` session cannot start (reported as the connection's failure reason). */
+export class MgmtVpnUnavailable extends Error {
+  constructor(readonly reason = 'mgmt_vpn_unavailable') {
+    super(reason);
+  }
+}
+
+/** The management VPN as the session networks see it (implemented by `MgmtVpn`). */
+export interface MgmtGate {
+  /** Throws `MgmtVpnUnavailable` unless hub, destination range and source are all in place. */
+  require(hubUUID: string, destination: string, source: string): Promise<void>;
+}
+
 /** Allocates slots and applies/removes session networks with the privileged runner. */
 export class SessionNetworks {
   #used = new Set<number>();
@@ -256,9 +322,18 @@ export class SessionNetworks {
     private readonly capacity: number,
     private readonly pool4 = DEFAULT_POOL_IPV4,
     private readonly pool6 = DEFAULT_POOL_IPV6,
+    private readonly mgmt: MgmtGate | null = null,
   ) {}
 
-  async create(connectionUUID: string, target: SessionTarget): Promise<SessionNet> {
+  async create(
+    connectionUUID: string,
+    target: SessionTarget,
+    mgmt: MgmtSessionTarget | null = null,
+  ): Promise<SessionNet> {
+    if (mgmt) {
+      if (!this.mgmt) throw new MgmtVpnUnavailable();
+      await this.mgmt.require(mgmt.hubUUID, target.address, mgmt.source);
+    }
     let index = 0;
     while (this.#used.has(index)) index++;
     if (index >= this.capacity) throw new Error('No free session slot');
@@ -270,18 +345,26 @@ export class SessionNetworks {
         ['ip', 'netns', 'exec', net.namespace, 'nft', '-f', '-'],
         renderSessionNft(target),
       );
-      await this.#must(['nft', '-f', '-'], renderHostSessionElement(net, target, 'add'));
+      await this.#must(
+        ['nft', '-f', '-'],
+        mgmt
+          ? renderMgmtSessionElement(net, target, mgmt, 'add')
+          : renderHostSessionElement(net, target, 'add'),
+      );
       return net;
     } catch (error) {
-      await this.destroy(net, target);
+      await this.destroy(net, target, mgmt);
       throw error;
     }
   }
 
-  async destroy(net: SessionNet, target: SessionTarget) {
-    await this.run(['nft', '-f', '-'], renderHostSessionElement(net, target, 'delete')).catch(
-      () => {},
-    );
+  async destroy(net: SessionNet, target: SessionTarget, mgmt: MgmtSessionTarget | null = null) {
+    await this.run(
+      ['nft', '-f', '-'],
+      mgmt
+        ? renderMgmtSessionElement(net, target, mgmt, 'delete')
+        : renderHostSessionElement(net, target, 'delete'),
+    ).catch(() => {});
     for (const argv of renderNetnsTeardown(net)) await this.run(argv).catch(() => {});
     this.#used.delete(net.index);
   }

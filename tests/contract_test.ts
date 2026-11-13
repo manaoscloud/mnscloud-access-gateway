@@ -9,7 +9,7 @@ import { ASSIGNMENT } from './fixtures.ts';
 Deno.test('contract: assignment validation refuses what the gateway must not do', () => {
   assertEquals(parseAssignment(ASSIGNMENT).target, { address: '203.0.113.10', port: 22 });
   assertThrows(() => parseAssignment({ ...ASSIGNMENT, protocol: 'telnet' }), /protocol_refused/);
-  assertThrows(() => parseAssignment({ ...ASSIGNMENT, path: 'mgmt_vpn' }), /path_unsupported/);
+  assertThrows(() => parseAssignment({ ...ASSIGNMENT, path: 'mgmt_vpn' }), /hubUUID/);
   // Connector path: transport and connector UUID must agree.
   assertThrows(() => parseAssignment({ ...ASSIGNMENT, path: 'connector' }), /connectorUuid/);
   assertThrows(

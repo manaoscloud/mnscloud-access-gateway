@@ -12,7 +12,7 @@ import {
 import type { CommandEvent, Facts, WorkerInit, WorkerToController } from '../shared/ipc.ts';
 import type { Assignment, FinishBody, HostKeyResponse } from './contract.ts';
 import { type Bridge, startBridge } from './bridge.ts';
-import type { SessionNet } from './netns.ts';
+import { MgmtVpnUnavailable, type SessionNet } from './netns.ts';
 import type { Unwrapper } from './openvault.ts';
 import { RecordingUploader } from './recording.ts';
 import type { SandboxLimits } from './sandbox.ts';
@@ -58,8 +58,16 @@ export interface SessionApi {
 }
 
 export interface SessionNetworkManager {
-  create(connectionUUID: string, target: { address: string; port: number }): Promise<SessionNet>;
-  destroy(net: SessionNet, target: { address: string; port: number }): Promise<void>;
+  create(
+    connectionUUID: string,
+    target: { address: string; port: number },
+    mgmt?: { hubUUID: string; source: string } | null,
+  ): Promise<SessionNet>;
+  destroy(
+    net: SessionNet,
+    target: { address: string; port: number },
+    mgmt?: { hubUUID: string; source: string } | null,
+  ): Promise<void>;
 }
 
 export interface BrowserSocket {
@@ -262,7 +270,29 @@ export class Session {
     const a = this.assignment;
     if (a.transport !== 'connector') {
       if (this.deps.networks) {
-        this.#net = await this.deps.networks.create(a.connectionUUID, a.target);
+        try {
+          this.#net = await this.deps.networks.create(a.connectionUUID, a.target, a.mgmtVpn);
+        } catch (error) {
+          if (!(error instanceof MgmtVpnUnavailable)) throw error;
+          this.deps.log(`connection ${this.uuid}: ${error.reason}`);
+          await this.#finish({
+            t: 'exit',
+            state: 'failed',
+            reason: error.reason,
+            bytesIn: 0,
+            bytesOut: 0,
+          });
+          return false;
+        }
+      } else if (a.transport === 'mgmt_vpn') {
+        await this.#finish({
+          t: 'exit',
+          state: 'failed',
+          reason: 'mgmt_vpn_unavailable',
+          bytesIn: 0,
+          bytesOut: 0,
+        });
+        return false;
       }
       return true;
     }
@@ -500,7 +530,8 @@ export class Session {
     }
     this.#bridge?.close();
     if (this.#net && this.deps.networks) {
-      await this.deps.networks.destroy(this.#net, this.assignment.target).catch(() => {});
+      await this.deps.networks.destroy(this.#net, this.assignment.target, this.assignment.mgmtVpn)
+        .catch(() => {});
     }
     const body: FinishBody = {
       state: exit.state,

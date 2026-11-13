@@ -61,6 +61,21 @@ export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
     await this.cp.call('POST', `/connectors/${uuid}/detach`, {});
   }
 
+  /** Hub and owner sources of the management VPN; an older API (404) means no hub. */
+  async mgmtVpn(): Promise<unknown> {
+    try {
+      return await this.cp.call<unknown>('GET', '/mgmt-vpn');
+    } catch (error) {
+      if (error instanceof ControlPlaneRejected && error.status === 404) return { hub: null };
+      throw error;
+    }
+  }
+
+  /** Reports the gateway's WireGuard public key (idempotent). */
+  async mgmtVpnKey(publicKey: string) {
+    await this.cp.call('POST', '/mgmt-vpn/key', { publicKey });
+  }
+
   heartbeat(body: Record<string, unknown>) {
     return this.cp.call<{ configDigest: string; drain: boolean }>('POST', '/heartbeat', body);
   }

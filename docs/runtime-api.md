@@ -153,8 +153,9 @@ ends them (finish reason `cancelled`).
   "connectionUUID": "uuid",
   "mode": "console | test",
   "protocol": "ssh | routeros_api",
-  "path": "public | connector",
-  "transport": "direct | connector",
+  "path": "public | connector | mgmt_vpn",
+  "transport": "direct | connector | mgmt_vpn",
+  "mgmtVpn": "{ \"hubUUID\": \"uuid\", \"source\": \"<IPv4 literal>\" } (required, and only allowed, when transport is mgmt_vpn)",
   "connectorUuid": "uuid (required, and only allowed, when transport is connector)",
   "connectorKeyFingerprint": "SHA256:<44 base64 chars incl. padding> (required with transport connector)",
   "target": { "address": "<IP literal resolved by the API with the rebinding guard>", "port": 22 },
@@ -181,9 +182,10 @@ ends them (finish reason `cancelled`).
   ticket is 32 random bytes from the API, base64url without padding (43 characters). The gateway
   accepts it once, until `min(expiresAt, received + 60 s)`.
 - `protocol` `routeros_api` is accepted only with `mode: test` and port 8729 semantics (TLS). Port 23
-  and 8728, `telnet`, and any `path` other than `public` and `connector` are refused in this
-  release. `transport` defaults to `connector` when `path` is `connector` and to `direct` otherwise;
-  `path: connector` requires `transport: connector` (and the reverse), otherwise `path_unsupported`.
+  and 8728, `telnet`, and any `path` other than `public`, `connector` and `mgmt_vpn` are refused in
+  this release. `transport` defaults to the path (`direct` for `public`); `path: connector` requires
+  `transport: connector` and `path: mgmt_vpn` requires `transport: mgmt_vpn` (and the reverse),
+  otherwise `path_unsupported`. Assignments without `mgmtVpn` keep working unchanged.
   `connectorKeyFingerprint` is the fingerprint of the connector public key the API has on file
   (`SHA256:` + base64 of sha256(raw key), as in `AcnPublicKeyFingerprint`); the gateway refuses the
   connection (`refused`, `connector_key_mismatch`) when the tunnel authenticated with another key,
@@ -194,6 +196,13 @@ ends them (finish reason `cancelled`).
   point); the gateway still refuses loopback, link-local, multicast, unspecified, broadcast and
   IPv4-mapped targets and ports 23/8728, and finishes `failed` with `connector_offline` when the
   connector has no tunnel attached to this gateway (see "Remote access connector").
+- For `transport: mgmt_vpn` (management VPN, section 11) `target.address` must be an IPv4 literal
+  inside the hub's `mgmtNet`; `mgmtVpn.source` is the owner's address (an IPv4 literal; a different
+  value per tenant), `mgmtVpn.hubUUID` the hub the API resolved. The public denylist does not apply
+  (the range is private on purpose); the host firewall lets only this path use it. Ports 23/8728 are
+  refused. The gateway finishes `failed` with `mgmt_vpn_unavailable` when it has no hub, the hub
+  differs from `hubUUID`, the destination is outside `mgmtNet`, or `source` is not on the interface
+  (after one immediate synchronisation).
 - `level` drives the manual-mode policy (`src/worker/policy.ts`).
 
 ## 4. `POST /connections/:uuid/hostkey`
@@ -273,7 +282,7 @@ Exactly once per connection (also for refused and expired assignments).
 ```json
 {
   "state": "closed | failed | refused | expired",
-  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | connector_offline | connector_key_mismatch | connector_open_failed | not_allowed | api_refused | api_unavailable | connect_timeout | open_timeout | too_many_streams | tunnel_closed | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
+  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | connector_offline | mgmt_vpn_unavailable | connector_key_mismatch | connector_open_failed | not_allowed | api_refused | api_unavailable | connect_timeout | open_timeout | too_many_streams | tunnel_closed | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
   "bytesFromDevice": 0,
   "bytesToDevice": 0,
   "durationMs": 0,
@@ -332,6 +341,33 @@ Used by the connector tunnel (section "Remote access connector"). Base `/api/v1/
   this gateway (stores gateway and `AcnTunnelConnectedAt`). A newer tunnel simply overwrites it.
 - `POST /connectors/:connectorUuid/detach` (body `{}`): the tunnel closed; clear the attachment only
   when it still points to this gateway.
+
+## 11. Management VPN routes (host Agent identity, same router)
+
+Base `/api/v1/access/runtime`. The gateway polls the first route at start and every 60 s (and when a
+`mgmt_vpn` assignment names a source that is not on the interface yet).
+
+- `GET /mgmt-vpn`: `data` is `{ "hub": null }` (no hub bound to this gateway: the gateway deletes its
+  interface) or
+
+  ```json
+  {
+    "hub": {
+      "uuid": "uuid",
+      "endpoint": "host:port",
+      "publicKey": "<44 chars base64 WireGuard key>",
+      "mgmtNet": "<IPv4 CIDR, prefix 8..30>",
+      "gatewayNet": "<IPv4 CIDR inside mgmtNet>"
+    },
+    "sources": ["<IPv4 inside gatewayNet>", "..."]
+  }
+  ```
+
+  An older API answering `404` means "no hub". Anything malformed is ignored (the interface stays as
+  it is) and logged.
+- `POST /mgmt-vpn/key` body `{ "publicKey": "<44 chars base64>" }`: the gateway's WireGuard public
+  key, sent once per process start and after a key change (idempotent). The private key is generated
+  on the host (`wg genkey`, `/var/lib/mnscloud/access-gateway/mgmt-vpn.key`, 0600) and never leaves it.
 
 ## WebSocket (browser <-> edge <-> gateway)
 

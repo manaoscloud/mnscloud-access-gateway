@@ -64,6 +64,11 @@ export class Gateway {
   /** Destination, protocol and (connector) tunnel checks; null when the assignment may proceed. */
   #preflight(assignment: Assignment): { reason: string; state: FinishBody['state'] } | null {
     const { address, port } = assignment.target;
+    if (assignment.transport === 'mgmt_vpn') {
+      // The hub range is private on purpose: the denylist does not apply here, `MgmtVpn.require`
+      // checks the range at session creation and the host firewall lets only this path use it.
+      return [23, 8728].includes(port) ? { reason: 'protocol_refused', state: 'refused' } : null;
+    }
     if (assignment.transport !== 'connector') {
       const destination = checkDestination(address, this.options.denylist);
       if (destination.allowed && ![23, 8728].includes(port)) return null;
