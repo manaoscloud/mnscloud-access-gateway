@@ -20,7 +20,15 @@ export interface GatewayOptions {
   deps: SessionDeps;
   /** Connector tunnels (`/access-gateway/<key>/connector`); absent when not served. */
   hub?: ConnectorHub;
+  /**
+   * How long a browser with a ticket this gateway does not know yet waits for its assignment
+   * (the API hands the ticket out before the next assignments poll delivers it). Default 5 s.
+   */
+  ticketArrivalMs?: number;
 }
+
+const TICKET_ARRIVAL_MS = 5000;
+const TICKET_RETRY_MS = 100;
 
 function refusal(
   _assignment: { connectionUUID: string },
@@ -199,6 +207,20 @@ export class Gateway {
     });
   }
 
+  /**
+   * Consumes the ticket; one the book does not know yet (only `unknown`: never a used, expired or
+   * malformed one) is retried until its assignment arrives or the wait ends.
+   */
+  async #awaitTicket(ticket: string | null) {
+    const deadline = Date.now() + (this.options.ticketArrivalMs ?? TICKET_ARRIVAL_MS);
+    let result = await this.tickets.consume(ticket);
+    while (!result.ok && result.reason === 'unknown' && Date.now() < deadline && !this.#draining) {
+      await new Promise((resolve) => setTimeout(resolve, TICKET_RETRY_MS));
+      result = await this.tickets.consume(ticket);
+    }
+    return result;
+  }
+
   /** HTTP handler of the 7443 listener. */
   async handle(request: Request, remote: string): Promise<Response> {
     if (!this.#edgeAllowed(remote)) return new Response('Forbidden', { status: 403 });
@@ -221,7 +243,7 @@ export class Gateway {
     if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('WebSocket required', { status: 426 });
     }
-    const result = await this.tickets.consume(url.searchParams.get('ticket'));
+    const result = await this.#awaitTicket(url.searchParams.get('ticket'));
     if (!result.ok) {
       return new Response('Console ticket is invalid or expired.', {
         status: 401,
