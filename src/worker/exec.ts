@@ -19,6 +19,7 @@ import {
 import type { CommandClass } from '../shared/framing.ts';
 import type { WorkerCredential, WorkerInit, WorkerToController } from '../shared/ipc.ts';
 import { Classifier } from './classifier.ts';
+import { deadlineExceeded, disarmsRollback, readProblem } from './exec_policy.ts';
 import { decide } from './policy.ts';
 import { type Redactor, stripAnsi } from './redaction.ts';
 import type { DialectRules } from './rules.ts';
@@ -78,7 +79,7 @@ const ROS_ERROR =
 const VRP_ERROR = /^\s*Error:/m;
 const ROS_PROMPT = /^\[[^\]\r\n]+\]\s*(?:\/[^<>\r\n]*)?(?:<SAFE>)?\s*>?\s*$/;
 const VRP_PROMPT = /(?:^|\n)[<[][^\s<>[\]]{1,64}[>\]]\s*$/;
-const GENERIC_PROMPT = /[>#$%]\s*$/;
+const PAGER = /-- \[Q quit\|D dump\|down\]/;
 const YES_NO = /\[Y\/N\]\s*:?\s*$/i;
 
 export function shellQuote(value: string): string {
@@ -124,9 +125,14 @@ export function planExec(
       const c = classifier.classify(command);
       classifier.commit(c);
       let allowed: boolean;
-      if (mode === 'read') allowed = c.class === 'read' && !c.unknown;
-      else if (c.class === 'destructive' || c.class === 'secret_read') allowed = false;
-      else {
+      if (mode === 'read') {
+        allowed = c.class === 'read' && !c.unknown &&
+          readProblem(rules.dialect, command, c.rule) === null;
+      } else if (c.class === 'destructive' || c.class === 'secret_read' || c.unknown) {
+        allowed = false;
+      } else if (disarmsRollback(rules.dialect, command, c.rule)) {
+        allowed = false;
+      } else {
         const decision = decide(level, c.class);
         allowed = decision === 'allow' || decision === 'confirm';
       }
@@ -160,7 +166,7 @@ function cleanOutput(redactor: Redactor, raw: string, truncated: boolean): strin
   if (truncated) text = text.slice(0, text.lastIndexOf('\n') + 1);
   const safe = new TerminalSanitizer().push(text);
   const plain = stripAnsi(safe).text.replace(/\r\n/g, '\n').replace(/\r/g, '');
-  return redactor.redactText(plain);
+  return redactor.redactText(plain.replace(/-- \[Q quit\|D dump\|down\]\s*/g, ''));
 }
 
 /** Shrinks outputs until the serialized result fits the IPC line and the API body cap. */
@@ -248,6 +254,7 @@ class Shell {
   #sanitizer = new TerminalSanitizer();
   #decoder = new TextDecoder();
   #waiter: (() => void) | null = null;
+  #pagerAnswered = false;
   closed = false;
 
   // deno-lint-ignore no-explicit-any
@@ -266,12 +273,17 @@ class Shell {
     if (this.#head.length < OUTPUT_CAP_BYTES * 2) this.#head += text;
     else this.#truncated = true;
     this.#tail = (this.#tail + text).slice(-4096);
+    // RouterOS pager: ask for the rest of the output at once instead of paging.
+    const paged = PAGER.test(lastLineOf(this.#view()));
+    if (paged && !this.#pagerAnswered) this.stream.write('D');
+    this.#pagerAnswered = paged;
     this.#waiter?.();
   }
 
   #view(): string {
     const source = this.#truncated ? this.#tail : this.#head;
-    return stripAnsi(source).text.replace(/\r\n/g, '\n').replace(/\r/g, '');
+    // A lone CR redraws the line: it starts a new one for prompt detection.
+    return stripAnsi(source).text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   }
 
   get truncated() {
@@ -467,6 +479,9 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     fingerprint: null,
   };
   const clients: { end(): void; destroy(): void }[] = [];
+  // Verification commands are read-only; a non-root Linux login runs them like every other
+  // command (set once the user is known).
+  let verifyWire = (command: string) => command;
 
   const connect = (role: Role, suffix: string) =>
     new Promise<{ end(): void; destroy(): void }>((resolve, reject) => {
@@ -604,10 +619,11 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     // deno-lint-ignore no-explicit-any
     client: any,
     prompt: (line: string) => boolean,
+    cols = 500,
   ): Promise<Shell> =>
     new Promise((resolve, reject) => {
       client.shell(
-        { term: 'vt100', cols: 500, rows: 50 },
+        { term: 'vt100', cols, rows: 50 },
         // deno-lint-ignore no-explicit-any
         (error: Error | undefined, stream: any) => {
           if (error || !stream) reject(new ExecFail('SHELL_REFUSED', 'failed', 'shell_refused'));
@@ -650,13 +666,18 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   ) => {
     const started = Date.now();
     const run = await guard(runInShell(shell, command, timeoutMs, answer));
-    const output = cleanOutput(redactor, shellBody(run, command), run.truncated);
+    let output = cleanOutput(redactor, shellBody(run, command), run.truncated);
+    let truncated = run.truncated;
+    if (output.length > OUTPUT_CAP_BYTES) {
+      output = output.slice(0, output.lastIndexOf('\n', OUTPUT_CAP_BYTES) + 1 || OUTPUT_CAP_BYTES);
+      truncated = true;
+    }
     record(
       phase,
       command,
       run.timedOut ? 124 : null,
       output,
-      run.truncated,
+      truncated,
       Date.now() - started,
       planOf(phase, command),
     );
@@ -682,6 +703,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   /** Runs the verify commands in a second connection; true when they all pass. */
   const verifyNewSession = async (): Promise<boolean> => {
     let ok = false;
+    const before = clients.length;
     let connection: { end(): void; destroy(): void } | null = null;
     const work = (async () => {
       connection = await connect('verify', '');
@@ -697,8 +719,11 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return true;
       }
       for (const command of exec.verify) {
-        const r = await runChannel(client, 'verify', command);
-        if (r.exitCode !== null && r.exitCode !== 0) return false;
+        const r = await runChannel(client, 'verify', command, verifyWire(command));
+        // RouterOS gives no exit status over exec; Linux must exit 0.
+        if (dialect === 'routeros' ? r.exitCode !== null && r.exitCode !== 0 : r.exitCode !== 0) {
+          return false;
+        }
         if (dialect === 'routeros' && ROS_ERROR.test(r.output)) return false;
       }
       return true;
@@ -713,7 +738,8 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       if (error instanceof ExecAbort) throw error;
       ok = false;
     } finally {
-      (connection as { end(): void; destroy(): void } | null)?.destroy();
+      // Also a verify connection that never got to `ready` (timeout while connecting).
+      for (const client of clients.slice(before)) client.destroy();
     }
     return ok;
   };
@@ -730,14 +756,9 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
 
   const readShell = async () => {
     const conn = await connectFirst('');
-    const prompt = dialect === 'vrp'
-      ? (line: string) => VRP_PROMPT.test('\n' + line)
-      : (line: string) => GENERIC_PROMPT.test(line);
-    const shell = await openShell(raw(conn), (view) => prompt(lastLineOf(view)));
+    const shell = await openShell(raw(conn), (view) => VRP_PROMPT.test('\n' + lastLineOf(view)));
     if (!(await guard(shell.waitPrompt(PROMPT_TIMEOUT_MS)))) throw new ExecFail('PROMPT_TIMEOUT');
-    if (dialect === 'vrp') {
-      await runInShell(shell, 'screen-length 0 temporary', COMMAND_TIMEOUT_MS, null);
-    }
+    await runInShell(shell, 'screen-length 0 temporary', COMMAND_TIMEOUT_MS, null);
     for (const command of exec.steps) {
       const { run } = await runShell(shell, 'step', command, COMMAND_TIMEOUT_MS, 'N');
       if (run.timedOut) {
@@ -755,8 +776,9 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
 
   const routerosChange = async () => {
     const backup = exec.backupName!;
-    const conn = await connectFirst('+ct');
+    const conn = await connectFirst('+ct4096w');
     let safeModeOn = false;
+    let armedAt = 0;
     const rollBackBySocket = (code: string, message: string) => {
       // Dropping the connection (no logout) makes RouterOS undo everything done in safe mode.
       conn.destroy();
@@ -764,7 +786,11 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       emit('rolled_back', { code, message });
     };
     try {
-      const shell = await openShell(raw(conn), (view) => ROS_PROMPT.test(lastLineOf(view)));
+      const shell = await openShell(
+        raw(conn),
+        (view) => ROS_PROMPT.test(lastLineOf(view)),
+        4096,
+      );
       if (!(await guard(shell.waitPrompt(PROMPT_TIMEOUT_MS)))) throw new ExecFail('PROMPT_TIMEOUT');
       // 1. backup before the change (outside safe mode)
       const backupCommand = `/export file=${backup}`;
@@ -802,9 +828,14 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       safeModeOn = true;
+      armedAt = Date.now();
       result.rollback = { method: 'safe_mode', armed: true, fired: false, pendingReboot: false };
       // 3. the steps
       for (const command of exec.steps) {
+        if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+          rollBackBySocket('DEADLINE', 'The time budget of the change ran out; it was reverted.');
+          return;
+        }
         const { run, output } = await runShell(shell, 'step', command, STEP_TIMEOUT_MS, null);
         if (run.timedOut || run.unexpectedConfirm || ROS_ERROR.test(output)) {
           rollBackBySocket('STEP_FAILED', 'A step failed; safe mode reverted the changes.');
@@ -819,6 +850,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         );
         return;
       }
+      if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+        rollBackBySocket('DEADLINE', 'The time budget of the change ran out; it was reverted.');
+        return;
+      }
       shell.take();
       shell.send('\x18');
       const released = await guard(
@@ -828,49 +863,69 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         ),
       );
       if (released === null) {
-        rollBackBySocket(
-          'RELEASE_FAILED',
-          'Safe mode could not be released; the changes were reverted.',
-        );
+        // Ctrl-X was sent but the prompt never came back: the commit may or may not have happened.
+        conn.destroy();
+        result.rollback = { method: 'safe_mode', armed: true, fired: true, pendingReboot: false };
+        emit('failed', {
+          code: 'RELEASE_UNCERTAIN',
+          message: 'Safe mode release was not confirmed; the device state must be checked.',
+        });
         return;
       }
-      safeModeOn = false;
+      safeModeOn = false; // committed from here on
       result.rollback = { method: 'safe_mode', armed: false, fired: false, pendingReboot: false };
       record('system', 'safe-mode release (Ctrl-X)', null, 'Safe mode released', false, 0);
-      // 5. change log and post-change export
+      // 5. change log and post-change export. The change is committed: nothing below can turn it
+      // into a failure, only into a note on the `applied` result.
       let documentation: ExecResult['error'] = null;
-      if (exec.changeLog?.kind === 'script') {
-        const ensure =
-          ':if ([:len [/system script find name=mnscloud-changelog]]=0) do={/system script add name=mnscloud-changelog policy="" comment="MNSCloud: Registro de alteracoes do suporte (somente documentacao)" source="# Registro de alteracoes"}';
-        const append =
-          `/system script set [find name=mnscloud-changelog] source=([get [find name=mnscloud-changelog] source] . "\\n# ${exec.changeLog.line}")`;
-        for (const command of [ensure, append]) {
-          const r = await runShell(shell, 'system', command, STEP_TIMEOUT_MS, null);
-          if (r.run.timedOut || ROS_ERROR.test(r.output)) {
-            documentation = {
-              code: 'CHANGELOG_FAILED',
-              message: 'The change was applied; the change log line was not written.',
-            };
-            break;
+      let stage: 'changelog' | 'export' = 'changelog';
+      try {
+        if (exec.changeLog?.kind === 'script') {
+          const ensure =
+            ':if ([:len [/system script find name=mnscloud-changelog]]=0) do={/system script add name=mnscloud-changelog policy="" comment="MNSCloud: Registro de alteracoes do suporte (somente documentacao)" source="# Registro de alteracoes"}';
+          const append =
+            `/system script set [find name=mnscloud-changelog] source=([get [find name=mnscloud-changelog] source] . "\\n# ${exec.changeLog.line}")`;
+          for (const command of [ensure, append]) {
+            const r = await runShell(shell, 'system', command, STEP_TIMEOUT_MS, null);
+            if (r.run.timedOut || ROS_ERROR.test(r.output)) {
+              documentation = {
+                code: 'CHANGELOG_FAILED',
+                message: 'The change was applied; the change log line was not written.',
+              };
+              break;
+            }
           }
         }
+        stage = 'export';
+        const after = `pos-${backup.replace(/^pre-/, '')}`;
+        const exported = await runShell(
+          shell,
+          'system',
+          `/export file=${after}`,
+          EXPORT_TIMEOUT_MS,
+          null,
+        );
+        if ((exported.run.timedOut || ROS_ERROR.test(exported.output)) && !documentation) {
+          documentation = {
+            code: 'EXPORT_FAILED',
+            message: 'The change was applied; the post-change export failed.',
+          };
+        }
+        shell.send('/quit\r');
+        await shell.waitFor(() => false, 1000);
+      } catch (error) {
+        conn.destroy();
+        emit('applied', {
+          code: error instanceof ExecAbort
+            ? 'EXEC_ABORTED'
+            : stage === 'export'
+            ? 'EXPORT_FAILED'
+            : 'CHANGELOG_FAILED',
+          message: 'The change was applied; the documentation step did not finish.',
+        });
+        if (error instanceof ExecAbort) throw error;
+        return;
       }
-      const after = `pos-${backup.replace(/^pre-/, '')}`;
-      const exported = await runShell(
-        shell,
-        'system',
-        `/export file=${after}`,
-        EXPORT_TIMEOUT_MS,
-        null,
-      );
-      if ((exported.run.timedOut || ROS_ERROR.test(exported.output)) && !documentation) {
-        documentation = {
-          code: 'EXPORT_FAILED',
-          message: 'The change was applied; the post-change export failed.',
-        };
-      }
-      shell.send('/quit\r');
-      await shell.waitFor(() => false, 1000);
       conn.end();
       emit('applied', documentation);
     } catch (error) {
@@ -892,6 +947,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     const backup = exec.backupName!;
     const conn = await connectFirst('');
     let scheduled = false;
+    let armedAt = 0;
     try {
       const shell = await openShell(raw(conn), (view) => VRP_PROMPT.test('\n' + lastLineOf(view)));
       if (!(await guard(shell.waitPrompt(PROMPT_TIMEOUT_MS)))) throw new ExecFail('PROMPT_TIMEOUT');
@@ -918,6 +974,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       scheduled = true;
+      armedAt = Date.now();
       result.rollback = {
         method: 'scheduled_reboot',
         armed: true,
@@ -937,6 +994,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       };
       let failed = !(await system('system-view'));
       for (const command of failed ? [] : exec.steps) {
+        if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+          rollbackNow('DEADLINE', 'The time budget of the change ran out; the device reboots.');
+          return;
+        }
         const { run, output } = await runShell(shell, 'step', command, STEP_TIMEOUT_MS, 'N');
         if (run.timedOut || run.unexpectedConfirm || VRP_ERROR.test(output)) {
           failed = true;
@@ -956,6 +1017,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           'VERIFY_FAILED',
           'The verification failed; the device reboots into the saved configuration.',
         );
+        return;
+      }
+      if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+        rollbackNow('DEADLINE', 'The time budget of the change ran out; the device reboots.');
         return;
       }
       const cancelled = await system('undo schedule reboot');
@@ -1012,10 +1077,11 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   };
 
   const linuxChange = async () => {
-    const unit = `mns-rb-${hex.slice(0, 8)}`;
+    const unit = `mns-rb-${hex}`;
     const conn = await connectFirst('');
     const client = raw(conn);
     let armed = false;
+    let armedAt = 0;
     try {
       const uidRun = await runChannel(client, 'system', 'id -u');
       const uid = Number.parseInt(uidRun.output.trim(), 10);
@@ -1029,9 +1095,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       }
       const asRoot = (command: string) =>
         uid === 0 ? command : `sudo -n /bin/sh -c ${shellQuote(command)}`;
+      verifyWire = asRoot;
       const script = Buffer.from(exec.rollback.join('\n'), 'utf8').toString('base64');
       const arm =
-        `systemd-run --unit=${unit} --on-active=${exec.rollbackSeconds} --timer-property=AccuracySec=1s /bin/sh -c ${
+        `systemd-run --unit=${unit} --on-active=${exec.rollbackSeconds} --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=120 /bin/sh -c ${
           shellQuote(`echo ${script} | base64 -d | /bin/sh`)
         }`;
       const armed_ = await runChannel(client, 'system', arm, asRoot(arm));
@@ -1044,6 +1111,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       armed = true;
+      armedAt = Date.now();
       result.rollback = {
         method: 'deadman_timer',
         armed: true,
@@ -1053,7 +1121,22 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       const rollbackNow = async (code: string, message: string) => {
         const start = `systemctl start ${unit}.service`;
         const stop = `systemctl stop ${unit}.timer`;
-        await runChannel(client, 'rollback', start, asRoot(start));
+        const started = await runChannel(client, 'rollback', start, asRoot(start), 130000);
+        if (started.exitCode !== 0) {
+          // The rollback script did not run: keep the timer armed, it is the last safety net.
+          conn.end();
+          result.rollback = {
+            method: 'deadman_timer',
+            armed: true,
+            fired: false,
+            pendingReboot: false,
+          };
+          emit('failed', {
+            code: 'ROLLBACK_FAILED',
+            message: 'The rollback commands failed; the timer stays armed.',
+          });
+          return;
+        }
         await runChannel(client, 'rollback', stop, asRoot(stop));
         conn.end();
         result.rollback = {
@@ -1065,6 +1148,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         emit('rolled_back', { code, message });
       };
       for (const command of exec.steps) {
+        if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+          await rollbackNow('DEADLINE', 'The time budget of the change ran out; rolled back.');
+          return;
+        }
         const r = await runChannel(client, 'step', command, asRoot(command), STEP_TIMEOUT_MS);
         if (r.exitCode !== 0) {
           await rollbackNow('STEP_FAILED', 'A step failed; the rollback commands were run.');
@@ -1076,6 +1163,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           'VERIFY_FAILED',
           'The verification failed; the rollback commands were run.',
         );
+        return;
+      }
+      if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+        await rollbackNow('DEADLINE', 'The time budget of the change ran out; rolled back.');
         return;
       }
       const stop = `systemctl stop ${unit}.timer`;
@@ -1102,15 +1193,26 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         pendingReboot: false,
       };
       let documentation: ExecResult['error'] = null;
-      if (exec.changeLog?.kind === 'file') {
-        const line = `printf '%s\\n' '${exec.changeLog.line}' >> /etc/mnscloud-changelog`;
-        const written = await runChannel(client, 'system', line, asRoot(line));
-        if (written.exitCode !== 0) {
-          documentation = {
-            code: 'CHANGELOG_FAILED',
-            message: 'The change was applied; the change log line was not written.',
-          };
+      try {
+        if (exec.changeLog?.kind === 'file') {
+          const line = `printf '%s\\n' '${exec.changeLog.line}' >> /etc/mnscloud-changelog`;
+          const written = await runChannel(client, 'system', line, asRoot(line));
+          if (written.exitCode !== 0) {
+            documentation = {
+              code: 'CHANGELOG_FAILED',
+              message: 'The change was applied; the change log line was not written.',
+            };
+          }
         }
+      } catch (error) {
+        // Committed (timer stopped): only the documentation is lost.
+        conn.destroy();
+        emit('applied', {
+          code: error instanceof ExecAbort ? 'EXEC_ABORTED' : 'CHANGELOG_FAILED',
+          message: 'The change was applied; the change log line was not written.',
+        });
+        if (error instanceof ExecAbort) throw error;
+        return;
       }
       conn.end();
       emit('applied', documentation);
@@ -1141,7 +1243,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   let finish: Exit | null = null;
   try {
     if (exec.kind === 'read') {
-      if (dialect === 'vrp' || dialect === 'other') await readShell();
+      if (dialect === 'vrp') await readShell();
       else await readExecChannel();
     } else if (exec.safeChange === 'routeros_safe_mode') await routerosChange();
     else if (exec.safeChange === 'vrp5_schedule_reboot') await vrpChange();

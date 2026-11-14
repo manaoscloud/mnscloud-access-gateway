@@ -155,6 +155,10 @@ export interface ExecDeviceOptions {
   /** Overrides the answer to an exec command (undefined: the default one). */
   respond?: (command: string) => ExecReply | undefined;
   host?: string;
+  /** RouterOS: the connection ends right after safe mode is released. */
+  dropAfterRelease?: boolean;
+  /** RouterOS: the release is applied but the prompt never comes back. */
+  silentRelease?: boolean;
 }
 
 export interface ExecDevice {
@@ -221,6 +225,7 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
   const rosShell = (stream: any, client: any) => {
     const prompt = () => `[support@sim] ${device.safe ? '<SAFE>' : '>'} `;
     let line = '';
+    let paging = false;
     stream.write(`MikroTik\r\n${prompt()}`);
     client.on('close', () => {
       if (device.safe && safeOwner === client) {
@@ -234,6 +239,14 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
       const text = new TextDecoder().decode(chunk);
       device.rawInput.push(text);
       for (const ch of text) {
+        if (paging) {
+          if (ch === 'D') {
+            paging = false;
+            device.events.push('pager-dump');
+            stream.write(`\r${' '.repeat(30)}\rline3\r\n${prompt()}`);
+          }
+          continue;
+        }
         if (ch === '\x18') {
           if (!device.safe) {
             device.safe = true;
@@ -246,7 +259,8 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
             device.committed.push(...device.pending);
             device.pending = [];
             device.events.push('released');
-            stream.write(`Safe mode released\r\n${prompt()}`);
+            if (!options.silentRelease) stream.write(`Safe mode released\r\n${prompt()}`);
+            if (options.dropAfterRelease) client.end();
           }
         } else if (ch === '\r') {
           const command = line;
@@ -265,7 +279,13 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
             stream.write('failure: bad thing happened\r\n');
           } else if (device.safe) device.pending.push(command);
           else device.committed.push(command);
-          stream.write(prompt());
+          if (command.includes('PAGER')) {
+            paging = true;
+            stream.write('line1\r\nline2\r\n-- [Q quit|D dump|down]');
+            continue;
+          }
+          // A redraw: the prompt follows a lone CR on the same line as the output.
+          stream.write((command.includes('REDRAW') ? 'drawn\r' : '') + prompt());
         } else if (ch >= ' ') {
           line += ch;
           stream.write(ch);
@@ -359,7 +379,7 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
   const server = new Server({ hostKeys: [hostKey] }, (client: any) => {
     // deno-lint-ignore no-explicit-any
     client.on('authentication', (ctx: any) => {
-      const base = ctx.username.replace(/\+ct$/, '');
+      const base = ctx.username.replace(/\+ct(?:\d+w)?$/, '');
       if (ctx.method === 'password' && base === 'support' && ctx.password === PASSWORD) {
         device.usernames.push(ctx.username);
         device.authenticated++;

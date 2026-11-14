@@ -10,7 +10,7 @@ import {
   READY_FRAME,
   utf8Length,
 } from '../shared/framing.ts';
-import type { ExecResult } from '../shared/exec.ts';
+import { type ExecResult, validExecResult } from '../shared/exec.ts';
 import type { CommandEvent, Facts, WorkerInit, WorkerToController } from '../shared/ipc.ts';
 import type { Assignment, FinishBody, HostKeyResponse } from './contract.ts';
 import { type Bridge, startBridge } from './bridge.ts';
@@ -159,6 +159,42 @@ export interface SessionDeps {
 
 /** Default waits between attempts to deliver an exec result (first attempt is immediate). */
 export const EXEC_RESULT_RETRY_MS = [1000, 3000, 8000, 20000, 30000];
+
+/** Delivers an exec result with retry and backoff (shared by sessions and refused assignments). */
+export async function postExecResult(
+  deps: Pick<SessionDeps, 'api' | 'log' | 'execResultRetryMs'>,
+  uuid: string,
+  result: ExecResult,
+) {
+  const waits = [0, ...(deps.execResultRetryMs ?? EXEC_RESULT_RETRY_MS)];
+  for (const wait of waits) {
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      await deps.api.execResult(uuid, result);
+      return;
+    } catch (error) {
+      // A client error other than timeout/rate limit will not change by retrying.
+      if (
+        error instanceof ControlPlaneRejected && error.status >= 400 && error.status < 500 &&
+        ![408, 425, 429].includes(error.status)
+      ) {
+        deps.log(`exec result of ${uuid} refused: ${error.message}`);
+        return;
+      }
+      deps.log(`exec result of ${uuid} not delivered: ${(error as Error).message}`);
+    }
+  }
+}
+
+/** A failed result for a request that never ran. */
+export function refusedExecResult(code: string, message: string): ExecResult {
+  return {
+    status: 'failed',
+    steps: [],
+    rollback: { method: 'none', armed: false, fired: false, pendingReboot: false },
+    error: { code, message },
+  };
+}
 
 const CLOSE_REASONS: Record<string, [number, string]> = {
   hostkey_mismatch: [4409, 'The device host key changed.'],
@@ -583,7 +619,8 @@ export class Session {
         this.#facts = message.facts;
         break;
       case 'exec_result':
-        this.#execResult ??= message.result;
+        // A malformed result from the worker is replaced by a failure (see #postExecResult).
+        if (validExecResult(message.result)) this.#execResult ??= message.result;
         break;
       case 'hostkey': {
         let decision: HostKeyResponse = { decision: 'block', pinned: false };
@@ -672,24 +709,7 @@ export class Session {
         message: 'The request ended without a result.',
       },
     };
-    const waits = [0, ...(this.deps.execResultRetryMs ?? EXEC_RESULT_RETRY_MS)];
-    for (const wait of waits) {
-      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
-      try {
-        await this.deps.api.execResult(this.uuid, result);
-        return;
-      } catch (error) {
-        // A client error other than timeout/rate limit will not change by retrying.
-        if (
-          error instanceof ControlPlaneRejected && error.status >= 400 && error.status < 500 &&
-          ![408, 425, 429].includes(error.status)
-        ) {
-          this.deps.log(`exec result of ${this.uuid} refused: ${error.message}`);
-          return;
-        }
-        this.deps.log(`exec result of ${this.uuid} not delivered: ${(error as Error).message}`);
-      }
-    }
+    await postExecResult(this.deps, this.uuid, result);
   }
 
   async #finish(exit: Extract<WorkerToController, { t: 'exit' }>) {

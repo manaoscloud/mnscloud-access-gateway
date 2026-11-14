@@ -10,6 +10,9 @@ export const MASK = '********';
 const MAX_HOLD = 4096;
 const KEY_BLOCK_START = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const KEY_BLOCK_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/;
+// A whole PEM private key (an unterminated one is masked up to the end of the text).
+const KEY_BLOCK_WHOLE =
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g;
 const KEY_BLOCK_PREFIX = '-----BEGIN';
 const CRYPT_HASH = /\$(?:1|2[abxy]?|5|6|y|gy|7|sha1|md5)\$[^\s:'"]{8,}/g;
 // deno-lint-ignore no-control-regex
@@ -162,6 +165,11 @@ export class Redactor {
     CRYPT_HASH.lastIndex = 0;
     for (let m = CRYPT_HASH.exec(text); m; m = CRYPT_HASH.exec(text)) {
       ranges.push({ start: m.index, end: m.index + m[0].length });
+    }
+    KEY_BLOCK_WHOLE.lastIndex = 0;
+    for (let m = KEY_BLOCK_WHOLE.exec(text); m; m = KEY_BLOCK_WHOLE.exec(text)) {
+      ranges.push({ start: m.index, end: m.index + m[0].length });
+      if (m[0].length === 0) KEY_BLOCK_WHOLE.lastIndex++;
     }
     if (this.#literalRegex) {
       this.#literalRegex.lastIndex = 0;

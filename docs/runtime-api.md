@@ -372,7 +372,11 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
   needs `rollbackSeconds` 120..900, `verify`, a `backupName`, and a `safeChange` that matches the
   dialect: `routeros_safe_mode` (routeros, `changeLog` script or report_only),
   `vrp5_schedule_reboot` (vrp, report_only), `systemd_deadman` (linux/proxmox, `rollback` required,
-  `changeLog` file or report_only). `none` is refused for a change. `rollbackSeconds` is 0..900 for
+  `changeLog` file or report_only). `none` is refused for a change. The dialect `other` is
+  refused for exec (read and change). Commands may not contain control characters (Tab included,
+  `\x00-\x1f`, `\x7f`), and not `?` on routeros and vrp (inline help). A change also needs
+  `steps.length * 30 + 60 <= rollbackSeconds` (every step may take 30 s and the rollback must still
+  be armed when the last one ends). `rollbackSeconds` is 0..900 for
   a read (it is part of the hash).
 - `sha256` = hex SHA-256 of `JSON.stringify({kind, steps, verify, rollback, safeChange,
   rollbackSeconds, backupName, changeLog})` (that key order; `changeLog` is `{kind, line}` or
@@ -390,10 +394,27 @@ Every `steps`, `verify` and `rollback` command is classified by the dialect rule
 (`Classifier(loadRules(dialect))`, `level` of the assignment). Any blocked command makes the whole
 request `blocked`: nothing connects, no credential is pulled.
 
-- `read`: every step must be class `read` and known (`unknown=false`).
+- `read`: every step must be class `read` and known (`unknown=false`) and pass the exec-read
+  policy, stricter than the console because no human reviews the line:
+  RouterOS needs an absolute path ending in a full read verb (`print`, `export` without `file=`,
+  `monitor` with `once` or `duration=`, `get`, `ping` with `count=`, `traceroute`) or a plain
+  `:put`/`:len`-style read; navigation (and abbreviations that classify as navigation), `[`, `;`,
+  `{`, `}`, `$`, `follow` and `interval=` are refused. Linux/Proxmox refuse glob and expansion
+  characters (`*?[]{}~`), `cd`, secret paths (shadow, gshadow, `id_*`, `ssh_host_*_key`, `*.key`,
+  `private`) and flags that write or act (`sort -o`, `uniq` with two files, `tree -o`, `xxd -r`,
+  `sar -o`, `dmesg -c/-C/--clear`, `ss -K`, `man -P/-H`, `yq -i`, `arping -U/-A`, `ping -f`,
+  `localectl|loginctl|resolvectl|timedatectl|hostnamectl` with a verb other than
+  `status|list*|show*`). VRP accepts `display`, `ping` and `tracert` only, without redirection.
 - `change`: a step or rollback command runs only when `decide(level, class)` is `allow` or
-  `confirm` (the technician approved it in the API); `double_confirm` and `block` are blocked and
-  `destructive` / `secret_read` are always blocked. `verify` must be `read` and known.
+  `confirm` (the technician approved it in the API); `double_confirm` and `block` are blocked,
+  `destructive` / `secret_read` are always blocked, and an `unknown` command is blocked. `verify`
+  must be `read`, known and pass the exec-read policy. No step or rollback command may disarm the
+  rollback: VRP `save`/`sa`, `schedule`/`undo schedule`, `startup`, `commit`, `reboot`, `quit`
+  (prefix abbreviations included); Linux anything naming `mns-rb-`, `systemctl stop|disable|mask|kill`
+  of timers, `systemd-run`, `at`, `batch`, `nohup`, `setsid`, `disown`, `crontab`, a trailing `&`,
+  `reboot|shutdown|poweroff|halt`; RouterOS only absolute commands and none of `:execute`,
+  `/import`, `/quit`, `/system script run`, `/system scheduler`, `/system reboot|shutdown`,
+  `/tool netwatch` (word prefixes such as `/sys sched` included) or rule `ros-script-exec`.
 - Commands run one per exec channel start at the root menu (RouterOS), so they are classified one
   by one; a shell session (RouterOS safe mode, VRP) keeps the menu between commands.
 
@@ -407,22 +428,36 @@ password/passphrase/key as literals). Raw output is never logged.
   (`null` when the device sends none). `read` vrp/other: shell with prompt detection (VRP
   `screen-length 0 temporary` first, output ignored); a command that does not return to the prompt
   ends the request `failed` (`COMMAND_TIMEOUT`).
-- `change` `routeros_safe_mode`: login `<user>+ct` on a PTY. `/export file=<backupName>`, Ctrl-X
+- `change` `routeros_safe_mode`: login `<user>+ct4096w` on a 4096-column PTY (no colors, no
+  terminal detection); the `-- [Q quit|D dump|down]` pager is answered `D`, and a lone CR starts a
+  new line for prompt detection. `/export file=<backupName>`, Ctrl-X
   (safe mode), each step (fails on the RouterOS error patterns), verification in a NEW SSH
   connection (same worker, same in-memory credential, same host key), Ctrl-X again (commit), the
-  change log script lines, `/export file=pos-<name>`, `/quit`. Any failure drops the socket without
-  logout (RouterOS reverts safe mode): `rolled_back`.
+  change log script lines, `/export file=pos-<name>`, `/quit`. Any failure before the commit drops
+  the socket without logout (RouterOS reverts safe mode): `rolled_back`. A Ctrl-X release whose
+  prompt does not come back in 10 s is `failed` / `RELEASE_UNCERTAIN` (socket dropped, state to be
+  checked). After the commit nothing turns the result into a failure: a later error (change log,
+  export, connection lost, abort) leaves `applied` with `CHANGELOG_FAILED`, `EXPORT_FAILED` or
+  `EXEC_ABORTED`.
 - `change` `vrp5_schedule_reboot`: `save <backupName>.cfg`, `schedule reboot delay 00:<mm>`
   (both answered `Y`), `system-view`, steps, `return`, verification in a NEW session, then
   `undo schedule reboot` and `save` (`Y`). A `[Y/N]` question during a step is answered `N` and
   fails the request. On failure nothing is saved and the device reboots into the saved
-  configuration: `rolled_back` with `rollback.pendingReboot: true`.
-- `change` `systemd_deadman`: `id -u` (non-root: system and AI commands run as
-  `sudo -n /bin/sh -c '<command>'`), `systemd-run --unit=mns-rb-<first 8 hex of requestUUID>
-  --on-active=<rollbackSeconds> ... /bin/sh -c 'echo <base64 of rollback> | base64 -d | /bin/sh'`
+  configuration: `rolled_back` with `rollback.pendingReboot: true`. The scheduled reboot reverts
+  the device to its startup (saved) configuration, so any other unsaved running change is lost
+  too; on success `save` stores the whole running configuration, including changes that were
+  pending before the request.
+- `change` `systemd_deadman`: `id -u` (non-root: system, AI and verify commands run as
+  `sudo -n /bin/sh -c '<command>'`), `systemd-run --unit=mns-rb-<32 hex of requestUUID>
+  --on-active=<rollbackSeconds> --timer-property=AccuracySec=1s --property=Type=oneshot
+  --property=TimeoutStartSec=120 /bin/sh -c 'echo <base64 of rollback> | base64 -d | /bin/sh'`
   (exit != 0: `failed`, nothing applied), steps, verification in a NEW connection, then
   `systemctl stop mns-rb-<id>.timer` and the change log line. A failing step or verification runs
-  `systemctl start mns-rb-<id>.service` and stops the timer: `rolled_back`.
+  `systemctl start mns-rb-<id>.service` and stops the timer: `rolled_back`; when that start exits
+  non-zero the timer is NOT stopped and the result is `failed` / `ROLLBACK_FAILED` with
+  `rollback.armed: true`. Linux verification needs exit code 0 (RouterOS accepts no exit status).
+- Time budget: before each step and before the commit, if more than `rollbackSeconds - 30 s` have
+  passed since the rollback was armed, the request rolls back (`DEADLINE`) instead of committing.
 - The finish reason is always `exec_done` (state `closed`) once a result exists, also for
   `blocked`, `failed` and `rolled_back`; host key, authentication and connection failures keep
   their usual reasons (`hostkey_mismatch`, `auth_failed`, `connect_failed`, ...) and also carry
@@ -464,10 +499,12 @@ Sent once per exec connection by the controller (Agent identity, like `/events`)
   code 124). `applied`: the change was verified and committed (`error` may carry
   `CHANGELOG_FAILED` / `EXPORT_FAILED` when only the documentation failed). `rolled_back`: the
   vendor rollback ran or is pending (`error.code` `STEP_FAILED`, `VERIFY_FAILED`,
-  `RELEASE_FAILED`, `CANCEL_FAILED`, `EXEC_ABORTED`, `CONNECTION_LOST`). `failed`: nothing was
+  `RELEASE_FAILED`, `CANCEL_FAILED`, `EXEC_ABORTED`, `CONNECTION_LOST`, `DEADLINE`). `failed`: nothing was
   committed or the state needs attention (`BACKUP_FAILED`, `SAFE_MODE_UNAVAILABLE`,
   `SCHEDULE_FAILED`, `ARM_FAILED`, `IDENTITY_UNKNOWN`, `SAVE_FAILED`, `DEADMAN_DISARM_FAILED`
-  (the timer may still revert the change), `PROMPT_TIMEOUT`, `COMMAND_TIMEOUT`, `AUTH_FAILED`,
+  (the timer may still revert the change), `ROLLBACK_FAILED`, `RELEASE_UNCERTAIN`,
+  `EXEC_REFUSED` (preflight or `gateway_full`; the result is posted before the finish, with the same
+  retry), `PROMPT_TIMEOUT`, `COMMAND_TIMEOUT`, `AUTH_FAILED`,
   `HOSTKEY_MISMATCH`, `HOSTKEY_REJECTED`, `CREDENTIAL_UNAVAILABLE`, `CONNECT_FAILED`,
   `EXEC_NO_RESULT`, `EXEC_INTERNAL`). `blocked`: `error.code` `EXEC_BLOCKED`, every step carries
   its class/rule/verdict, `output` empty.

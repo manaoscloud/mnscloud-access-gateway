@@ -94,14 +94,24 @@ export function execSha256(p: ExecPayload): string {
   return createHash('sha256').update(canonicalExec(p)).digest('hex');
 }
 
-function commands(value: unknown, label: string, min: number, max: number): string[] {
+function commands(
+  value: unknown,
+  label: string,
+  min: number,
+  max: number,
+  dialect: string,
+): string[] {
   if (!Array.isArray(value) || value.length < min || value.length > max) {
     throw new ExecPayloadError(`Invalid exec ${label}`);
   }
+  // Control characters (Tab included) could trigger completion or editing in a device shell, and
+  // `?` is inline help on RouterOS and VRP.
+  const inlineHelp = dialect === 'routeros' || dialect === 'vrp';
   for (const item of value) {
     if (
       typeof item !== 'string' || !item.trim() || item.length > MAX_COMMAND ||
-      /[\n\r\0]/.test(item)
+      // deno-lint-ignore no-control-regex
+      /[\x00-\x1f\x7f]/.test(item) || (inlineHelp && item.includes('?'))
     ) throw new ExecPayloadError(`Invalid exec ${label}`);
   }
   return value as string[];
@@ -123,6 +133,8 @@ export function parseExecPayload(
   dialect: string,
   connectionUUID: string,
 ): ExecPayload {
+  // The `other` dialect has no safe prompt handling: exec is refused for it, read or change.
+  if (!(dialect in SAFE_FOR_DIALECT)) throw new ExecPayloadError('Invalid exec dialect');
   const v = value as Record<string, unknown> | null;
   if (!v || typeof v !== 'object' || Array.isArray(v)) throw new ExecPayloadError('Invalid exec');
   if (Object.keys(v).some((key) => !KEYS.includes(key))) {
@@ -135,7 +147,7 @@ export function parseExecPayload(
     !(HEX32.test(v.requestUUID) || UUID_FORM.test(v.requestUUID)) ||
     requestHex(v.requestUUID) !== requestHex(connectionUUID)
   ) throw new ExecPayloadError('Invalid exec requestUUID');
-  const steps = commands(v.steps, 'steps', 1, 30);
+  const steps = commands(v.steps, 'steps', 1, 30, dialect);
   const safeChange = v.safeChange as SafeChange;
   if (
     !Number.isInteger(v.rollbackSeconds) || (v.rollbackSeconds as number) < 0 ||
@@ -159,10 +171,14 @@ export function parseExecPayload(
     if (!SAFE_FOR_DIALECT[dialect]?.includes(safeChange)) {
       throw new ExecPayloadError('Invalid exec safeChange');
     }
-    if (rollbackSeconds < 120) throw new ExecPayloadError('Invalid exec rollbackSeconds');
-    verify = commands(v.verify, 'verify', 1, 10);
-    if (safeChange === 'systemd_deadman') rollback = commands(v.rollback, 'rollback', 1, 30);
-    else if (!Array.isArray(v.rollback) || v.rollback.length) {
+    if (rollbackSeconds < 120 || steps.length * 30 + 60 > rollbackSeconds) {
+      // Every step may take 30 s and the rollback must still be armed when the last one ends.
+      throw new ExecPayloadError('Invalid exec rollbackSeconds');
+    }
+    verify = commands(v.verify, 'verify', 1, 10, dialect);
+    if (safeChange === 'systemd_deadman') {
+      rollback = commands(v.rollback, 'rollback', 1, 30, dialect);
+    } else if (!Array.isArray(v.rollback) || v.rollback.length) {
       throw new ExecPayloadError('Invalid exec rollback');
     }
     if (typeof v.backupName !== 'string' || !BACKUP.test(v.backupName)) {
@@ -206,4 +222,33 @@ export function parseExecPayload(
   };
   if (execSha256(payload) !== v.sha256) throw new ExecPayloadError('EXEC_PAYLOAD_MISMATCH');
   return payload;
+}
+
+const STATUSES = ['ok', 'blocked', 'failed', 'applied', 'rolled_back'];
+const METHODS = ['safe_mode', 'scheduled_reboot', 'deadman_timer', 'none'];
+
+/** Light shape and size check of a result produced by the worker (before it is posted). */
+export function validExecResult(value: unknown): value is ExecResult {
+  const r = value as ExecResult | null;
+  if (!r || typeof r !== 'object' || !STATUSES.includes(r.status)) return false;
+  if (!Array.isArray(r.steps) || r.steps.length > 200) return false;
+  const rb = r.rollback;
+  if (
+    !rb || !METHODS.includes(rb.method) || typeof rb.armed !== 'boolean' ||
+    typeof rb.fired !== 'boolean' || typeof rb.pendingReboot !== 'boolean'
+  ) return false;
+  if (
+    r.error !== null &&
+    (typeof r.error?.code !== 'string' || typeof r.error?.message !== 'string')
+  ) return false;
+  for (const step of r.steps) {
+    if (
+      !step || typeof step.command !== 'string' || typeof step.output !== 'string' ||
+      typeof step.truncated !== 'boolean' ||
+      !['system', 'step', 'verify', 'rollback'].includes(step.phase) ||
+      !['allowed', 'blocked'].includes(step.verdict) ||
+      (step.exitCode !== null && !Number.isInteger(step.exitCode))
+    ) return false;
+  }
+  return new TextEncoder().encode(JSON.stringify(r)).length <= 1024 * 1024;
 }
