@@ -260,6 +260,13 @@ connection attempt). `data`:
 { "credentialUseUUID": "uuid", "wrapToken": "<OpenBao response-wrapping token>", "ttlSeconds": 30 }
 ```
 
+`POST /connections/:uuid/credential?role=new` (query `role`, absent means `current`) is the same
+call for the staged replacement of a credential rotation (exec kind `rotate` only, section 13): the
+API answers it only for an exec connection of kind `rotate` in the rotating state and issues the
+wrapped read of the staged value. The gateway asks for `role=new` only after the first login with
+the current credential, and refuses to ask for it on any other connection. Each role has its own
+`credentialUseUUID`.
+
 The gateway unwraps it at `<openvault.address>/v1/sys/wrapping/unwrap` (header `X-Vault-Token`). The
 unwrapped secret (`data`, or `data.data` for KV v2) holds `username` (optional; else the assignment
 username) and `password` and/or `privateKey` (`private_key` accepted) and optional `passphrase`.
@@ -267,7 +274,10 @@ username) and `password` and/or `privateKey` (`private_key` accepted) and option
 ### 5.2 `POST /connections/:uuid/credential/result`
 
 `{ "credentialUseUUID": "uuid", "result": "used | auth_failed | unwrap_failed | unused" }` ->
-`finishConnectionCredentialUse`. `data`: ignored.
+`finishConnectionCredentialUse`. `data`: ignored. The use (and so the role) is identified by
+`credentialUseUUID`; a rotation reports one result per role: `current` (the first login) and `new`
+(`used` when the verification login with the replacement worked, `auth_failed` when the device
+refused it, `unused` when the request ended before that login).
 
 ## 6. `POST /connections/:uuid/events`
 
@@ -351,7 +361,7 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
 
 ```json
 {
-  "kind": "read | change",
+  "kind": "read | change | rotate",
   "requestUUID": "<the connectionUUID: 32 hex or the dashed form, any case>",
   "steps": ["1..30 commands, each <= 1000 chars, no CR/LF/NUL"],
   "verify": ["change only: 1..10 read commands, run in a NEW SSH session"],
@@ -363,6 +373,7 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
     "kind": "script | file | report_only",
     "line": "<=300 printable ASCII, no quotes, backslash, $, backtick, ; ? [ ] { } | & < >"
   },
+  "autonomous": "optional boolean, change only (runbooks); default false",
   "sha256": "<hex sha256 of the canonical JSON>"
 }
 ```
@@ -378,15 +389,65 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
   `steps.length * 30 + 60 <= rollbackSeconds` (every step may take 30 s and the rollback must still
   be armed when the last one ends). `rollbackSeconds` is 0..900 for
   a read (it is part of the hash).
+- `autonomous` (change only, ST-H runbooks): when `true`, every change step must classify `read`
+  or `write_low` and be known; anything else makes the request `blocked` (`EXEC_BLOCKED`, the
+  step carries `rule: "autonomous"` and verdict `blocked`) before anything connects. Rollback
+  steps keep the change policy. `true` on a `read` or `rotate` is refused; `false` is accepted and
+  means the same as absent.
 - `sha256` = hex SHA-256 of `JSON.stringify({kind, steps, verify, rollback, safeChange,
   rollbackSeconds, backupName, changeLog})` (that key order; `changeLog` is `{kind, line}` or
-  `null`). The gateway recomputes it in the controller and again in the worker. A mismatch (or any
+  `null`), with `"autonomous":true` appended as the LAST key only when `autonomous` is `true`, so a
+  payload without it keeps its hash. The gateway recomputes it in the controller and again in the worker. A mismatch (or any
   invalid payload) is refused before anything runs: `POST /exec-result` with status `failed` and
   `error.code` `EXEC_PAYLOAD_MISMATCH` (`EXEC_INVALID_ASSIGNMENT` otherwise), then `finish`
   `refused` with reason `exec_payload_mismatch` (`invalid_assignment`).
-- A `change` over `transport: connector` is refused (`finish` `refused`,
+- A `change` or `rotate` over `transport: connector` is refused (`finish` `refused`,
   `exec_change_unsupported_transport`): the verification needs a second SSH connection and the
   connector bridge carries one stream.
+
+### Kind `rotate` (password rotation, ST-H)
+
+Changes the password of the login user on the device, under the vendor rollback, and proves the
+new password with a NEW SSH login. Password credentials only. Payload: `steps` MUST be `[]` (the
+gateway builds the change from the fixed templates below; the API never sends the password),
+`verify` 1..5 read commands, `rollback` `[]`, `safeChange` as for the dialect (`routeros_safe_mode`,
+`vrp5_schedule_reboot`, `systemd_deadman`), `rollbackSeconds` 120..900, `backupName` and `changeLog`
+as for a change, `sha256` as for a change. Only `verify` is classified (read, known, exec-read
+policy); the templates are fixed gateway commands and are not classified.
+
+Credentials: the first login uses the `current` credential (`role` absent); before anything is
+changed the gateway asks for the `new` one (`need_credential` with `role: "new"` over IPC, API call
+`POST /connections/:uuid/credential?role=new`). Both secrets are registered for redaction.
+
+- `new.username` (default: the assignment username) must equal the current username, else the
+  request ends `blocked` with `error.code` `CREDENTIAL_MISMATCH` (nothing was changed; the first
+  login is the only connection).
+- The new password must match `^[A-Za-z0-9._~+=-]{16,64}$` and differ from the current one, and the
+  user must match `^[A-Za-z0-9._@-]{1,64}$` (linux/proxmox `^[a-z_][a-z0-9_-]{0,31}$`), else
+  `failed` / `CREDENTIAL_UNSAFE` before any change. A `current` credential without a password is
+  `failed` / `CREDENTIAL_UNSUPPORTED`. An unavailable `new` credential is `failed` /
+  `CREDENTIAL_UNAVAILABLE` (finish `credential_unavailable`).
+- `routeros`: the `change` safe-mode flow with the step `/user set [find name="<user>"]
+  password="<new>"`.
+- `vrp`: the `change` schedule-reboot flow with the steps `aaa`, `local-user <user> password
+  irreversible-cipher <new>`, `quit` (then `return`).
+- `linux`/`proxmox` (root, or `sudo -n`): the current hash is read with `getent shadow <user>` (as
+  root; the line is kept in memory only, registered for redaction, never recorded; a locked,
+  empty or unreadable hash is `failed` / `SHADOW_UNAVAILABLE` and nothing is changed). A root-only
+  rollback script `/run/mns-rb-<32 hex>.sh` (`chpasswd -e <<'EOF'` / `<user>:<hash>` / `EOF`) is
+  written through stdin (`install -m 600 /dev/stdin <file>`, never argv; failure:
+  `ROLLBACK_SCRIPT_FAILED`), the dead-man timer runs it (`systemd-run --unit=mns-rb-<id> ...
+  /bin/sh <file>`), the change is `chpasswd` with `<user>:<new>` on stdin (never argv), and after a
+  good verification the timer is stopped and the file removed (`ROLLBACK_SCRIPT_REMAINS` on an
+  `applied` result when the removal failed). A failing step or verification starts the service
+  (restores the hash), stops the timer and removes the file.
+- Recorded step commands never carry the password: `/user set [find name="<user>"]
+  password=<redacted>`, `local-user <user> password irreversible-cipher <redacted>`, `chpasswd`.
+- Verification opens a NEW SSH connection that authenticates with the NEW password only (never the
+  old credential, never a key) and runs the `verify` commands as for a change; the commit follows the
+  vendor flow of a change. A refused new login rolls back (`VERIFY_FAILED`, old password valid
+  again) and reports `credential_result` `role: "new"` `auth_failed` for the `new` use.
+- Result: `applied | rolled_back | failed | blocked` with the `rollback` block as for a change.
 
 ### Policy (before anything runs)
 
@@ -405,6 +466,7 @@ request `blocked`: nothing connects, no credential is pulled.
   `sar -o`, `dmesg -c/-C/--clear`, `ss -K`, `man -P/-H`, `yq -i`, `arping -U/-A`, `ping -f`,
   `localectl|loginctl|resolvectl|timedatectl|hostnamectl` with a verb other than
   `status|list*|show*`). VRP accepts `display`, `ping` and `tracert` only, without redirection.
+- `rotate`: only the `verify` commands are classified (as below).
 - `change`: a step or rollback command runs only when `decide(level, class)` is `allow` or
   `confirm` (the technician approved it in the API); `double_confirm` and `block` are blocked,
   `destructive` / `secret_read` are always blocked, and an `unknown` command is blocked. `verify`
@@ -499,15 +561,20 @@ Sent once per exec connection by the controller (Agent identity, like `/events`)
   code 124). `applied`: the change was verified and committed (`error` may carry
   `CHANGELOG_FAILED` / `EXPORT_FAILED` when only the documentation failed). `rolled_back`: the
   vendor rollback ran or is pending (`error.code` `STEP_FAILED`, `VERIFY_FAILED`,
-  `RELEASE_FAILED`, `CANCEL_FAILED`, `EXEC_ABORTED`, `CONNECTION_LOST`, `DEADLINE`). `failed`: nothing was
+  `CANCEL_FAILED`, `EXEC_ABORTED`, `CONNECTION_LOST`, `DEADLINE`). `failed`: nothing was
   committed or the state needs attention (`BACKUP_FAILED`, `SAFE_MODE_UNAVAILABLE`,
   `SCHEDULE_FAILED`, `ARM_FAILED`, `IDENTITY_UNKNOWN`, `SAVE_FAILED`, `DEADMAN_DISARM_FAILED`
-  (the timer may still revert the change), `ROLLBACK_FAILED`, `RELEASE_UNCERTAIN`,
+  (the timer may still revert the change), `ROLLBACK_FAILED`, `RELEASE_UNCERTAIN` (a RouterOS
+  release whose prompt never came back; the socket is dropped and the device state must be
+  checked; it replaced the former `RELEASE_FAILED` of the rollback list), `CREDENTIAL_UNSAFE`,
+  `CREDENTIAL_UNSUPPORTED`, `SHADOW_UNAVAILABLE`, `ROLLBACK_SCRIPT_FAILED` (rotate),
   `EXEC_REFUSED` (preflight or `gateway_full`; the result is posted before the finish, with the same
   retry), `PROMPT_TIMEOUT`, `COMMAND_TIMEOUT`, `AUTH_FAILED`,
   `HOSTKEY_MISMATCH`, `HOSTKEY_REJECTED`, `CREDENTIAL_UNAVAILABLE`, `CONNECT_FAILED`,
-  `EXEC_NO_RESULT`, `EXEC_INTERNAL`). `blocked`: `error.code` `EXEC_BLOCKED`, every step carries
-  its class/rule/verdict, `output` empty.
+  `EXEC_NO_RESULT`, `EXEC_INTERNAL`). `blocked`: `error.code` `EXEC_BLOCKED` (also an
+  `autonomous` change with a step that is not read/write_low, rule `autonomous`) or, for a
+  rotation, `CREDENTIAL_MISMATCH`; every blocked step carries its class/rule/verdict, `output`
+  empty.
 - `system` steps are the gateway's own commands (backup, safe mode, `id -u`, arming, change log);
   their `class` is `null`. The AI `rollback` commands are executed by the device (timer script),
   so only the commands the gateway runs to fire the rollback appear in phase `rollback`.

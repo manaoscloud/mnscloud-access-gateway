@@ -4,7 +4,7 @@
 
 import { createHash } from 'node:crypto';
 
-export type ExecKind = 'read' | 'change';
+export type ExecKind = 'read' | 'change' | 'rotate';
 export type SafeChange = 'routeros_safe_mode' | 'vrp5_schedule_reboot' | 'systemd_deadman' | 'none';
 export type ChangeLogKind = 'script' | 'file' | 'report_only';
 
@@ -18,6 +18,11 @@ export interface ExecPayload {
   rollbackSeconds: number;
   backupName: string | null;
   changeLog: { kind: ChangeLogKind; line: string } | null;
+  /**
+   * Change only (runbooks, ST-H): the steps must classify `read` or `write_low`. Part of the
+   * canonical JSON only when true, so payloads without it keep their hash.
+   */
+  autonomous?: boolean;
   sha256: string;
 }
 
@@ -62,6 +67,7 @@ const KEYS = [
   'rollbackSeconds',
   'backupName',
   'changeLog',
+  'autonomous',
   'sha256',
 ];
 const HEX32 = /^[0-9a-f]{32}$/i;
@@ -87,6 +93,8 @@ export function canonicalExec(p: ExecPayload): string {
     rollbackSeconds: p.rollbackSeconds,
     backupName: p.backupName,
     changeLog: p.changeLog ? { kind: p.changeLog.kind, line: p.changeLog.line } : null,
+    // Appended last and only when true: ST-F payloads keep their sha256.
+    ...(p.autonomous === true ? { autonomous: true } : {}),
   });
 }
 
@@ -140,14 +148,29 @@ export function parseExecPayload(
   if (Object.keys(v).some((key) => !KEYS.includes(key))) {
     throw new ExecPayloadError('Invalid exec field');
   }
-  if (v.kind !== 'read' && v.kind !== 'change') throw new ExecPayloadError('Invalid exec kind');
+  if (v.kind !== 'read' && v.kind !== 'change' && v.kind !== 'rotate') {
+    throw new ExecPayloadError('Invalid exec kind');
+  }
   const kind = v.kind;
   if (
     typeof v.requestUUID !== 'string' ||
     !(HEX32.test(v.requestUUID) || UUID_FORM.test(v.requestUUID)) ||
     requestHex(v.requestUUID) !== requestHex(connectionUUID)
   ) throw new ExecPayloadError('Invalid exec requestUUID');
-  const steps = commands(v.steps, 'steps', 1, 30, dialect);
+  // A rotation builds its change from fixed per-dialect templates: the API sends no step.
+  const steps = kind === 'rotate' ? commands(v.steps, 'steps', 0, 0, dialect) : commands(
+    v.steps,
+    'steps',
+    1,
+    30,
+    dialect,
+  );
+  if (v.autonomous !== undefined && typeof v.autonomous !== 'boolean') {
+    throw new ExecPayloadError('Invalid exec autonomous');
+  }
+  if (v.autonomous === true && kind !== 'change') {
+    throw new ExecPayloadError('Invalid exec autonomous');
+  }
   const safeChange = v.safeChange as SafeChange;
   if (
     !Number.isInteger(v.rollbackSeconds) || (v.rollbackSeconds as number) < 0 ||
@@ -165,6 +188,7 @@ export function parseExecPayload(
       v.rollback.length || v.backupName !== null || v.changeLog !== null
     ) throw new ExecPayloadError('Invalid exec read');
   } else {
+    // `change` and `rotate` share the vendor safety net, backup and change log rules.
     if (!SAFE_CHANGES.includes(safeChange as string)) {
       throw new ExecPayloadError('Invalid exec safeChange');
     }
@@ -175,8 +199,13 @@ export function parseExecPayload(
       // Every step may take 30 s and the rollback must still be armed when the last one ends.
       throw new ExecPayloadError('Invalid exec rollbackSeconds');
     }
-    verify = commands(v.verify, 'verify', 1, 10, dialect);
-    if (safeChange === 'systemd_deadman') {
+    verify = commands(v.verify, 'verify', 1, kind === 'rotate' ? 5 : 10, dialect);
+    if (kind === 'rotate') {
+      // The gateway builds the rollback itself (RouterOS safe mode, VRP reboot, root-only script).
+      if (!Array.isArray(v.rollback) || v.rollback.length) {
+        throw new ExecPayloadError('Invalid exec rollback');
+      }
+    } else if (safeChange === 'systemd_deadman') {
       rollback = commands(v.rollback, 'rollback', 1, 30, dialect);
     } else if (!Array.isArray(v.rollback) || v.rollback.length) {
       throw new ExecPayloadError('Invalid exec rollback');
@@ -218,6 +247,7 @@ export function parseExecPayload(
     rollbackSeconds,
     backupName,
     changeLog,
+    ...(v.autonomous === true ? { autonomous: true } : {}),
     sha256: v.sha256,
   };
   if (execSha256(payload) !== v.sha256) throw new ExecPayloadError('EXEC_PAYLOAD_MISMATCH');

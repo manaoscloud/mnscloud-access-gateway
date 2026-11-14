@@ -44,8 +44,16 @@ export interface WorkerInit {
   exec?: ExecPayload;
 }
 
+/**
+ * Which credential a request is about. `current` is the device login (every connection); `new` is
+ * the staged replacement of a credential rotation (exec kind `rotate` only).
+ */
+export type CredentialRole = 'current' | 'new';
+
 export interface WorkerCredential {
   t: 'credential';
+  /** Absent means `current`. */
+  role?: CredentialRole;
   username?: string;
   password?: string;
   privateKey?: string;
@@ -55,7 +63,7 @@ export interface WorkerCredential {
 export type ControllerToWorker =
   | WorkerInit
   | WorkerCredential
-  | { t: 'credential_unavailable' }
+  | { t: 'credential_unavailable'; role?: CredentialRole }
   | { t: 'hostkey_decision'; accept: boolean }
   | { t: 'input'; d: string }
   | { t: 'resize'; cols: number; rows: number }
@@ -93,8 +101,8 @@ export type WorkerToController =
     fingerprint: string;
     result: 'match' | 'mismatch' | 'unpinned';
   }
-  | { t: 'need_credential' }
-  | { t: 'credential_result'; result: 'used' | 'auth_failed' }
+  | { t: 'need_credential'; role?: CredentialRole }
+  | { t: 'credential_result'; role?: CredentialRole; result: 'used' | 'auth_failed' }
   | { t: 'ready' }
   | { t: 'output'; d: string }
   | { t: 'control'; m: ControlMessage }

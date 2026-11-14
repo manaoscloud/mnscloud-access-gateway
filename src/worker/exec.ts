@@ -17,7 +17,12 @@ import {
   requestHex,
 } from '../shared/exec.ts';
 import type { CommandClass } from '../shared/framing.ts';
-import type { WorkerCredential, WorkerInit, WorkerToController } from '../shared/ipc.ts';
+import type {
+  CredentialRole,
+  WorkerCredential,
+  WorkerInit,
+  WorkerToController,
+} from '../shared/ipc.ts';
 import { Classifier } from './classifier.ts';
 import { deadlineExceeded, disarmsRollback, readProblem } from './exec_policy.ts';
 import { decide } from './policy.ts';
@@ -49,7 +54,7 @@ export interface ExecHelpers {
     fingerprint: string,
     pinned: string | null,
   ): Promise<boolean>;
-  requestCredential(): Promise<WorkerCredential | null>;
+  requestCredential(role?: CredentialRole): Promise<WorkerCredential | null>;
   fingerprintOf(key: Uint8Array): string;
   algorithmOf(key: Uint8Array): string;
   onClose(handler: (reason: string) => void): void;
@@ -73,6 +78,13 @@ class ExecAbort extends Error {
     super('aborted');
   }
 }
+
+/** Credential rotation (ST-H): what the gateway accepts as the new password and user. */
+export const NEW_PASSWORD = /^[A-Za-z0-9._~+=-]{16,64}$/;
+const DEVICE_USER = /^[A-Za-z0-9._@-]{1,64}$/;
+const LINUX_USER = /^[a-z_][a-z0-9_-]{0,31}$/;
+/** A crypt(3) hash as `getent shadow` prints it (locked or empty fields never match). */
+const SHADOW_HASH = /^\$[0-9a-z]+\$[./A-Za-z0-9$]+$/;
 
 const ROS_ERROR =
   /^(failure|bad command|syntax error|expected |input does not match|no such item|ambiguous value|invalid value|value of [^ ]+ out of range|Script Error|ERROR)/im;
@@ -117,6 +129,7 @@ export function planExec(
     phase: ExecPhase,
     mode: 'read' | 'change',
     shared: boolean,
+    autonomous = false,
   ) => {
     // Commands that run one per exec channel always start at the root menu; a shell keeps it.
     const kept = shared ? new Classifier(rules) : null;
@@ -136,11 +149,17 @@ export function planExec(
         const decision = decide(level, c.class);
         allowed = decision === 'allow' || decision === 'confirm';
       }
+      let rule = c.rule;
+      // Autonomous runbook step: only read and write_low, never an unknown line.
+      if (allowed && autonomous && !(c.class === 'read' || c.class === 'write_low')) {
+        allowed = false;
+        rule = 'autonomous';
+      }
       items.push({
         phase,
         command,
         class: c.class,
-        rule: c.rule,
+        rule,
         unknown: c.unknown,
         verdict: allowed ? 'allowed' : 'blocked',
       });
@@ -148,8 +167,12 @@ export function planExec(
   };
   if (exec.kind === 'read') {
     classify(exec.steps, 'step', 'read', false);
+  } else if (exec.kind === 'rotate') {
+    // The change itself comes from fixed per-dialect templates built in the worker; only the
+    // verify reads are the API's.
+    classify(exec.verify, 'verify', 'read', false);
   } else {
-    classify(exec.steps, 'step', 'change', stateful);
+    classify(exec.steps, 'step', 'change', stateful, exec.autonomous === true);
     classify(exec.verify, 'verify', 'read', false);
     classify(exec.rollback, 'rollback', 'change', false);
   }
@@ -194,8 +217,13 @@ interface ChannelResult {
   lost: boolean;
 }
 
-// deno-lint-ignore no-explicit-any
-function execChannel(client: any, command: string, timeoutMs: number): Promise<ChannelResult> {
+function execChannel(
+  // deno-lint-ignore no-explicit-any
+  client: any,
+  command: string,
+  timeoutMs: number,
+  stdin?: string,
+): Promise<ChannelResult> {
   return new Promise((resolve) => {
     const chunks: Uint8Array[] = [];
     let size = 0;
@@ -245,6 +273,8 @@ function execChannel(client: any, command: string, timeoutMs: number): Promise<C
       s.on('data', add);
       s.stderr?.on('data', add);
       s.on('close', (exitCode: unknown) => done(typeof exitCode === 'number' ? exitCode : null));
+      // Secrets travel on stdin, never in the command line.
+      if (stdin !== undefined) s.end(stdin);
     });
   });
 }
@@ -410,6 +440,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   const level = init.level;
   const dialect = init.shellDialect;
   const hex = requestHex(exec.requestUUID);
+  const rotation = exec.kind === 'rotate';
 
   const result: ExecResult = {
     status: 'failed',
@@ -429,10 +460,12 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     truncated: boolean,
     ms: number,
     plan?: PlannedCommand,
+    /** A fixed text built by the gateway with the secret already left out. */
+    literal = false,
   ) => {
     result.steps.push({
       phase,
-      command: redactor.redactText(command),
+      command: literal ? command : redactor.redactText(command),
       class: plan?.class ?? null,
       rule: plan?.rule ?? null,
       verdict: 'allowed',
@@ -477,8 +510,14 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   h.onClose((reason) => abortNow(new ExecAbort(reason)));
   const guard = <T>(p: Promise<T>): Promise<T> => Promise.race([p, aborted]);
 
-  const secrets: { credential: WorkerCredential | null; fingerprint: string | null } = {
+  const secrets: {
+    credential: WorkerCredential | null;
+    /** Rotation only: the replacement password, the only credential the verify login may use. */
+    next: WorkerCredential | null;
+    fingerprint: string | null;
+  } = {
     credential: null,
+    next: null,
     fingerprint: null,
   };
   const clients: { end(): void; destroy(): void }[] = [];
@@ -572,10 +611,12 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         ) => {
           const advance = () => next(attempts?.shift() ?? false);
           if (attempts) return advance();
+          // A rotation verifies with the NEW password only: the old credential must not log in.
+          const passwordOnly = rotation && role === 'verify';
           const build = (received: WorkerCredential) => {
             const username = (received.username || init.username) + suffix;
             const list: Record<string, unknown>[] = [];
-            if (received.privateKey) {
+            if (received.privateKey && !passwordOnly) {
               list.push({
                 type: 'publickey',
                 username,
@@ -601,6 +642,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
             attempts = list;
             advance();
           };
+          if (passwordOnly) {
+            if (secrets.next?.password) return build(secrets.next);
+            return next(false);
+          }
           if (secrets.credential) return build(secrets.credential);
           h.requestCredential().then((received) => {
             if (!received || (!received.password && !received.privateKey)) {
@@ -653,9 +698,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     command: string,
     wire = command,
     timeoutMs = COMMAND_TIMEOUT_MS,
+    stdin?: string,
   ) => {
     const started = Date.now();
-    const r = await guard(execChannel(client, wire, timeoutMs));
+    const r = await guard(execChannel(client, wire, timeoutMs, stdin));
     const output = cleanOutput(redactor, r.raw, r.truncated);
     record(
       phase,
@@ -677,6 +723,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     command: string,
     timeoutMs: number,
     answer: 'Y' | 'N' | null,
+    display = command,
   ) => {
     const started = Date.now();
     const run = await guard(runInShell(shell, command, timeoutMs, answer));
@@ -688,12 +735,13 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     }
     record(
       phase,
-      command,
+      display,
       run.timedOut ? 124 : null,
       output,
       truncated,
       Date.now() - started,
-      planOf(phase, command),
+      planOf(phase, display),
+      display !== command,
     );
     if (run.closed) throw new ExecFail('CONNECTION_LOST');
     return { run, output };
@@ -702,11 +750,11 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   const connectFirst = async (suffix: string) => {
     try {
       const conn = await guard(connect('first', suffix));
-      h.send({ t: 'credential_result', result: 'used' });
+      h.send({ t: 'credential_result', role: 'current', result: 'used' });
       return conn;
     } catch (error) {
       if (error instanceof ExecFail && error.reason === 'auth_failed') {
-        h.send({ t: 'credential_result', result: 'auth_failed' });
+        h.send({ t: 'credential_result', role: 'current', result: 'auth_failed' });
       }
       throw error;
     }
@@ -720,7 +768,16 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     const before = clients.length;
     let connection: { end(): void; destroy(): void } | null = null;
     const work = (async () => {
-      connection = await connect('verify', '');
+      try {
+        connection = await connect('verify', '');
+      } catch (error) {
+        // The replacement password did not log in: report it for the credential use.
+        if (rotation && error instanceof ExecFail && error.reason === 'auth_failed') {
+          h.send({ t: 'credential_result', role: 'new', result: 'auth_failed' });
+        }
+        throw error;
+      }
+      if (rotation) h.send({ t: 'credential_result', role: 'new', result: 'used' });
       const client = raw(connection);
       if (dialect === 'vrp') {
         const shell = await openShell(client, (view) => VRP_PROMPT.test('\n' + lastLineOf(view)));
@@ -757,6 +814,80 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     }
     return ok;
   };
+
+  // --- credential rotation (kind rotate) ------------------------------------------------------
+
+  interface Rotation {
+    user: string;
+    password: string;
+  }
+  interface ChangeStep {
+    command: string;
+    /** What the result records when the command carries a secret. */
+    display?: string;
+  }
+
+  /**
+   * Fetches and checks the replacement credential before anything is changed. Returns null after
+   * emitting `blocked` (CREDENTIAL_MISMATCH) or `failed` (CREDENTIAL_UNSAFE, CREDENTIAL_UNSUPPORTED);
+   * the caller then closes the connection.
+   */
+  const prepareRotation = async (): Promise<Rotation | null> => {
+    const current = secrets.credential;
+    const refuse = (status: 'blocked' | 'failed', code: string, message: string) => {
+      emit(status, { code, message });
+      return null;
+    };
+    if (!current?.password) {
+      return refuse(
+        'failed',
+        'CREDENTIAL_UNSUPPORTED',
+        'Only a password credential can be rotated; nothing was changed.',
+      );
+    }
+    const received = await guard(h.requestCredential('new'));
+    if (!received?.password) {
+      throw new ExecFail('CREDENTIAL_UNAVAILABLE', 'failed', 'credential_unavailable');
+    }
+    secrets.next = received;
+    const user = current.username || init.username;
+    if ((received.username || init.username) !== user) {
+      return refuse(
+        'blocked',
+        'CREDENTIAL_MISMATCH',
+        'The new credential belongs to another user; nothing was changed.',
+      );
+    }
+    const userOk = DEVICE_USER.test(user) &&
+      (dialect === 'linux' || dialect === 'proxmox' ? LINUX_USER.test(user) : true);
+    if (
+      !userOk || !NEW_PASSWORD.test(received.password) || received.password === current.password
+    ) {
+      return refuse(
+        'failed',
+        'CREDENTIAL_UNSAFE',
+        'The new credential is not acceptable; nothing was changed.',
+      );
+    }
+    return { user, password: received.password };
+  };
+
+  const rotationSteps = (r: Rotation): ChangeStep[] =>
+    dialect === 'routeros'
+      ? [{
+        command: `/user set [find name="${r.user}"] password="${r.password}"`,
+        display: `/user set [find name="${r.user}"] password=<redacted>`,
+      }]
+      : [
+        { command: 'aaa' },
+        {
+          command: `local-user ${r.user} password irreversible-cipher ${r.password}`,
+          display: `local-user ${r.user} password irreversible-cipher <redacted>`,
+        },
+        { command: 'quit' },
+      ];
+
+  const plainSteps = (): ChangeStep[] => exec.steps.map((command) => ({ command }));
 
   // --- flows ------------------------------------------------------------------------------------
 
@@ -800,6 +931,15 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       emit('rolled_back', { code, message });
     };
     try {
+      let steps = plainSteps();
+      if (rotation) {
+        const rot = await prepareRotation();
+        if (!rot) {
+          conn.end();
+          return;
+        }
+        steps = rotationSteps(rot);
+      }
       const shell = await openShell(
         raw(conn),
         (view) => ROS_PROMPT.test(lastLineOf(view)),
@@ -845,12 +985,19 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       armedAt = Date.now();
       result.rollback = { method: 'safe_mode', armed: true, fired: false, pendingReboot: false };
       // 3. the steps
-      for (const command of exec.steps) {
+      for (const { command, display } of steps) {
         if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
           rollBackBySocket('DEADLINE', 'The time budget of the change ran out; it was reverted.');
           return;
         }
-        const { run, output } = await runShell(shell, 'step', command, STEP_TIMEOUT_MS, null);
+        const { run, output } = await runShell(
+          shell,
+          'step',
+          command,
+          STEP_TIMEOUT_MS,
+          null,
+          display,
+        );
         if (run.timedOut || run.unexpectedConfirm || ROS_ERROR.test(output)) {
           rollBackBySocket('STEP_FAILED', 'A step failed; safe mode reverted the changes.');
           return;
@@ -963,6 +1110,15 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     let scheduled = false;
     let armedAt = 0;
     try {
+      let steps = plainSteps();
+      if (rotation) {
+        const rot = await prepareRotation();
+        if (!rot) {
+          conn.end();
+          return;
+        }
+        steps = rotationSteps(rot);
+      }
       const shell = await openShell(raw(conn), (view) => VRP_PROMPT.test('\n' + lastLineOf(view)));
       if (!(await guard(shell.waitPrompt(PROMPT_TIMEOUT_MS)))) throw new ExecFail('PROMPT_TIMEOUT');
       await runInShell(shell, 'screen-length 0 temporary', COMMAND_TIMEOUT_MS, null);
@@ -1007,12 +1163,19 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         emit('rolled_back', { code, message });
       };
       let failed = !(await system('system-view'));
-      for (const command of failed ? [] : exec.steps) {
+      for (const { command, display } of failed ? [] : steps) {
         if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
           rollbackNow('DEADLINE', 'The time budget of the change ran out; the device reboots.');
           return;
         }
-        const { run, output } = await runShell(shell, 'step', command, STEP_TIMEOUT_MS, 'N');
+        const { run, output } = await runShell(
+          shell,
+          'step',
+          command,
+          STEP_TIMEOUT_MS,
+          'N',
+          display,
+        );
         if (run.timedOut || run.unexpectedConfirm || VRP_ERROR.test(output)) {
           failed = true;
           break;
@@ -1110,13 +1273,67 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       const asRoot = (command: string) =>
         uid === 0 ? command : `sudo -n /bin/sh -c ${shellQuote(command)}`;
       verifyWire = asRoot;
+      // Rotation: the new credential is checked, the current hash is kept in memory and written
+      // (stdin only, never argv) into a root-only rollback script the dead-man timer runs.
+      const scriptFile = `/run/${unit}.sh`;
+      const removeScript = async (): Promise<boolean> => {
+        const remove = `rm -f ${scriptFile}`;
+        const removed = await runChannel(client, 'system', remove, asRoot(remove));
+        return removed.exitCode === 0;
+      };
+      let rot: Rotation | null = null;
+      if (rotation) {
+        rot = await prepareRotation();
+        if (!rot) {
+          conn.end();
+          return;
+        }
+        const getent = `getent shadow ${rot.user}`;
+        const started = Date.now();
+        const shadow = await guard(execChannel(client, asRoot(getent), COMMAND_TIMEOUT_MS));
+        // The shadow line is a secret: only the exit code is recorded.
+        record('system', getent, shadow.exitCode, '', false, Date.now() - started);
+        if (shadow.lost) throw new ExecFail('CONNECTION_LOST');
+        const fields = shadow.raw.split('\n')[0].split(':');
+        const hash = fields[0] === rot.user ? fields[1] ?? '' : '';
+        if (shadow.exitCode !== 0 || !SHADOW_HASH.test(hash)) {
+          conn.end();
+          emit('failed', {
+            code: 'SHADOW_UNAVAILABLE',
+            message: 'The current password hash could not be read; nothing was changed.',
+          });
+          return;
+        }
+        redactor.addSecret(hash);
+        const install = `install -m 600 /dev/stdin ${scriptFile}`;
+        const content = `chpasswd -e <<'EOF'\n${rot.user}:${hash}\nEOF\n`;
+        const written = await runChannel(
+          client,
+          'system',
+          install,
+          asRoot(install),
+          COMMAND_TIMEOUT_MS,
+          content,
+        );
+        if (written.exitCode !== 0) {
+          await removeScript();
+          conn.end();
+          emit('failed', {
+            code: 'ROLLBACK_SCRIPT_FAILED',
+            message: 'The rollback script could not be written; nothing was changed.',
+          });
+          return;
+        }
+      }
       const script = Buffer.from(exec.rollback.join('\n'), 'utf8').toString('base64');
+      const unitCommand = rotation
+        ? `/bin/sh ${scriptFile}`
+        : `/bin/sh -c ${shellQuote(`echo ${script} | base64 -d | /bin/sh`)}`;
       const arm =
-        `systemd-run --unit=${unit} --on-active=${exec.rollbackSeconds} --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=120 /bin/sh -c ${
-          shellQuote(`echo ${script} | base64 -d | /bin/sh`)
-        }`;
+        `systemd-run --unit=${unit} --on-active=${exec.rollbackSeconds} --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=120 ${unitCommand}`;
       const armed_ = await runChannel(client, 'system', arm, asRoot(arm));
       if (armed_.exitCode !== 0) {
+        if (rotation) await removeScript();
         conn.end();
         emit('failed', {
           code: 'ARM_FAILED',
@@ -1152,6 +1369,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           return;
         }
         await runChannel(client, 'rollback', stop, asRoot(stop));
+        if (rotation) await removeScript();
         conn.end();
         result.rollback = {
           method: 'deadman_timer',
@@ -1161,12 +1379,22 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         };
         emit('rolled_back', { code, message });
       };
-      for (const command of exec.steps) {
+      const linuxSteps: { command: string; stdin?: string }[] = rot
+        ? [{ command: 'chpasswd', stdin: `${rot.user}:${rot.password}\n` }]
+        : plainSteps();
+      for (const { command, stdin } of linuxSteps) {
         if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
           await rollbackNow('DEADLINE', 'The time budget of the change ran out; rolled back.');
           return;
         }
-        const r = await runChannel(client, 'step', command, asRoot(command), STEP_TIMEOUT_MS);
+        const r = await runChannel(
+          client,
+          'step',
+          command,
+          asRoot(command),
+          STEP_TIMEOUT_MS,
+          stdin,
+        );
         if (r.exitCode !== 0) {
           await rollbackNow('STEP_FAILED', 'A step failed; the rollback commands were run.');
           return;
@@ -1208,10 +1436,16 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       };
       let documentation: ExecResult['error'] = null;
       try {
+        if (rotation && !(await removeScript())) {
+          documentation = {
+            code: 'ROLLBACK_SCRIPT_REMAINS',
+            message: 'The change was applied; the root-only rollback script was not removed.',
+          };
+        }
         if (exec.changeLog?.kind === 'file') {
           const line = `printf '%s\\n' '${exec.changeLog.line}' >> /etc/mnscloud-changelog`;
           const written = await runChannel(client, 'system', line, asRoot(line));
-          if (written.exitCode !== 0) {
+          if (written.exitCode !== 0 && !documentation) {
             documentation = {
               code: 'CHANGELOG_FAILED',
               message: 'The change was applied; the change log line was not written.',
@@ -1284,6 +1518,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     }
   } finally {
     secrets.credential = null;
+    secrets.next = null;
     for (const client of clients) client.end();
   }
   return finish!;

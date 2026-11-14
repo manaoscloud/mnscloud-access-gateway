@@ -11,7 +11,13 @@ import {
   utf8Length,
 } from '../shared/framing.ts';
 import { type ExecResult, validExecResult } from '../shared/exec.ts';
-import type { CommandEvent, Facts, WorkerInit, WorkerToController } from '../shared/ipc.ts';
+import type {
+  CommandEvent,
+  CredentialRole,
+  Facts,
+  WorkerInit,
+  WorkerToController,
+} from '../shared/ipc.ts';
 import type { Assignment, FinishBody, HostKeyResponse } from './contract.ts';
 import { type Bridge, startBridge } from './bridge.ts';
 import { MgmtVpnUnavailable, type SessionNet } from './netns.ts';
@@ -40,8 +46,10 @@ export interface SessionApi {
       result: 'match' | 'mismatch' | 'unpinned';
     },
   ): Promise<HostKeyResponse>;
+  /** `role` `new` (exec kind `rotate` only) pulls the staged replacement: `?role=new`. */
   credential(
     connection: string,
+    role?: CredentialRole,
   ): Promise<{ credentialUseUUID: string; wrapToken: string; ttlSeconds: number }>;
   credentialResult(
     connection: string,
@@ -228,7 +236,8 @@ export class Session {
   #recording: RecordingUploader | null = null;
   #facts: Facts | null = null;
   #execResult: ExecResult | null = null;
-  #credentialUse: string | null = null;
+  /** Open credential uses by role (a rotation holds a `current` and a `new` one). */
+  #credentialUse = new Map<CredentialRole, string>();
   #exit: Extract<WorkerToController, { t: 'exit' }> | null = null;
   #finished = false;
   #closeReason: string | null = null;
@@ -652,34 +661,44 @@ export class Session {
         break;
       }
       case 'need_credential': {
+        const role: CredentialRole = message.role ?? 'current';
         let use: string | null = null;
         try {
-          const grant = await this.deps.api.credential(this.uuid);
+          // The staged replacement exists only for a credential rotation.
+          if (role === 'new' && this.assignment.exec?.kind !== 'rotate') {
+            throw new Error('role new is only for exec kind rotate');
+          }
+          const grant = role === 'new'
+            ? await this.deps.api.credential(this.uuid, 'new')
+            : await this.deps.api.credential(this.uuid);
           use = grant.credentialUseUUID;
-          this.#credentialUse = use;
+          this.#credentialUse.set(role, use);
           const secret = await this.deps.unwrap(grant.wrapToken);
-          worker.send({ t: 'credential', ...secret });
+          worker.send({ t: 'credential', role, ...secret });
           this.#event('credential', { result: 'delivered' });
         } catch (error) {
           this.deps.log(
-            `connection ${this.uuid}: credential unavailable: ${(error as Error).message}`,
+            `connection ${this.uuid}: credential (${role}) unavailable: ${
+              (error as Error).message
+            }`,
           );
-          worker.send({ t: 'credential_unavailable' });
+          worker.send({ t: 'credential_unavailable', role });
           this.#event('credential', { result: 'unavailable' });
           if (use) {
             await this.deps.api.credentialResult(this.uuid, {
               credentialUseUUID: use,
               result: 'unwrap_failed',
             }).catch(() => {});
-            this.#credentialUse = null;
+            this.#credentialUse.delete(role);
           }
         }
         break;
       }
-      case 'credential_result':
-        if (this.#credentialUse) {
-          const use = this.#credentialUse;
-          this.#credentialUse = null;
+      case 'credential_result': {
+        const role: CredentialRole = message.role ?? 'current';
+        const use = this.#credentialUse.get(role);
+        if (use) {
+          this.#credentialUse.delete(role);
           await this.deps.api.credentialResult(this.uuid, {
             credentialUseUUID: use,
             result: message.result,
@@ -693,6 +712,7 @@ export class Session {
           );
         }
         break;
+      }
       case 'started':
         break;
     }
@@ -721,9 +741,10 @@ export class Session {
     const reason = this.#closeReason && exit.reason === 'gateway_closed'
       ? this.#closeReason
       : exit.reason;
-    if (this.#credentialUse) {
+    for (const [role, use] of [...this.#credentialUse]) {
+      this.#credentialUse.delete(role);
       await this.deps.api.credentialResult(this.uuid, {
-        credentialUseUUID: this.#credentialUse,
+        credentialUseUUID: use,
         result: 'unused',
       }).catch(() => {});
     }

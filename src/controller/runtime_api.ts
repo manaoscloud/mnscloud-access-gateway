@@ -7,6 +7,7 @@ import type {
   HostKeyResponse,
 } from './contract.ts';
 import type { ExecResult } from '../shared/exec.ts';
+import type { CredentialRole } from '../shared/ipc.ts';
 import {
   AttachRefused,
   type ConnectorAttachment,
@@ -85,10 +86,13 @@ export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
     return this.cp.call<HostKeyResponse>('POST', `/connections/${connection}/hostkey`, body);
   }
 
-  credential(connection: string) {
-    return this.cp.call<CredentialResponse>('POST', `/connections/${connection}/credential`, {
-      workerReady: true,
-    });
+  credential(connection: string, role?: CredentialRole) {
+    return this.cp.call<CredentialResponse>(
+      'POST',
+      `/connections/${connection}/credential`,
+      { workerReady: true },
+      role === 'new' ? { query: { role: 'new' } } : {},
+    );
   }
 
   async credentialResult(connection: string, body: Parameters<SessionApi['credentialResult']>[1]) {
