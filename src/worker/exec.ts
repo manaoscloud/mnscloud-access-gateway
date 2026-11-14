@@ -83,7 +83,7 @@ const PAGER = /-- \[Q quit\|D dump\|down\]/;
 const YES_NO = /\[Y\/N\]\s*:?\s*$/i;
 
 export function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 const lastLineOf = (text: string) => text.slice(text.lastIndexOf('\n') + 1);
