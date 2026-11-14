@@ -163,6 +163,16 @@ export interface ExecDeviceOptions {
   password?: string;
   /** The new password is refused at login (a device that stored it wrongly). */
   rejectNewPassword?: boolean;
+  /** VRP: names listed by `display local-user username <name>` (default ['support']). */
+  localUsers?: string[];
+  /** VRP: a plain `save` answers with an error and saves nothing. */
+  failSave?: boolean;
+  /** VRP: `undo schedule reboot` answers with an error. */
+  failUndo?: boolean;
+  /** Linux: armed timers fire by themselves after this many ms (a fast device clock). */
+  timerFireMs?: number;
+  /** Linux: an exec matching this is executed, then the connection drops without a reply. */
+  dropOn?: RegExp;
 }
 
 export interface ExecDevice {
@@ -254,6 +264,8 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
     const body = device.scripts.get(file) ?? '';
     const match = /^support:(\$6\$fake\$[0-9a-f]*)$/m.exec(body);
     if (match) device.password = unhash(match[1]);
+    // The script removes itself (`rm -f -- <file>`).
+    if (/^rm -f -- /m.test(body)) device.scripts.delete(file);
   };
   /** Strips `sudo -n /bin/sh -c '<command>'` (the way the gateway runs commands as non-root). */
   const unsudo = (command: string) => {
@@ -271,7 +283,8 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
           ? { stdout: `support:${hashOf(device.password)}:19000:0:99999:7:::\n`, code: 0 }
           : { code: 2 };
       }
-      const install = /^install -m 600 \/dev\/stdin (\/run\/mns-rb-[0-9a-f]+\.sh)$/.exec(command);
+      const install = /^(?:umask 077; )?install -m 600 \/dev\/stdin (\/run\/mns-rb-[0-9a-f]+\.sh)$/
+        .exec(command);
       if (install) {
         device.scripts.set(install[1], stdin);
         return { code: 0 };
@@ -285,7 +298,16 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
       const armTimer = /--unit=(mns-rb-[0-9a-f]+) .* \/bin\/sh (\/run\/mns-rb-[0-9a-f]+\.sh)$/
         .exec(command);
       if (armTimer) {
-        device.timers.set(armTimer[1], armTimer[2]);
+        const unit = armTimer[1];
+        device.timers.set(unit, armTimer[2]);
+        if (options.timerFireMs !== undefined) {
+          setTimeout(() => {
+            const file = device.timers.get(unit);
+            if (file === undefined) return;
+            device.timers.delete(unit);
+            runScript(file);
+          }, options.timerFireMs).unref?.();
+        }
         return { code: 0 };
       }
       const start = /^systemctl start (mns-rb-[0-9a-f]+)\.service$/.exec(command);
@@ -432,6 +454,15 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
         device.shellLines.push(command);
         if (command === 'display fail') {
           stream.write(`Error: Wrong parameter found at '^' position.\r\n${prompt()}`);
+        } else if (command.startsWith('display local-user username ')) {
+          const name = command.split(' ').at(-1)!;
+          const listed = (options.localUsers ?? ['support']).includes(name);
+          stream.write(
+            (listed
+              ? `User-name                : ${name}\r\n`
+              : 'Info: The user does not exist.\r\n') +
+              prompt(),
+          );
         } else if (command.startsWith('display')) {
           stream.write(`Huawei VRP simulated output\r\n${prompt()}`);
         } else if (command.startsWith('screen-length')) {
@@ -446,6 +477,10 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
           device.password = command.split(' ').at(-1)!;
           device.pending.push(command);
           stream.write(prompt());
+        } else if (command === 'save' && options.failSave) {
+          ask(command, 'Are you sure to save the configuration?', () => {
+            stream.write(`Error: Failed to save the configuration.\r\n${prompt()}`);
+          });
         } else if (command.startsWith('save')) {
           ask(command, 'Are you sure to save the configuration?', () => {
             device.saved = true;
@@ -458,6 +493,10 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
             device.scheduledReboot = true;
             device.events.push(`schedule:${command}`);
             stream.write(`Info: scheduled.\r\n${prompt()}`);
+          });
+        } else if (command === 'undo schedule reboot' && options.failUndo) {
+          ask(command, 'Info: Cancel the scheduled reboot. Confirm?', () => {
+            stream.write(`Error: Failed to cancel the reboot.\r\n${prompt()}`);
           });
         } else if (command === 'undo schedule reboot') {
           ask(command, 'Info: Cancel the scheduled reboot. Confirm?', () => {
@@ -510,7 +549,13 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
           const stream = ok();
           device.execs.push(info.command);
           const answer = (stdin: string) => {
+            const dropAfter = options.dropOn?.test(info.command) ?? false;
             const reply = options.respond?.(info.command) ?? defaultReply(info.command, stdin);
+            if (dropAfter) {
+              // The effect happened; the reply never reaches the client.
+              client.end();
+              return;
+            }
             if (reply.stdout) stream.write(reply.stdout);
             if (reply.stderr) stream.stderr.write(reply.stderr);
             if (reply.code !== null) stream.exit(reply.code ?? 0);

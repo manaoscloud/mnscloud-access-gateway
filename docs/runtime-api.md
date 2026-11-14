@@ -264,7 +264,9 @@ connection attempt). `data`:
 call for the staged replacement of a credential rotation (exec kind `rotate` only, section 13): the
 API answers it only for an exec connection of kind `rotate` in the rotating state and issues the
 wrapped read of the staged value. The gateway asks for `role=new` only after the first login with
-the current credential, and refuses to ask for it on any other connection. Each role has its own
+the current credential, and refuses to ask for it on any other connection (no API call is made;
+the worker gets `credential_unavailable`). Only `current` and `new` are valid roles; a second
+request for a role whose use is still open first reports that use as `unused`. Each role has its own
 `credentialUseUUID`.
 
 The gateway unwraps it at `<openvault.address>/v1/sys/wrapping/unwrap` (header `X-Vault-Token`). The
@@ -412,7 +414,9 @@ new password with a NEW SSH login. Password credentials only. Payload: `steps` M
 gateway builds the change from the fixed templates below; the API never sends the password),
 `verify` 1..5 read commands, `rollback` `[]`, `safeChange` as for the dialect (`routeros_safe_mode`,
 `vrp5_schedule_reboot`, `systemd_deadman`), `rollbackSeconds` 120..900, `backupName` and `changeLog`
-as for a change, `sha256` as for a change. Only `verify` is classified (read, known, exec-read
+as for a change, `sha256` as for a change. A rotation needs support level `n3` of the assignment;
+below it the request is `blocked` (`EXEC_BLOCKED`, a `system` step `credential rotation` with rule
+`rotate_level`) before anything connects. Only `verify` is classified (read, known, exec-read
 policy); the templates are fixed gateway commands and are not classified.
 
 Credentials: the first login uses the `current` credential (`role` absent); before anything is
@@ -430,13 +434,21 @@ changed the gateway asks for the `new` one (`need_credential` with `role: "new"`
 - `routeros`: the `change` safe-mode flow with the step `/user set [find name="<user>"]
   password="<new>"`.
 - `vrp`: the `change` schedule-reboot flow with the steps `aaa`, `local-user <user> password
-  irreversible-cipher <new>`, `quit` (then `return`).
+  irreversible-cipher <new>`, `quit` (then `return`). Before scheduling the reboot the gateway
+  reads `display local-user username <user>`; when the user is not listed (not a local user) the
+  request is `failed` / `CREDENTIAL_UNSUPPORTED` and nothing was changed. After a good verification
+  `save` runs BEFORE `undo schedule reboot`: a failed `save` keeps the reboot armed (`rolled_back` /
+  `SAVE_FAILED`, `pendingReboot: true`, `credentialActive: current`); once `save` worked the new
+  password is the startup configuration, so every later problem (`undo schedule reboot` failing:
+  `CANCEL_FAILED`; connection lost; abort) still ends `applied` (`credentialActive: new`), with
+  `rollback.pendingReboot: true` while the reboot could not be cancelled.
 - `linux`/`proxmox` (root, or `sudo -n`): the current hash is read with `getent shadow <user>` (as
   root; the line is kept in memory only, registered for redaction, never recorded; a locked,
   empty or unreadable hash is `failed` / `SHADOW_UNAVAILABLE` and nothing is changed). A root-only
-  rollback script `/run/mns-rb-<32 hex>.sh` (`chpasswd -e <<'EOF'` / `<user>:<hash>` / `EOF`) is
-  written through stdin (`install -m 600 /dev/stdin <file>`, never argv; failure:
-  `ROLLBACK_SCRIPT_FAILED`), the dead-man timer runs it (`systemd-run --unit=mns-rb-<id> ...
+  rollback script `/run/mns-rb-<32 hex>.sh` (`chpasswd -e <<'EOF'` / `<user>:<hash>` / `EOF`, then
+  `rc=$?`, `rm -f -- <file>`, `exit $rc`: the script deletes itself) is written through stdin
+  (`umask 077; install -m 600 /dev/stdin <file>`, never argv; failure: `ROLLBACK_SCRIPT_FAILED`;
+  the file is removed again on any failure before the timer is armed), the dead-man timer runs it (`systemd-run --unit=mns-rb-<id> ...
   /bin/sh <file>`), the change is `chpasswd` with `<user>:<new>` on stdin (never argv), and after a
   good verification the timer is stopped and the file removed (`ROLLBACK_SCRIPT_REMAINS` on an
   `applied` result when the removal failed). A failing step or verification starts the service
@@ -447,7 +459,21 @@ changed the gateway asks for the `new` one (`need_credential` with `role: "new"`
   old credential, never a key) and runs the `verify` commands as for a change; the commit follows the
   vendor flow of a change. A refused new login rolls back (`VERIFY_FAILED`, old password valid
   again) and reports `credential_result` `role: "new"` `auth_failed` for the `new` use.
-- Result: `applied | rolled_back | failed | blocked` with the `rollback` block as for a change.
+- Result: `applied | rolled_back | failed | blocked` with the `rollback` block as for a change, plus
+  `credentialActive: "new" | "current" | "unknown"` (rotate only): the password that logs in on
+  the device when the request ended. A clean `applied` is `new` (the verification login already
+  proved it). On every other ending the gateway first settles the device with fresh logins (the
+  new password, then the current one; passwords are never logged or recorded): RouterOS waits
+  about 3 s for safe mode to revert; Linux/Proxmox with the timer still armed or in doubt waits for
+  the timer (`rollbackSeconds` + 15 s after arming, polling every 2 s, ending early when the
+  current password works again) and skips the wait, answering `unknown`, when that is more than
+  10 minutes away; VRP is decided by whether `save` ran (see above), without a probe. `new` works
+  and `current` is refused: `new`; the opposite: `current`; anything else (both, none, a login
+  that could not be tried): `unknown`. When the probe proves `new` after a non-clean ending
+  (for example `RELEASE_UNCERTAIN`, `DEADMAN_DISARM_FAILED`, `CONNECTION_LOST`) the status becomes
+  `applied` and the original `error.code` stays as a warning (`ROTATION_SETTLED` when there was
+  none), so the API stores the new value. Before any login (blocked, auth or connect failures) it
+  is `unknown`; after the first login but before any change it is `current`.
 
 ### Policy (before anything runs)
 
@@ -567,7 +593,8 @@ Sent once per exec connection by the controller (Agent identity, like `/events`)
   (the timer may still revert the change), `ROLLBACK_FAILED`, `RELEASE_UNCERTAIN` (a RouterOS
   release whose prompt never came back; the socket is dropped and the device state must be
   checked; it replaced the former `RELEASE_FAILED` of the rollback list), `CREDENTIAL_UNSAFE`,
-  `CREDENTIAL_UNSUPPORTED`, `SHADOW_UNAVAILABLE`, `ROLLBACK_SCRIPT_FAILED` (rotate),
+  `CREDENTIAL_UNSUPPORTED` (also a VRP user that is not local), `SHADOW_UNAVAILABLE`,
+  `ROLLBACK_SCRIPT_FAILED` (rotate),
   `EXEC_REFUSED` (preflight or `gateway_full`; the result is posted before the finish, with the same
   retry), `PROMPT_TIMEOUT`, `COMMAND_TIMEOUT`, `AUTH_FAILED`,
   `HOSTKEY_MISMATCH`, `HOSTKEY_REJECTED`, `CREDENTIAL_UNAVAILABLE`, `CONNECT_FAILED`,

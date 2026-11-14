@@ -51,6 +51,11 @@ export interface ExecResult {
     pendingReboot: boolean;
   };
   error: { code: string; message: string } | null;
+  /**
+   * Kind `rotate` only: which password logs in on the device when the request ended (checked
+   * with fresh logins when the outcome was not clean). `unknown`: neither could be proven.
+   */
+  credentialActive?: 'new' | 'current' | 'unknown';
 }
 
 export class ExecPayloadError extends Error {}
@@ -270,6 +275,10 @@ export function validExecResult(value: unknown): value is ExecResult {
   if (
     r.error !== null &&
     (typeof r.error?.code !== 'string' || typeof r.error?.message !== 'string')
+  ) return false;
+  if (
+    r.credentialActive !== undefined &&
+    !['new', 'current', 'unknown'].includes(r.credentialActive)
   ) return false;
   for (const step of r.steps) {
     if (

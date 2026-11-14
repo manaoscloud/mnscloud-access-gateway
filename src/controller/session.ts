@@ -661,8 +661,22 @@ export class Session {
         break;
       }
       case 'need_credential': {
+        if (message.role !== undefined && message.role !== 'current' && message.role !== 'new') {
+          worker.send({ t: 'credential_unavailable' });
+          this.#event('credential', { result: 'unavailable' });
+          break;
+        }
         const role: CredentialRole = message.role ?? 'current';
         let use: string | null = null;
+        // A use still open for this role is closed first (never two open uses for one role).
+        const open = this.#credentialUse.get(role);
+        if (open) {
+          this.#credentialUse.delete(role);
+          await this.deps.api.credentialResult(this.uuid, {
+            credentialUseUUID: open,
+            result: 'unused',
+          }).catch(() => {});
+        }
         try {
           // The staged replacement exists only for a credential rotation.
           if (role === 'new' && this.assignment.exec?.kind !== 'rotate') {
@@ -674,7 +688,7 @@ export class Session {
           use = grant.credentialUseUUID;
           this.#credentialUse.set(role, use);
           const secret = await this.deps.unwrap(grant.wrapToken);
-          worker.send({ t: 'credential', role, ...secret });
+          worker.send({ t: 'credential', ...secret, role });
           this.#event('credential', { result: 'delivered' });
         } catch (error) {
           this.deps.log(

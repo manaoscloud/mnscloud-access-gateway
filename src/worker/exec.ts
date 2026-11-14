@@ -39,6 +39,12 @@ export const VERIFY_TIMEOUT_MS = 30000;
 /** The JSON line of the result must fit the IPC limit and the API body cap (1 MiB). */
 const RESULT_MAX_BYTES = 900 * 1024;
 const PROMPT_TIMEOUT_MS = 15000;
+/** Rotation settle probe: RouterOS safe mode revert, login timeout, dead-man wait and its cap. */
+const ROS_SETTLE_MS = 3000;
+const SETTLE_LOGIN_MS = 15000;
+const SETTLE_POLL_MS = 2000;
+const TIMER_MARGIN_MS = 15000;
+const SETTLE_BUDGET_MS = 10 * 60 * 1000;
 const STEP_TIMEOUT_MS = 30000;
 const EXPORT_TIMEOUT_MS = 60000;
 
@@ -84,7 +90,7 @@ export const NEW_PASSWORD = /^[A-Za-z0-9._~+=-]{16,64}$/;
 const DEVICE_USER = /^[A-Za-z0-9._@-]{1,64}$/;
 const LINUX_USER = /^[a-z_][a-z0-9_-]{0,31}$/;
 /** A crypt(3) hash as `getent shadow` prints it (locked or empty fields never match). */
-const SHADOW_HASH = /^\$[0-9a-z]+\$[./A-Za-z0-9$]+$/;
+const SHADOW_HASH = /^\$[0-9a-z]+\$[./A-Za-z0-9$=]+$/;
 
 const ROS_ERROR =
   /^(failure|bad command|syntax error|expected |input does not match|no such item|ambiguous value|invalid value|value of [^ ]+ out of range|Script Error|ERROR)/im;
@@ -169,7 +175,17 @@ export function planExec(
     classify(exec.steps, 'step', 'read', false);
   } else if (exec.kind === 'rotate') {
     // The change itself comes from fixed per-dialect templates built in the worker; only the
-    // verify reads are the API's.
+    // verify reads are the API's. Replacing a login password needs the top support level.
+    if (level !== 'n3') {
+      items.push({
+        phase: 'system',
+        command: 'credential rotation',
+        class: 'write_risky',
+        rule: 'rotate_level',
+        unknown: false,
+        verdict: 'blocked',
+      });
+    }
     classify(exec.verify, 'verify', 'read', false);
   } else {
     classify(exec.steps, 'step', 'change', stateful, exec.autonomous === true);
@@ -432,7 +448,7 @@ function shellBody(run: ShellRun, command: string): string {
 
 // ---------------------------------------------------------------------------------------------
 
-type Role = 'first' | 'verify';
+type Role = 'first' | 'verify' | 'probe';
 
 export async function runExec(h: ExecHelpers): Promise<Exit> {
   const { init, redactor, rules } = h;
@@ -475,10 +491,12 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       ms,
     });
   };
+  const sendResult = () => h.send({ t: 'exec_result', result: fitResult(result) });
+  // A rotation holds its result until `settle` has checked which password works on the device.
   const emit = (status: ExecStatus, error: ExecResult['error'] = null) => {
     result.status = status;
     if (error) result.error = error;
-    h.send({ t: 'exec_result', result: fitResult(result) });
+    if (!rotation) sendResult();
   };
 
   if (planned.blocked) {
@@ -500,6 +518,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       code: 'EXEC_BLOCKED',
       message: `${count} command(s) not allowed; nothing was executed.`,
     });
+    if (rotation) {
+      result.credentialActive = 'unknown';
+      sendResult();
+    }
     return h.finish('closed', 'exec_done');
   }
 
@@ -521,11 +543,21 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     fingerprint: null,
   };
   const clients: { end(): void; destroy(): void }[] = [];
+  /** Rotation bookkeeping the settle probe decides from. */
+  const rstate: {
+    loggedIn: boolean;
+    changeMayHaveRun: boolean;
+    hint:
+      | { kind: 'none' }
+      | { kind: 'ros' }
+      | { kind: 'timer'; armedAt: number }
+      | { kind: 'vrp'; saved: boolean | null };
+  } = { loggedIn: false, changeMayHaveRun: false, hint: { kind: 'none' } };
   // Verification commands are read-only; a non-root Linux login runs them like every other
   // command (set once the user is known).
   let verifyWire = (command: string) => command;
 
-  const connect = (role: Role, suffix: string) =>
+  const connect = (role: Role, suffix: string, only?: WorkerCredential) =>
     new Promise<{ end(): void; destroy(): void }>((resolve, reject) => {
       const client = new Client();
       const wrapper = {
@@ -612,7 +644,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           const advance = () => next(attempts?.shift() ?? false);
           if (attempts) return advance();
           // A rotation verifies with the NEW password only: the old credential must not log in.
-          const passwordOnly = rotation && role === 'verify';
+          const passwordOnly = rotation && (role === 'verify' || role === 'probe');
           const build = (received: WorkerCredential) => {
             const username = (received.username || init.username) + suffix;
             const list: Record<string, unknown>[] = [];
@@ -642,6 +674,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
             attempts = list;
             advance();
           };
+          if (role === 'probe') {
+            if (only?.password) return build(only);
+            return next(false);
+          }
           if (passwordOnly) {
             if (secrets.next?.password) return build(secrets.next);
             return next(false);
@@ -750,6 +786,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   const connectFirst = async (suffix: string) => {
     try {
       const conn = await guard(connect('first', suffix));
+      rstate.loggedIn = true;
       h.send({ t: 'credential_result', role: 'current', result: 'used' });
       return conn;
     } catch (error) {
@@ -887,6 +924,84 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         { command: 'quit' },
       ];
 
+  // --- settle: which password works once the request ended (rotation) ---------------------------
+
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  /** A fresh login with one credential: logged in, refused, or not decidable. */
+  const tryLogin = async (credential: WorkerCredential): Promise<'ok' | 'refused' | 'error'> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let connection: { destroy(): void } | null = null;
+    try {
+      connection = await Promise.race([
+        connect('probe', '', credential),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new ExecFail('CONNECT_FAILED')), SETTLE_LOGIN_MS);
+        }),
+      ]);
+      return 'ok';
+    } catch (error) {
+      return error instanceof ExecFail && error.code === 'AUTH_FAILED' ? 'refused' : 'error';
+    } finally {
+      clearTimeout(timer);
+      connection?.destroy();
+    }
+  };
+
+  const whichPasswordWorks = async (): Promise<'new' | 'current' | 'unknown'> => {
+    if (!secrets.next || !secrets.credential) return 'unknown';
+    const withNew = await tryLogin(secrets.next);
+    const withCurrent = await tryLogin(secrets.credential);
+    if (withNew === 'ok' && withCurrent === 'refused') return 'new';
+    if (withCurrent === 'ok' && withNew === 'refused') return 'current';
+    return 'unknown';
+  };
+
+  let settled = false;
+  /** Sends the result of a rotation after checking the device (never logs a password). */
+  const settle = async () => {
+    if (!rotation || settled) return;
+    settled = true;
+    let active: 'new' | 'current' | 'unknown' = 'unknown';
+    try {
+      const hint = rstate.hint;
+      if (result.status === 'applied') active = 'new';
+      else if (!rstate.loggedIn) active = 'unknown';
+      else if (!rstate.changeMayHaveRun) active = 'current';
+      else if (hint.kind === 'vrp') {
+        active = hint.saved === true ? 'new' : hint.saved === false ? 'current' : 'unknown';
+      } else if (hint.kind === 'ros') {
+        await sleep(ROS_SETTLE_MS);
+        active = await whichPasswordWorks();
+      } else if (hint.kind === 'timer') {
+        const until = hint.armedAt + exec.rollbackSeconds * 1000 + TIMER_MARGIN_MS;
+        // The timer may still fire: only wait for it when that fits the budget.
+        if (until - Date.now() <= SETTLE_BUDGET_MS) {
+          for (;;) {
+            active = await whichPasswordWorks();
+            if (active === 'current' || Date.now() >= until) break;
+            await sleep(Math.max(1, Math.min(SETTLE_POLL_MS, until - Date.now())));
+          }
+          result.rollback = active === 'current'
+            ? { method: 'deadman_timer', armed: false, fired: true, pendingReboot: false }
+            : { ...result.rollback, armed: Date.now() < until };
+        }
+      } else active = await whichPasswordWorks();
+    } catch {
+      active = 'unknown';
+    }
+    if (active === 'new' && result.status !== 'applied') {
+      // The device runs the new password: the vault must follow; the error stays as a warning.
+      result.status = 'applied';
+      result.error = {
+        code: result.error?.code ?? 'ROTATION_SETTLED',
+        message: 'The new credential is active on the device.',
+      };
+    }
+    result.credentialActive = active;
+    sendResult();
+  };
+
   const plainSteps = (): ChangeStep[] => exec.steps.map((command) => ({ command }));
 
   // --- flows ------------------------------------------------------------------------------------
@@ -984,7 +1099,9 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       safeModeOn = true;
       armedAt = Date.now();
       result.rollback = { method: 'safe_mode', armed: true, fired: false, pendingReboot: false };
+      rstate.hint = { kind: 'ros' };
       // 3. the steps
+      rstate.changeMayHaveRun = true;
       for (const { command, display } of steps) {
         if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
           rollBackBySocket('DEADLINE', 'The time budget of the change ran out; it was reverted.');
@@ -1034,6 +1151,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       safeModeOn = false; // committed from here on
+      rstate.hint = { kind: 'none' };
       result.rollback = { method: 'safe_mode', armed: false, fired: false, pendingReboot: false };
       record('system', 'safe-mode release (Ctrl-X)', null, 'Safe mode released', false, 0);
       // 5. change log and post-change export. The change is committed: nothing below can turn it
@@ -1126,6 +1244,24 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         const { run, output } = await runShell(shell, 'system', command, STEP_TIMEOUT_MS, 'Y');
         return !(run.timedOut || VRP_ERROR.test(output));
       };
+      if (rotation) {
+        // Only a local user can be rotated here (AAA/remote users have no local password).
+        const user = secrets.credential!.username || init.username;
+        const probe = `display local-user username ${user}`;
+        const { run, output } = await runShell(shell, 'system', probe, COMMAND_TIMEOUT_MS, null);
+        const listed = new RegExp(
+          `(^|[\\s:])${user.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`,
+          'im',
+        ).test(output);
+        if (run.timedOut || VRP_ERROR.test(output) || !listed) {
+          conn.end();
+          emit('failed', {
+            code: 'CREDENTIAL_UNSUPPORTED',
+            message: 'The user is not a local user of the device; nothing was changed.',
+          });
+          return;
+        }
+      }
       if (!(await system(`save ${backup}.cfg`))) {
         conn.end();
         emit('failed', {
@@ -1135,6 +1271,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       const minutes = String(Math.ceil(exec.rollbackSeconds / 60)).padStart(2, '0');
+      armedAt = Date.now(); // the delay starts when the device accepts the command
       if (!(await system(`schedule reboot delay 00:${minutes}`))) {
         conn.end();
         emit('failed', {
@@ -1144,13 +1281,13 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       scheduled = true;
-      armedAt = Date.now();
       result.rollback = {
         method: 'scheduled_reboot',
         armed: true,
         fired: false,
         pendingReboot: false,
       };
+      if (rotation) rstate.hint = { kind: 'vrp', saved: false };
       const rollbackNow = (code: string, message: string) => {
         // The device reboots into the saved configuration when the delay ends.
         conn.end();
@@ -1162,6 +1299,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         };
         emit('rolled_back', { code, message });
       };
+      rstate.changeMayHaveRun = true;
       let failed = !(await system('system-view'));
       for (const { command, display } of failed ? [] : steps) {
         if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
@@ -1200,6 +1338,48 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         rollbackNow('DEADLINE', 'The time budget of the change ran out; the device reboots.');
         return;
       }
+      if (rotation) {
+        // Save first: from the save on, the new password is the startup configuration and every
+        // later problem leaves it applied. A failed save keeps the reboot armed (back to current).
+        rstate.hint = { kind: 'vrp', saved: null };
+        const saved = await runShell(shell, 'system', 'save', STEP_TIMEOUT_MS, 'Y');
+        const savedOk = !(saved.run.timedOut || VRP_ERROR.test(saved.output));
+        if (!savedOk) {
+          rstate.hint = { kind: 'vrp', saved: saved.run.timedOut ? null : false };
+          rollbackNow(
+            'SAVE_FAILED',
+            'The new password was not saved; the device reboots into the saved configuration.',
+          );
+          return;
+        }
+        rstate.hint = { kind: 'vrp', saved: true };
+        const undone = await system('undo schedule reboot');
+        scheduled = false;
+        if (!undone) {
+          // Saved: a reboot reloads the new password. Report it as applied, reboot still armed.
+          conn.end();
+          result.rollback = {
+            method: 'scheduled_reboot',
+            armed: true,
+            fired: false,
+            pendingReboot: true,
+          };
+          emit('applied', {
+            code: 'CANCEL_FAILED',
+            message: 'The new password is saved; the scheduled reboot could not be cancelled.',
+          });
+          return;
+        }
+        result.rollback = {
+          method: 'scheduled_reboot',
+          armed: false,
+          fired: false,
+          pendingReboot: false,
+        };
+        conn.end();
+        emit('applied');
+        return;
+      }
       const cancelled = await system('undo schedule reboot');
       if (!cancelled) {
         // The reboot may still fire: report it so nobody believes the change is permanent.
@@ -1227,6 +1407,22 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       conn.end();
       emit('applied');
     } catch (error) {
+      if (rotation && rstate.hint.kind === 'vrp' && rstate.hint.saved === true) {
+        // The new password was saved before the request ended: it is applied.
+        conn.end();
+        result.rollback = {
+          method: 'scheduled_reboot',
+          armed: scheduled,
+          fired: false,
+          pendingReboot: scheduled,
+        };
+        emit('applied', {
+          code: error instanceof ExecAbort ? 'EXEC_ABORTED' : 'CONNECTION_LOST',
+          message: 'The new password is saved; the request ended before the reboot was cancelled.',
+        });
+        if (error instanceof ExecAbort) throw error;
+        return;
+      }
       if (scheduled) {
         // Nothing was committed: the pending reboot returns the device to the saved configuration.
         conn.end();
@@ -1259,6 +1455,8 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     const client = raw(conn);
     let armed = false;
     let armedAt = 0;
+    let scriptWritten = false;
+    let removeScriptQuietly = async () => {};
     try {
       const uidRun = await runChannel(client, 'system', 'id -u');
       const uid = Number.parseInt(uidRun.output.trim(), 10);
@@ -1280,6 +1478,11 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         const remove = `rm -f ${scriptFile}`;
         const removed = await runChannel(client, 'system', remove, asRoot(remove));
         return removed.exitCode === 0;
+      };
+      removeScriptQuietly = async () => {
+        try {
+          await removeScript();
+        } catch { /* connection gone: the script is root-only and self-deleting */ }
       };
       let rot: Rotation | null = null;
       if (rotation) {
@@ -1305,8 +1508,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           return;
         }
         redactor.addSecret(hash);
-        const install = `install -m 600 /dev/stdin ${scriptFile}`;
-        const content = `chpasswd -e <<'EOF'\n${rot.user}:${hash}\nEOF\n`;
+        // The script removes itself after it ran, whatever chpasswd returned.
+        const install = `umask 077; install -m 600 /dev/stdin ${scriptFile}`;
+        const content =
+          `chpasswd -e <<'EOF'\n${rot.user}:${hash}\nEOF\nrc=$?\nrm -f -- ${scriptFile}\nexit $rc\n`;
         const written = await runChannel(
           client,
           'system',
@@ -1315,6 +1520,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           COMMAND_TIMEOUT_MS,
           content,
         );
+        scriptWritten = true;
         if (written.exitCode !== 0) {
           await removeScript();
           conn.end();
@@ -1331,6 +1537,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         : `/bin/sh -c ${shellQuote(`echo ${script} | base64 -d | /bin/sh`)}`;
       const arm =
         `systemd-run --unit=${unit} --on-active=${exec.rollbackSeconds} --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=120 ${unitCommand}`;
+      armedAt = Date.now(); // the timer counts from the moment the device accepts the command
       const armed_ = await runChannel(client, 'system', arm, asRoot(arm));
       if (armed_.exitCode !== 0) {
         if (rotation) await removeScript();
@@ -1342,7 +1549,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       armed = true;
-      armedAt = Date.now();
+      if (rotation) rstate.hint = { kind: 'timer', armedAt };
       result.rollback = {
         method: 'deadman_timer',
         armed: true,
@@ -1369,7 +1576,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           return;
         }
         await runChannel(client, 'rollback', stop, asRoot(stop));
-        if (rotation) await removeScript();
+        if (rotation) {
+          rstate.hint = { kind: 'none' }; // the script ran: the old hash is back
+          await removeScript();
+        }
         conn.end();
         result.rollback = {
           method: 'deadman_timer',
@@ -1387,6 +1597,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           await rollbackNow('DEADLINE', 'The time budget of the change ran out; rolled back.');
           return;
         }
+        if (rotation) rstate.changeMayHaveRun = true;
         const r = await runChannel(
           client,
           'step',
@@ -1428,6 +1639,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         return;
       }
       armed = false;
+      if (rotation) rstate.hint = { kind: 'none' };
       result.rollback = {
         method: 'deadman_timer',
         armed: false,
@@ -1481,6 +1693,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         if (error instanceof ExecAbort) throw error;
         return;
       }
+      if (scriptWritten) {
+        // Nothing was armed: do not leave the root-only script behind (best effort).
+        await removeScriptQuietly();
+      }
       conn.destroy();
       throw error;
     }
@@ -1496,6 +1712,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     } else if (exec.safeChange === 'routeros_safe_mode') await routerosChange();
     else if (exec.safeChange === 'vrp5_schedule_reboot') await vrpChange();
     else await linuxChange();
+    await settle();
     finish = h.finish('closed', 'exec_done');
   } catch (error) {
     for (const client of clients) client.destroy();
@@ -1503,17 +1720,20 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       if (!result.error) {
         emit('failed', { code: 'EXEC_ABORTED', message: 'The request was cancelled.' });
       }
+      await settle();
       finish = h.finish(
         'closed',
         error.reason === 'controller_gone' ? 'gateway_closed' : error.reason,
       );
     } else if (error instanceof ExecFail) {
       emit('failed', { code: error.code, message: error.code });
+      await settle();
       finish = error.state === 'failed' && error.reason === 'exec_done'
         ? h.finish('closed', 'exec_done')
         : h.finish(error.state, error.reason);
     } else {
       emit('failed', { code: 'EXEC_INTERNAL', message: 'The request failed unexpectedly.' });
+      await settle();
       finish = h.finish('failed', 'device_error');
     }
   } finally {
