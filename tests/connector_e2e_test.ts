@@ -40,6 +40,7 @@ function sessionApi(finished: Map<string, FinishBody>): SessionApi {
     recordingPart: () => Promise.resolve(),
     attach: () => Promise.resolve({ role: 'operator' as const }),
     detach: () => Promise.resolve(),
+    execResult: () => Promise.resolve(),
     finish: (uuid, body) => {
       finished.set(uuid, body);
       return Promise.resolve();

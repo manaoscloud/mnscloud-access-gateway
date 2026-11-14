@@ -2,6 +2,7 @@
 // (systemd-run --pipe hands the pipe file descriptors straight to the sandboxed process). The
 // credential travels only on this pipe and lives only in the worker's memory.
 
+import type { ExecPayload, ExecResult } from './exec.ts';
 import type { CommandClass, ConfirmMessage, ControlMessage } from './framing.ts';
 
 /** Bridge socket paths the controller creates (and the only ones a worker may be given). */
@@ -17,7 +18,7 @@ export type SupportLevel = 'n1' | 'n2' | 'n3';
 export interface WorkerInit {
   t: 'init';
   connectionUUID: string;
-  mode: 'console' | 'test';
+  mode: 'console' | 'test' | 'exec';
   protocol: 'ssh' | 'routeros_api';
   target: { address: string; port: number };
   /** `connector`: connect to the unix socket `bridge` instead of the network. */
@@ -39,6 +40,8 @@ export interface WorkerInit {
     verdictTimeoutSeconds: number;
   };
   recording: boolean;
+  /** Exec mode (AI copilot): the validated command payload. */
+  exec?: ExecPayload;
 }
 
 export interface WorkerCredential {
@@ -98,6 +101,7 @@ export type WorkerToController =
   | { t: 'event'; e: CommandEvent }
   | { t: 'cast'; line: string }
   | { t: 'facts'; facts: Facts }
+  | { t: 'exec_result'; result: ExecResult }
   | {
     t: 'exit';
     state: 'closed' | 'failed' | 'refused';

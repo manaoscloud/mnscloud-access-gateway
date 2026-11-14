@@ -6,6 +6,7 @@ import type {
   FinishBody,
   HostKeyResponse,
 } from './contract.ts';
+import type { ExecResult } from '../shared/exec.ts';
 import {
   AttachRefused,
   type ConnectorAttachment,
@@ -122,6 +123,11 @@ export class RuntimeApi implements SessionApi, ConnectorRuntimeApi {
   /** The operator browser left a detachable connection (best effort, audit only). */
   async detach(connection: string) {
     await this.cp.call('POST', `/connections/${connection}/detach`, {});
+  }
+
+  /** Result of an exec connection; 1 MiB body cap is kept by the worker. */
+  async execResult(connection: string, result: ExecResult) {
+    await this.cp.call('POST', `/connections/${connection}/exec-result`, result);
   }
 
   async finish(connection: string, body: FinishBody) {

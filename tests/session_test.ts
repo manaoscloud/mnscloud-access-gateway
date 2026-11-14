@@ -61,6 +61,11 @@ class FakeApi implements SessionApi {
     this.calls.push('detach');
     return Promise.resolve();
   }
+  execResults: unknown[] = [];
+  execResult(_c: string, result: unknown) {
+    this.execResults.push(result);
+    return Promise.resolve();
+  }
   finish(_c: string, body: FinishBody) {
     this.finished = body;
     this.calls.push(`finish:${body.reason}`);

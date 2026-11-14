@@ -7,12 +7,19 @@ import {
   type Assignment,
   type AttachTicket,
   ContractError,
+  EXEC_PAYLOAD_MISMATCH,
   type FinishBody,
   parseAssignment,
 } from './contract.ts';
 import type { ConnectorHub } from './connector_hub.ts';
 import { checkDestination, type Denylist } from './denylist.ts';
-import { MAX_OBSERVERS, Session, type SessionDeps } from './session.ts';
+import {
+  MAX_OBSERVERS,
+  postExecResult,
+  refusedExecResult,
+  Session,
+  type SessionDeps,
+} from './session.ts';
 import { TicketBook, ticketHash } from './ticket.ts';
 
 export interface GatewayOptions {
@@ -120,9 +127,23 @@ export class Gateway {
       assignment = parseAssignment(raw);
     } catch (error) {
       if (uuid && /^[0-9a-f-]{36}$/.test(uuid)) {
-        const reason = error instanceof ContractError && /^[a-z_]+$/.test(error.message)
-          ? error.message
+        const code = error instanceof ContractError ? error.message : '';
+        const reason = code === EXEC_PAYLOAD_MISMATCH
+          ? 'exec_payload_mismatch'
+          : /^[a-z_]+$/.test(code)
+          ? code
           : 'invalid_assignment';
+        if ((raw as { mode?: unknown }).mode === 'exec') {
+          // The API waits for a result: say why nothing ran (no command was executed).
+          await postExecResult(
+            this.options.deps,
+            uuid,
+            refusedExecResult(
+              code === EXEC_PAYLOAD_MISMATCH ? code : 'EXEC_INVALID_ASSIGNMENT',
+              'The assignment was refused; nothing was executed.',
+            ),
+          );
+        }
         await this.options.deps.api.finish(uuid, refusal({ connectionUUID: uuid }, reason)).catch(
           () => {},
         );
@@ -134,6 +155,7 @@ export class Gateway {
     ) return 'waiting';
     const refused = this.#preflight(assignment);
     if (refused) {
+      await this.#refuseExec(assignment, refused.reason);
       await this.options.deps.api.finish(
         assignment.connectionUUID,
         refusal(assignment, refused.reason, refused.state),
@@ -141,13 +163,14 @@ export class Gateway {
       return 'refused';
     }
     if (this.#draining || this.freeSlots <= 0) {
+      await this.#refuseExec(assignment, 'gateway_full');
       await this.options.deps.api.finish(
         assignment.connectionUUID,
         refusal(assignment, 'gateway_full', 'failed'),
       ).catch(() => {});
       return 'refused';
     }
-    if (assignment.mode === 'test') {
+    if (assignment.mode === 'test' || assignment.mode === 'exec') {
       this.#startSession(assignment).start();
       return 'started';
     }
@@ -158,6 +181,16 @@ export class Gateway {
       assignment,
     );
     return 'waiting';
+  }
+
+  /** An exec assignment that will not run still owes its result (the API waits for it). */
+  async #refuseExec(assignment: Assignment, reason: string) {
+    if (assignment.mode !== 'exec') return;
+    await postExecResult(
+      this.options.deps,
+      assignment.connectionUUID,
+      refusedExecResult('EXEC_REFUSED', `The gateway refused the request (${reason}).`),
+    );
   }
 
   #startSession(assignment: Assignment) {
