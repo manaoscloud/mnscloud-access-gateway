@@ -2,6 +2,7 @@
 // Everything received is validated here; an invalid assignment is refused, never "fixed".
 
 import { parseAddress, parseCidr } from '../shared/ip.ts';
+import { type ExecPayload, ExecPayloadError, parseExecPayload } from '../shared/exec.ts';
 import type { ShellDialect, SupportLevel } from '../shared/ipc.ts';
 import { DIALECTS } from '../worker/rules.ts';
 
@@ -22,7 +23,7 @@ export interface GatewayConfig {
 
 export interface Assignment {
   connectionUUID: string;
-  mode: 'console' | 'test';
+  mode: 'console' | 'test' | 'exec';
   protocol: 'ssh' | 'routeros_api';
   path: 'public' | 'connector' | 'mgmt_vpn';
   /**
@@ -48,6 +49,8 @@ export interface Assignment {
    * attach again later (attach tickets). False when the API does not send it.
    */
   detachable: boolean;
+  /** `exec` mode only (AI copilot): the validated command payload; null otherwise. */
+  exec: ExecPayload | null;
   terminal: { cols: number; rows: number };
   limits: {
     maxSessionSeconds: number;
@@ -119,6 +122,9 @@ export interface HostKeyResponse {
   decision: 'accept' | 'block';
   pinned: boolean;
 }
+
+/** Raised for an exec assignment whose sha256 does not match its payload. */
+export const EXEC_PAYLOAD_MISMATCH = 'EXEC_PAYLOAD_MISMATCH';
 
 export interface FinishBody {
   state: 'closed' | 'failed' | 'refused' | 'expired';
@@ -289,12 +295,39 @@ function parseTicket(v: Record<string, any>): Assignment['ticket'] {
   return { sha256: v.ticket.sha256, expiresAt: v.ticket.expiresAt };
 }
 
+/** The `exec` payload: required (and only allowed) for mode exec. */
+// deno-lint-ignore no-explicit-any
+function parseExec(v: Record<string, any>, transport: Assignment['transport']): ExecPayload | null {
+  if (v.mode !== 'exec') {
+    if (v.exec !== undefined && v.exec !== null) throw new ContractError('Invalid exec');
+    return null;
+  }
+  if (v.protocol !== 'ssh') throw new ContractError('protocol_refused');
+  try {
+    const exec = parseExecPayload(v.exec, v.shellDialect, v.connectionUUID);
+    // A change verifies in a second SSH connection; the connector bridge carries only one.
+    if (exec.kind === 'change' && transport === 'connector') {
+      throw new ContractError('exec_change_unsupported_transport');
+    }
+    return exec;
+  } catch (error) {
+    if (error instanceof ExecPayloadError) {
+      throw new ContractError(
+        error.message === 'EXEC_PAYLOAD_MISMATCH' ? error.message : 'Invalid exec payload',
+      );
+    }
+    throw error;
+  }
+}
+
 export function parseAssignment(value: unknown): Assignment {
   // deno-lint-ignore no-explicit-any
   const v = value as Record<string, any>;
   if (!v || typeof v !== 'object') throw new ContractError('Invalid assignment');
   if (!UUID.test(String(v.connectionUUID))) throw new ContractError('Invalid connectionUUID');
-  if (v.mode !== 'console' && v.mode !== 'test') throw new ContractError('Invalid mode');
+  if (v.mode !== 'console' && v.mode !== 'test' && v.mode !== 'exec') {
+    throw new ContractError('Invalid mode');
+  }
   if (v.protocol !== 'ssh' && v.protocol !== 'routeros_api') {
     throw new ContractError('protocol_refused');
   }
@@ -313,6 +346,7 @@ export function parseAssignment(value: unknown): Assignment {
     throw new ContractError('Invalid target address');
   }
   const ticket = parseTicket(v);
+  const exec = parseExec(v, route.transport);
   return {
     connectionUUID: v.connectionUUID,
     mode: v.mode,
@@ -326,6 +360,7 @@ export function parseAssignment(value: unknown): Assignment {
     tls: { pinned: pin(v.tls?.pinned) },
     ticket,
     detachable: v.mode === 'console' && v.detachable === true,
+    exec,
     terminal: {
       cols: int(v.terminal?.cols ?? 120, 20, 500, 'cols'),
       rows: int(v.terminal?.rows ?? 32, 5, 200, 'rows'),
@@ -342,7 +377,7 @@ export function parseAssignment(value: unknown): Assignment {
       maxOutputBytes: int(v.limits?.maxOutputBytes ?? 268435456, 65536, 4294967296, 'output limit'),
     },
     recording: {
-      enabled: v.recording?.enabled !== false,
+      enabled: v.mode !== 'exec' && v.recording?.enabled !== false,
       partBytes: int(v.recording?.partBytes ?? 1048576, 65536, 8388608, 'partBytes'),
       partSeconds: int(v.recording?.partSeconds ?? 60, 5, 600, 'partSeconds'),
     },
