@@ -173,7 +173,10 @@ function cleanOutput(redactor: Redactor, raw: string, truncated: boolean): strin
 export function fitResult(result: ExecResult, maxBytes = RESULT_MAX_BYTES): ExecResult {
   const size = () => new TextEncoder().encode(JSON.stringify(result)).length;
   while (size() > maxBytes) {
-    const biggest = result.steps.reduce((a, b) => (b.output.length > a.output.length ? b : a));
+    const biggest = result.steps.reduce<ExecResult['steps'][number] | null>(
+      (a, b) => (!a || b.output.length > a.output.length ? b : a),
+      null,
+    );
     if (!biggest || !biggest.output.length) break;
     biggest.output = biggest.output.slice(0, Math.floor(biggest.output.length / 2));
     biggest.truncated = true;
@@ -556,6 +559,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
             }
             verify(ok);
             if (!ok) setTimeout(() => refusal && fail(refusal), 0);
+          }).catch(() => {
+            refusal = new ExecFail('HOSTKEY_REJECTED', 'refused', 'hostkey_rejected');
+            verify(false);
+            setTimeout(() => refusal && fail(refusal), 0);
           });
         },
         authHandler: (
@@ -607,6 +614,13 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
             }
             secrets.credential = received;
             build(received);
+          }).catch(() => {
+            next(false);
+            setTimeout(
+              () =>
+                fail(new ExecFail('CREDENTIAL_UNAVAILABLE', 'failed', 'credential_unavailable')),
+              0,
+            );
           });
         },
       });

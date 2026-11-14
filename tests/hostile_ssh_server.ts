@@ -299,11 +299,11 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
   const vrpShell = (stream: any) => {
     let view = false;
     let line = '';
-    let asking: { command: string; then: () => void } | null = null;
+    let asking: { command: string; onYes: () => void } | null = null;
     const prompt = () => (view ? '[Huawei]' : '<Huawei>');
     stream.write(`Info: Welcome\r\n${prompt()}`);
-    const ask = (command: string, question: string, then: () => void) => {
-      asking = { command, then };
+    const ask = (command: string, question: string, onYes: () => void) => {
+      asking = { command, onYes };
       stream.write(`${question} [Y/N]:`);
     };
     stream.on('data', (chunk: Uint8Array) => {
@@ -325,7 +325,7 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
           asking = null;
           const answer = command.toUpperCase();
           device.answers.push({ command: pending.command, answer });
-          if (answer === 'Y') pending.then();
+          if (answer === 'Y') pending.onYes();
           else stream.write(`Info: cancelled.\r\n${prompt()}`);
           continue;
         }

@@ -9,4 +9,5 @@ paths = [
   '''tests/hostile_ssh_server\.ts''',
   '''tests/input_gate_test\.ts''',
   '''tests/routeros_api_test\.ts''',
+  '''tests/exec_test\.ts''',
 ]
