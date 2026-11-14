@@ -876,6 +876,22 @@ Deno.test('exec contract H1c/H3/M2: other dialect, control chars, help and time 
   assertThrows(() => make('linux', { steps: ['ls\x7f'] }), /Invalid exec/);
   assertThrows(() => make('routeros', { steps: ['/ip address print ?'] }), /Invalid exec/);
   assertThrows(() => make('vrp', { steps: ['display ?'] }), /Invalid exec/);
+  for (const bad of ['\u0085', '\u009b', '\u2028', '\u2029']) {
+    assertThrows(() => make('linux', { steps: [`ls${bad}/tmp`] }), /Invalid exec/);
+  }
+  const logged = (line: string) => () =>
+    make('routeros', {
+      kind: 'change',
+      steps: ['/system identity set name=x'],
+      verify: ['/ip address print'],
+      safeChange: 'routeros_safe_mode',
+      backupName: BACKUP,
+      changeLog: { kind: 'script', line },
+    });
+  logged('MNSCloud: ajuste (ok)')();
+  for (const c of ['?', '[', ']', '{', '}', '|', '&', '<', '>']) {
+    assertThrows(logged(`x ${c} y`), /Invalid exec/);
+  }
   make('linux', { steps: ['ls /tmp/a?b'] }); // `?` is only inline help on RouterOS and VRP
   const change: Options = {
     kind: 'change',

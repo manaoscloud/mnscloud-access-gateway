@@ -361,7 +361,7 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
   "backupName": "^[a-z0-9-]{1,48}$ (change only, else null)",
   "changeLog": {
     "kind": "script | file | report_only",
-    "line": "<=300 printable ASCII, no quotes, backslash, $, backtick or ;"
+    "line": "<=300 printable ASCII, no quotes, backslash, $, backtick, ; ? [ ] { } | & < >"
   },
   "sha256": "<hex sha256 of the canonical JSON>"
 }
@@ -374,7 +374,7 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
   `vrp5_schedule_reboot` (vrp, report_only), `systemd_deadman` (linux/proxmox, `rollback` required,
   `changeLog` file or report_only). `none` is refused for a change. The dialect `other` is
   refused for exec (read and change). Commands may not contain control characters (Tab included,
-  `\x00-\x1f`, `\x7f`), and not `?` on routeros and vrp (inline help). A change also needs
+  `\x00-\x1f`, `\x7f-\x9f` (C1), U+2028, U+2029), and not `?` on routeros and vrp (inline help). A change also needs
   `steps.length * 30 + 60 <= rollbackSeconds` (every step may take 30 s and the rollback must still
   be armed when the last one ends). `rollbackSeconds` is 0..900 for
   a read (it is part of the hash).

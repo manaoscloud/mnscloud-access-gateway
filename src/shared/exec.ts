@@ -67,9 +67,9 @@ const KEYS = [
 const HEX32 = /^[0-9a-f]{32}$/i;
 const UUID_FORM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const BACKUP = /^[a-z0-9-]{1,48}$/;
-// Printable ASCII without quotes, backslash, `$`, backtick and `;` (the line is embedded in
-// device commands).
-const LOG_LINE = /^[ !#%&()*+,\-./0-9:<=>?@A-Z[\]^_a-z{|}~]{1,300}$/;
+// Printable ASCII without quotes, backslash, `$`, backtick, `;`, `?` (inline help on RouterOS) and
+// `[ ] { } | & < >` (the line is embedded in device commands).
+const LOG_LINE = /^[ !#%()*+,\-./0-9:=@A-Z^_a-z~]{1,300}$/;
 
 /** Lowercase hex of a request UUID in either form (32 hex or the dashed form). */
 export function requestHex(value: string): string {
@@ -111,7 +111,7 @@ function commands(
     if (
       typeof item !== 'string' || !item.trim() || item.length > MAX_COMMAND ||
       // deno-lint-ignore no-control-regex
-      /[\x00-\x1f\x7f]/.test(item) || (inlineHelp && item.includes('?'))
+      /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(item) || (inlineHelp && item.includes('?'))
     ) throw new ExecPayloadError(`Invalid exec ${label}`);
   }
   return value as string[];
