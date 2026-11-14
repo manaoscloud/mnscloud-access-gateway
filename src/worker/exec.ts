@@ -32,6 +32,8 @@ import { TerminalSanitizer } from './terminal.ts';
 
 // deno-lint-ignore no-explicit-any
 const { Client } = ssh2 as any;
+/** Text shown in recorded commands in place of a secret. */
+const REDACTED_MARK = '<redacted>';
 
 export const COMMAND_TIMEOUT_MS = 20000;
 export const OUTPUT_CAP_BYTES = 64 * 1024;
@@ -913,13 +915,13 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     dialect === 'routeros'
       ? [{
         command: `/user set [find name="${r.user}"] password="${r.password}"`,
-        display: `/user set [find name="${r.user}"] password=<redacted>`,
+        display: '/user set [find name="' + r.user + '"] password=' + REDACTED_MARK,
       }]
       : [
         { command: 'aaa' },
         {
           command: `local-user ${r.user} password irreversible-cipher ${r.password}`,
-          display: `local-user ${r.user} password irreversible-cipher <redacted>`,
+          display: 'local-user ' + r.user + ' password irreversible-cipher ' + REDACTED_MARK,
         },
         { command: 'quit' },
       ];
@@ -1249,10 +1251,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         const user = secrets.credential!.username || init.username;
         const probe = `display local-user username ${user}`;
         const { run, output } = await runShell(shell, 'system', probe, COMMAND_TIMEOUT_MS, null);
-        const listed = new RegExp(
-          `(^|[\\s:])${user.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`,
-          'im',
-        ).test(output);
+        const listed = output.split(/[\s:]+/).includes(user);
         if (run.timedOut || VRP_ERROR.test(output) || !listed) {
           conn.end();
           emit('failed', {
