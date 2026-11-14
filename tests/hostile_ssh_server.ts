@@ -159,6 +159,20 @@ export interface ExecDeviceOptions {
   dropAfterRelease?: boolean;
   /** RouterOS: the release is applied but the prompt never comes back. */
   silentRelease?: boolean;
+  /** Initial login password of user `support` (default PASSWORD). */
+  password?: string;
+  /** The new password is refused at login (a device that stored it wrongly). */
+  rejectNewPassword?: boolean;
+  /** VRP: names listed by `display local-user username <name>` (default ['support']). */
+  localUsers?: string[];
+  /** VRP: a plain `save` answers with an error and saves nothing. */
+  failSave?: boolean;
+  /** VRP: `undo schedule reboot` answers with an error. */
+  failUndo?: boolean;
+  /** Linux: armed timers fire by themselves after this many ms (a fast device clock). */
+  timerFireMs?: number;
+  /** Linux: an exec matching this is executed, then the connection drops without a reply. */
+  dropOn?: RegExp;
 }
 
 export interface ExecDevice {
@@ -185,6 +199,20 @@ export interface ExecDevice {
   safe: boolean;
   scheduledReboot: boolean;
   saved: boolean;
+  /** Current login password of `support`; every authentication reads it (mutable on purpose). */
+  password: string;
+  /** VRP: the password in the saved configuration (what a reboot restores). */
+  savedPassword: string;
+  /** Linux: armed dead-man timers (unit -> script path). */
+  timers: Map<string, string>;
+  /** Linux: files written through stdin (path -> content). */
+  scripts: Map<string, string>;
+  /** Authentication attempts with their outcome, never the password itself. */
+  logins: { username: string; ok: boolean }[];
+  /** VRP: the scheduled reboot fires (restores the saved configuration). */
+  reboot(): void;
+  /** Linux: every armed timer fires (runs its script). */
+  fireTimers(): void;
   close(): Promise<void>;
 }
 
@@ -207,12 +235,97 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
     safe: false,
     scheduledReboot: false,
     saved: false,
+    password: options.password ?? PASSWORD,
+    savedPassword: options.password ?? PASSWORD,
+    timers: new Map(),
+    scripts: new Map(),
+    logins: [],
+    reboot: () => {
+      device.password = device.savedPassword;
+    },
+    fireTimers: () => {
+      for (const [unit, file] of device.timers) {
+        device.timers.delete(unit);
+        runScript(file);
+      }
+    },
     close: () => Promise.resolve(),
+  };
+  let preSafePassword: string | null = null;
+  const hashOf = (password: string) =>
+    '$6$fake$' + [...new TextEncoder().encode(password)].map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  const unhash = (hash: string) =>
+    new TextDecoder().decode(
+      Uint8Array.from(hash.replace('$6$fake$', '').match(/../g) ?? [], (h) => parseInt(h, 16)),
+    );
+  /** Runs a rollback script of the form `chpasswd -e <<'EOF'\nuser:hash\nEOF`. */
+  const runScript = (file: string) => {
+    const body = device.scripts.get(file) ?? '';
+    const match = /^support:(\$6\$fake\$[0-9a-f]*)$/m.exec(body);
+    if (match) device.password = unhash(match[1]);
+    // The script removes itself (`rm -f -- <file>`).
+    if (/^rm -f -- /m.test(body)) device.scripts.delete(file);
+  };
+  /** Strips `sudo -n /bin/sh -c '<command>'` (the way the gateway runs commands as non-root). */
+  const unsudo = (command: string) => {
+    const m = /^sudo -n \/bin\/sh -c '(.*)'$/s.exec(command);
+    return m ? m[1].replace(/'\\''/g, "'") : command;
   };
   let safeOwner: unknown = null;
 
-  const defaultReply = (command: string): ExecReply => {
+  const defaultReply = (wire: string, stdin = ''): ExecReply => {
+    const command = unsudo(wire);
     if (options.kind === 'linux') {
+      const shadow = /^getent shadow (\S+)$/.exec(command);
+      if (shadow) {
+        return shadow[1] === 'support'
+          ? { stdout: `support:${hashOf(device.password)}:19000:0:99999:7:::\n`, code: 0 }
+          : { code: 2 };
+      }
+      const install = /^(?:umask 077; )?install -m 600 \/dev\/stdin (\/run\/mns-rb-[0-9a-f]+\.sh)$/
+        .exec(command);
+      if (install) {
+        device.scripts.set(install[1], stdin);
+        return { code: 0 };
+      }
+      if (command === 'chpasswd') {
+        const m = /^support:(.*)\n$/s.exec(stdin);
+        if (!m) return { stderr: 'chpasswd: bad input\n', code: 1 };
+        device.password = m[1];
+        return { code: 0 };
+      }
+      const armTimer = /--unit=(mns-rb-[0-9a-f]+) .* \/bin\/sh (\/run\/mns-rb-[0-9a-f]+\.sh)$/
+        .exec(command);
+      if (armTimer) {
+        const unit = armTimer[1];
+        device.timers.set(unit, armTimer[2]);
+        if (options.timerFireMs !== undefined) {
+          setTimeout(() => {
+            const file = device.timers.get(unit);
+            if (file === undefined) return;
+            device.timers.delete(unit);
+            runScript(file);
+          }, options.timerFireMs).unref?.();
+        }
+        return { code: 0 };
+      }
+      const start = /^systemctl start (mns-rb-[0-9a-f]+)\.service$/.exec(command);
+      if (start) {
+        const file = device.timers.get(start[1]);
+        if (file) runScript(file);
+        return { code: 0 };
+      }
+      const stop = /^systemctl stop (mns-rb-[0-9a-f]+)\.timer$/.exec(command);
+      if (stop) {
+        device.timers.delete(stop[1]);
+        return { code: 0 };
+      }
+      const rm = /^rm -f (\S+)$/.exec(command);
+      if (rm) {
+        device.scripts.delete(rm[1]);
+        return { code: 0 };
+      }
       if (command === 'id -u') return { stdout: `${options.uid ?? 0}\n`, code: 0 };
       if (command.includes('FAILME')) return { stderr: 'boom\n', code: 1 };
       return { stdout: '', code: 0 };
@@ -232,6 +345,8 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
         device.safe = false;
         device.pending = [];
         safeOwner = null;
+        if (preSafePassword !== null) device.password = preSafePassword;
+        preSafePassword = null;
         device.events.push('reverted');
       }
     });
@@ -258,6 +373,7 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
             safeOwner = null;
             device.committed.push(...device.pending);
             device.pending = [];
+            preSafePassword = null;
             device.events.push('released');
             if (!options.silentRelease) stream.write(`Safe mode released\r\n${prompt()}`);
             if (options.dropAfterRelease) client.end();
@@ -277,6 +393,12 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
             stream.write('Configuration exported\r\n');
           } else if (command.includes(ROS_ERROR_WORD)) {
             stream.write('failure: bad thing happened\r\n');
+          } else if (/^\/user set \[find name="support"\] password="[^"]*"$/.test(command)) {
+            // Safe mode changes are live at once and revert when the session drops.
+            if (device.safe && preSafePassword === null) preSafePassword = device.password;
+            device.password = /password="([^"]*)"$/.exec(command)![1];
+            if (device.safe) device.pending.push(command);
+            else device.committed.push(command);
           } else if (device.safe) device.pending.push(command);
           else device.committed.push(command);
           if (command.includes('PAGER')) {
@@ -332,6 +454,15 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
         device.shellLines.push(command);
         if (command === 'display fail') {
           stream.write(`Error: Wrong parameter found at '^' position.\r\n${prompt()}`);
+        } else if (command.startsWith('display local-user username ')) {
+          const name = command.split(' ').at(-1)!;
+          const listed = (options.localUsers ?? ['support']).includes(name);
+          stream.write(
+            (listed
+              ? `User-name                : ${name}\r\n`
+              : 'Info: The user does not exist.\r\n') +
+              prompt(),
+          );
         } else if (command.startsWith('display')) {
           stream.write(`Huawei VRP simulated output\r\n${prompt()}`);
         } else if (command.startsWith('screen-length')) {
@@ -342,9 +473,18 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
         } else if (command === 'return') {
           view = false;
           stream.write(prompt());
+        } else if (/^local-user support password irreversible-cipher \S+$/.test(command)) {
+          device.password = command.split(' ').at(-1)!;
+          device.pending.push(command);
+          stream.write(prompt());
+        } else if (command === 'save' && options.failSave) {
+          ask(command, 'Are you sure to save the configuration?', () => {
+            stream.write(`Error: Failed to save the configuration.\r\n${prompt()}`);
+          });
         } else if (command.startsWith('save')) {
           ask(command, 'Are you sure to save the configuration?', () => {
             device.saved = true;
+            device.savedPassword = device.password;
             device.events.push(`save:${command}`);
             stream.write(`Save the configuration successfully.\r\n${prompt()}`);
           });
@@ -353,6 +493,10 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
             device.scheduledReboot = true;
             device.events.push(`schedule:${command}`);
             stream.write(`Info: scheduled.\r\n${prompt()}`);
+          });
+        } else if (command === 'undo schedule reboot' && options.failUndo) {
+          ask(command, 'Info: Cancel the scheduled reboot. Confirm?', () => {
+            stream.write(`Error: Failed to cancel the reboot.\r\n${prompt()}`);
           });
         } else if (command === 'undo schedule reboot') {
           ask(command, 'Info: Cancel the scheduled reboot. Confirm?', () => {
@@ -380,7 +524,11 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
     // deno-lint-ignore no-explicit-any
     client.on('authentication', (ctx: any) => {
       const base = ctx.username.replace(/\+ct(?:\d+w)?$/, '');
-      if (ctx.method === 'password' && base === 'support' && ctx.password === PASSWORD) {
+      const ok = ctx.method === 'password' && base === 'support' &&
+        ctx.password === device.password &&
+        !(options.rejectNewPassword && ctx.password !== (options.password ?? PASSWORD));
+      if (ctx.method === 'password') device.logins.push({ username: ctx.username, ok });
+      if (ok) {
         device.usernames.push(ctx.username);
         device.authenticated++;
         ctx.accept();
@@ -400,11 +548,25 @@ export function startExecDevice(hostKey: string, options: ExecDeviceOptions): Pr
         session.on('exec', (ok: any, _reject: any, info: { command: string }) => {
           const stream = ok();
           device.execs.push(info.command);
-          const reply = options.respond?.(info.command) ?? defaultReply(info.command);
-          if (reply.stdout) stream.write(reply.stdout);
-          if (reply.stderr) stream.stderr.write(reply.stderr);
-          if (reply.code !== null) stream.exit(reply.code ?? 0);
-          stream.end();
+          const answer = (stdin: string) => {
+            const dropAfter = options.dropOn?.test(info.command) ?? false;
+            const reply = options.respond?.(info.command) ?? defaultReply(info.command, stdin);
+            if (dropAfter) {
+              // The effect happened; the reply never reaches the client.
+              client.end();
+              return;
+            }
+            if (reply.stdout) stream.write(reply.stdout);
+            if (reply.stderr) stream.stderr.write(reply.stderr);
+            if (reply.code !== null) stream.exit(reply.code ?? 0);
+            stream.end();
+          };
+          // Commands that read stdin (the gateway sends secrets there) answer at end of input.
+          if (/\/dev\/stdin|chpasswd/.test(info.command)) {
+            let stdin = '';
+            stream.on('data', (chunk: Uint8Array) => stdin += new TextDecoder().decode(chunk));
+            stream.on('end', () => answer(stdin));
+          } else answer('');
         });
         // deno-lint-ignore no-explicit-any
         session.on('shell', (ok: any) => {

@@ -11,6 +11,7 @@ import type { ControlMessage } from '../shared/framing.ts';
 import { parseAddress } from '../shared/ip.ts';
 import type {
   ControllerToWorker,
+  CredentialRole,
   WorkerCredential,
   WorkerInit,
   WorkerToController,
@@ -103,7 +104,9 @@ class Mailbox {
       for (const handler of this.#closed) handler(message.reason);
       return;
     }
-    const key = message.t === 'credential_unavailable' ? 'credential' : message.t;
+    const key = message.t === 'credential_unavailable' || message.t === 'credential'
+      ? `credential:${message.role ?? 'current'}`
+      : message.t;
     const waiter = this.#waiters.get(key);
     if (waiter) {
       this.#waiters.delete(key);
@@ -176,9 +179,11 @@ export async function runWorker(io: WorkerIO): Promise<Exit> {
   const redactor = new Redactor(rules.redact);
   const control = (m: ControlMessage) => io.send({ t: 'control', m });
 
-  const requestCredential = async (): Promise<WorkerCredential | null> => {
-    io.send({ t: 'need_credential' });
-    const reply = await mailbox.wait<WorkerCredential>('credential', 45000);
+  const requestCredential = async (
+    role: CredentialRole = 'current',
+  ): Promise<WorkerCredential | null> => {
+    io.send({ t: 'need_credential', role });
+    const reply = await mailbox.wait<WorkerCredential>(`credential:${role}`, 45000);
     if (!reply || reply.t !== 'credential') return null;
     redactor.addSecret(reply.password);
     redactor.addSecret(reply.passphrase);

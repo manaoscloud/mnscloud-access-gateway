@@ -1,13 +1,14 @@
 // Exec mode (AI copilot, ST-F): payload contract, pre-classification, read and change flows
 // against a fake device (exec channels, RouterOS-like safe mode, VRP-like prompts, Linux codes).
 
+import { createHash } from 'node:crypto';
 import { parseAssignment } from '../src/controller/contract.ts';
 import type { FinishBody } from '../src/controller/contract.ts';
 import { Gateway } from '../src/controller/gateway.ts';
 import { buildDenylist } from '../src/controller/denylist.ts';
 import { Session } from '../src/controller/session.ts';
 import type { RuntimeEvent, SessionApi } from '../src/controller/session.ts';
-import { DirectLauncher } from '../src/controller/worker_launcher.ts';
+import { DirectLauncher, type WorkerLauncher } from '../src/controller/worker_launcher.ts';
 import { type ExecPayload, type ExecResult, execSha256 } from '../src/shared/exec.ts';
 import { fitResult, planExec } from '../src/worker/exec.ts';
 import { deadlineExceeded } from '../src/worker/exec_policy.ts';
@@ -44,6 +45,7 @@ function payloadOf(connectionUUID: string, options: Options): ExecPayload {
     rollbackSeconds: options.rollbackSeconds ?? 300,
     backupName: options.backupName ?? null,
     changeLog: options.changeLog ?? null,
+    ...(options.autonomous ? { autonomous: true } : {}),
     sha256: '',
   };
   return { ...base, sha256: execSha256(base) };
@@ -58,16 +60,19 @@ class FakeApi implements SessionApi {
   hostKey() {
     return Promise.resolve({ decision: 'accept' as const, pinned: this.pinAccept });
   }
-  credential() {
-    this.calls.push('credential');
+  credential(_c: string, role?: 'current' | 'new') {
+    this.calls.push(role === 'new' ? 'credential:new' : 'credential');
     return Promise.resolve({
-      credentialUseUUID: '11111111-2222-4333-8444-555555555555',
-      wrapToken: 'wrap-token-0123456789',
+      credentialUseUUID: role === 'new'
+        ? '66666666-2222-4333-8444-555555555555'
+        : '11111111-2222-4333-8444-555555555555',
+      wrapToken: role === 'new' ? 'wrap-new-token-0123456789' : 'wrap-token-0123456789',
       ttlSeconds: 30,
     });
   }
-  credentialResult(_c: string, body: { result: string }) {
-    this.calls.push(`credential:${body.result}`);
+  credentialResult(_c: string, body: { credentialUseUUID: string; result: string }) {
+    const role = body.credentialUseUUID.startsWith('66666666') ? 'new:' : '';
+    this.calls.push(`credential:${role}${body.result}`);
     return Promise.resolve();
   }
   events(_c: string, _events: RuntimeEvent[]) {
@@ -95,15 +100,23 @@ class FakeApi implements SessionApi {
   }
 }
 
-type Dialect = 'routeros' | 'linux' | 'vrp';
+type Dialect = 'routeros' | 'linux' | 'vrp' | 'proxmox';
 
 async function run(
   dialect: Dialect,
   exec: Options,
-  device: ExecDeviceOptions & { level?: 'n1' | 'n2' | 'n3'; api?: FakeApi } = { kind: dialect },
+  device: Partial<ExecDeviceOptions> & {
+    level?: 'n1' | 'n2' | 'n3';
+    api?: FakeApi;
+    /** Credential per wrapping token (default: the device password for both roles). */
+    unwrap?: (token: string) => { username?: string; password?: string };
+  } = {},
 ) {
   const key = generateHostKey();
-  const fake = await startExecDevice(key, { ...device, kind: dialect });
+  const fake = await startExecDevice(key, {
+    ...device,
+    kind: dialect === 'proxmox' ? 'linux' : dialect,
+  });
   const api = device.api ?? new FakeApi();
   const connectionUUID = crypto.randomUUID();
   const assignment = parseAssignment({
@@ -121,7 +134,10 @@ async function run(
   const logs: string[] = [];
   const session = new Session(assignment, {
     api,
-    unwrap: () => Promise.resolve({ username: 'support', password: PASSWORD }),
+    unwrap: (token) =>
+      Promise.resolve(
+        device.unwrap?.(token) ?? { username: 'support', password: PASSWORD },
+      ),
     launcher: new DirectLauncher(ROOT),
     networks: null,
     sandbox: { memoryMaxMB: 256, cpuQuotaPercent: 50, tasksMax: 64 },
@@ -1142,5 +1158,728 @@ Deno.test({
     assertEquals(result.error?.code, 'ROLLBACK_FAILED');
     assertEquals(result.rollback.armed, true);
     assertEquals(device.execs.some((c) => c.startsWith('systemctl stop')), false);
+  },
+});
+
+// ---------------------------------------------------------------------------------------------
+// ST-H: autonomous change flag and credential rotation (kind rotate)
+
+const sha = (text: string) => createHash('sha256').update(text).digest('hex');
+const NEW_PASSWORD = 'N3w-Rotated.Pass~2026';
+
+const rotate = (dialect: Dialect, extra: Options = {}): Options => ({
+  kind: 'rotate',
+  steps: [],
+  verify: [
+    dialect === 'routeros'
+      ? '/system identity print'
+      : dialect === 'vrp'
+      ? 'display version'
+      : 'id -un',
+  ],
+  safeChange: dialect === 'routeros'
+    ? 'routeros_safe_mode'
+    : dialect === 'vrp'
+    ? 'vrp5_schedule_reboot'
+    : 'systemd_deadman',
+  backupName: BACKUP,
+  changeLog: dialect === 'vrp'
+    ? { kind: 'report_only', line: LOG_LINE }
+    : { kind: dialect === 'routeros' ? 'script' : 'file', line: LOG_LINE },
+  ...extra,
+});
+
+/** Both credentials: `current` is the device password, `new` the replacement. */
+const credentials = (next: { username?: string; password?: string } = {
+  username: 'support',
+  password: NEW_PASSWORD,
+}) =>
+(token: string) =>
+  token.startsWith('wrap-new') ? next : { username: 'support', password: PASSWORD };
+
+const noSecret = (value: unknown, logs: string[] = []) => {
+  const text = JSON.stringify(value) + logs.join('\n');
+  assertNotIncludes(text, PASSWORD);
+  assertNotIncludes(text, NEW_PASSWORD);
+};
+
+Deno.test('exec contract ST-H: autonomous joins the canonical JSON only when true', () => {
+  const id = ASSIGNMENT.connectionUUID;
+  const change: Options = {
+    kind: 'change',
+    steps: ['/system identity set name=x'],
+    verify: ['/ip address print'],
+    safeChange: 'routeros_safe_mode',
+    backupName: BACKUP,
+  };
+  const plain = payloadOf(id, change);
+  const legacy = JSON.stringify({
+    kind: 'change',
+    steps: plain.steps,
+    verify: plain.verify,
+    rollback: [],
+    safeChange: 'routeros_safe_mode',
+    rollbackSeconds: 300,
+    backupName: BACKUP,
+    changeLog: null,
+  });
+  // ST-F payloads keep their hash.
+  assertEquals(plain.sha256, sha(legacy));
+  const auto = payloadOf(id, { ...change, autonomous: true });
+  assert(auto.sha256 !== plain.sha256);
+  assertEquals(auto.sha256, sha(legacy.slice(0, -1) + ',"autonomous":true}'));
+  const base = { ...ASSIGNMENT, mode: 'exec', ticket: null, shellDialect: 'routeros' };
+  assertEquals(parseAssignment({ ...base, exec: auto }).exec?.autonomous, true);
+  // `false` is accepted and hashes like absent; it is not kept.
+  const explicit = { ...plain, autonomous: false };
+  assertEquals(parseAssignment({ ...base, exec: explicit }).exec?.autonomous, undefined);
+  // The flag cannot be added to a signed payload, and only a change carries it.
+  assertThrows(
+    () => parseAssignment({ ...base, exec: { ...plain, autonomous: true } }),
+    /EXEC_PAYLOAD_MISMATCH/,
+  );
+  assertThrows(() => parseAssignment({ ...base, exec: { ...plain, autonomous: 'yes' } }), /exec/);
+  assertThrows(
+    () =>
+      parseAssignment({
+        ...base,
+        shellDialect: 'linux',
+        exec: payloadOf(id, { steps: ['uptime'], autonomous: true }),
+      }),
+    /Invalid exec/,
+  );
+});
+
+const FAKE_HASH = (password: string) =>
+  '$6$fake$' + [...new TextEncoder().encode(password)].map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+
+const REDACTED_ROS = '/user set [find name="support"] password=<redacted>';
+
+Deno.test('exec contract ST-H: rotate payload is strict and never travels over a connector', () => {
+  const id = ASSIGNMENT.connectionUUID;
+  const base = { ...ASSIGNMENT, mode: 'exec', ticket: null };
+  const parse = (dialect: Dialect, options: Options) => () =>
+    parseAssignment({ ...base, shellDialect: dialect, exec: payloadOf(id, options) });
+  for (const dialect of ['routeros', 'vrp', 'linux'] as const) {
+    assertEquals(parse(dialect, rotate(dialect))().exec?.kind, 'rotate');
+  }
+  assertEquals(parse('routeros', rotate('routeros'))().exec?.steps, []);
+  assertThrows(parse('routeros', rotate('routeros', { steps: ['/user print'] })), /Invalid exec/);
+  assertThrows(
+    parse('routeros', rotate('routeros', { verify: Array(6).fill('/ip address print') })),
+    /Invalid exec/,
+  );
+  assertThrows(parse('routeros', rotate('routeros', { verify: [] })), /Invalid exec/);
+  assertThrows(parse('linux', rotate('linux', { rollback: ['true'] })), /Invalid exec/);
+  assertThrows(parse('routeros', rotate('routeros', { rollbackSeconds: 60 })), /Invalid exec/);
+  assertThrows(parse('routeros', rotate('routeros', { backupName: undefined })), /Invalid exec/);
+  assertThrows(parse('routeros', rotate('routeros', { autonomous: true })), /Invalid exec/);
+  assertThrows(parse('linux', rotate('routeros')), /Invalid exec/); // safe mode on a linux device
+  assertThrows(
+    () =>
+      parseAssignment({
+        ...base,
+        shellDialect: 'routeros',
+        exec: payloadOf(id, rotate('routeros')),
+        path: 'connector',
+        transport: 'connector',
+        connectorUuid: id,
+        connectorKeyFingerprint: 'SHA256:Vkdap1RjR0wChd9dvyvKtz2mUTWIOem3dIGy6rEHcIw=',
+      }),
+    /exec_change_unsupported_transport/,
+  );
+});
+
+Deno.test('exec policy ST-H: rotate classifies only its verify reads', () => {
+  const rules = loadRules('routeros');
+  const id = ASSIGNMENT.connectionUUID;
+  const plan = planExec(payloadOf(id, rotate('routeros')), rules, 'n3');
+  assertEquals(plan.items.map((i) => i.phase), ['verify']);
+  assertEquals(plan.blocked, false);
+  const bad = planExec(
+    payloadOf(id, rotate('routeros', { verify: ['/system reboot'] })),
+    rules,
+    'n3',
+  );
+  assertEquals(bad.blocked, true);
+  // Below n3 a rotation is blocked by the level rule.
+  const low = planExec(payloadOf(id, rotate('routeros')), rules, 'n2');
+  assertEquals(low.items.find((i) => i.rule === 'rotate_level')?.verdict, 'blocked');
+});
+
+Deno.test({
+  name: 'exec autonomous ST-H: only read and write_low steps run; anything else is blocked',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const risky = ['/ip firewall filter add chain=input action=drop comment=x'];
+    const n3 = { kind: 'routeros', level: 'n3' } as const;
+    const blocked = await run('routeros', { ...rosChange(risky), autonomous: true }, n3);
+    assertEquals(blocked.result.status, 'blocked');
+    assertEquals(blocked.result.error?.code, 'EXEC_BLOCKED');
+    assertEquals(blocked.result.steps[0].class, 'write_risky');
+    assertEquals(blocked.result.steps[0].rule, 'autonomous');
+    assertEquals(blocked.result.steps[0].verdict, 'blocked');
+    assertEquals(blocked.device.authenticated, 0);
+    // The same step is not blocked by the autonomous rule when supervised.
+    const supervised = await run('routeros', rosChange(risky), n3);
+    assertEquals(supervised.result.status, 'applied');
+    // A write_low step is fine in both modes, and an unknown line is blocked.
+    const low = await run('routeros', {
+      ...rosChange(['/system identity set name=lab']),
+      autonomous: true,
+    });
+    assertEquals(low.result.status, 'applied');
+    const unknown = await run('linux', { ...linuxChange(['nginx -t']), autonomous: true });
+    assertEquals(unknown.result.status, 'blocked');
+  },
+});
+
+Deno.test({
+  name: 'exec rotate RouterOS: safe mode, verify with the NEW password, commit, no secret leaks',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, api, logs } = await run('routeros', rotate('routeros'), {
+      kind: 'routeros',
+      level: 'n3',
+      unwrap: credentials(),
+    });
+    assertEquals(result.status, 'applied');
+    assertEquals(result.error, null);
+    assertEquals(device.password, NEW_PASSWORD);
+    assertEquals(result.credentialActive, 'new');
+    assertEquals(device.events.filter((e) => e !== 'pager-dump'), ['safe-taken', 'released']);
+    // Login 1 is the current password (safe mode shell), login 2 the NEW password (verify).
+    assertEquals(device.logins, [
+      { username: 'support+ct4096w', ok: true },
+      { username: 'support', ok: true },
+    ]);
+    assertEquals(
+      result.steps.filter((s) => s.phase === 'step').map((s) => s.command),
+      [REDACTED_ROS],
+    );
+    assertEquals(api.calls.filter((c) => c.startsWith('credential')), [
+      'credential',
+      'credential:used',
+      'credential:new',
+      'credential:new:used',
+    ]);
+    noSecret(result, logs);
+  },
+});
+
+Deno.test({
+  name: 'exec rotate RouterOS: a refused NEW login reverts the change; the old password works',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, api, logs } = await run('routeros', rotate('routeros'), {
+      kind: 'routeros',
+      level: 'n3',
+      rejectNewPassword: true,
+      unwrap: credentials(),
+    });
+    assertEquals(result.status, 'rolled_back');
+    assertEquals(result.error?.code, 'VERIFY_FAILED');
+    assertEquals(result.rollback.fired, true);
+    assertEquals(device.password, PASSWORD);
+    assert(device.events.includes('reverted'));
+    assert(!device.events.includes('released'));
+    assert(api.calls.includes('credential:new:auth_failed'));
+    assert(device.logins.some((l) => !l.ok), 'the NEW login was refused');
+    assertEquals(result.credentialActive, 'current');
+    noSecret(result, logs);
+  },
+});
+
+Deno.test({
+  name: 'exec rotate: an unsafe password, another user or a reused password change nothing',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    for (
+      const next of ['short', 'has space and a long enough value', PASSWORD, `${NEW_PASSWORD}"`]
+    ) {
+      const r = await run('routeros', rotate('routeros'), {
+        kind: 'routeros',
+        level: 'n3',
+        unwrap: credentials({ username: 'support', password: next }),
+      });
+      assertEquals(r.result.status, 'failed');
+      assertEquals(r.result.error?.code, 'CREDENTIAL_UNSAFE');
+      assertEquals(r.device.password, PASSWORD);
+      assertEquals(r.device.events, []);
+      assertEquals(r.device.shellLines, []);
+      assertEquals(r.device.connections, 1, 'nothing connects past the first login');
+      noSecret(r.result, r.logs);
+    }
+    const other = await run('routeros', rotate('routeros'), {
+      kind: 'routeros',
+      level: 'n3',
+      unwrap: credentials({ username: 'admin', password: NEW_PASSWORD }),
+    });
+    assertEquals(other.result.status, 'blocked');
+    assertEquals(other.result.error?.code, 'CREDENTIAL_MISMATCH');
+    assertEquals(other.device.password, PASSWORD);
+    assertEquals(other.device.connections, 1);
+    assertEquals(other.device.events, []);
+    noSecret(other.result, other.logs);
+  },
+});
+
+Deno.test({
+  name:
+    'exec rotate VRP: password set in aaa, verify with the NEW password, reboot cancelled, saved',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, logs } = await run('vrp', rotate('vrp'), {
+      kind: 'vrp',
+      level: 'n3',
+      unwrap: credentials(),
+    });
+    assertEquals(result.status, 'applied');
+    assertEquals(device.password, NEW_PASSWORD);
+    assertEquals(device.savedPassword, NEW_PASSWORD);
+    assertEquals(device.scheduledReboot, false);
+    assertEquals(result.credentialActive, 'new');
+    assertEquals(
+      result.steps.filter((s) => s.phase === 'step').map((s) => s.command),
+      ['aaa', 'local-user support password irreversible-cipher <redacted>', 'quit'],
+    );
+    assertEquals(device.logins.map((l) => l.ok), [true, true]);
+    noSecret(result, logs);
+  },
+});
+
+Deno.test({
+  name: 'exec rotate VRP: a refused NEW login leaves the reboot pending; the reboot restores it',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, logs } = await run('vrp', rotate('vrp'), {
+      kind: 'vrp',
+      level: 'n3',
+      rejectNewPassword: true,
+      unwrap: credentials(),
+    });
+    assertEquals(result.status, 'rolled_back');
+    assertEquals(result.error?.code, 'VERIFY_FAILED');
+    assertEquals(result.rollback.pendingReboot, true);
+    assertEquals(device.scheduledReboot, true);
+    assertEquals(device.savedPassword, PASSWORD, 'the change was never saved');
+    device.reboot();
+    assertEquals(device.password, PASSWORD);
+    noSecret(result, logs);
+  },
+});
+
+Deno.test({
+  name: 'exec rotate Linux: root-only rollback script via stdin, chpasswd via stdin, NEW verify',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, logs, connectionUUID } = await run('linux', rotate('linux'), {
+      kind: 'linux',
+      level: 'n3',
+      unwrap: credentials(),
+    });
+    assertEquals(result.status, 'applied');
+    assertEquals(device.password, NEW_PASSWORD);
+    const unit = `mns-rb-${connectionUUID.replaceAll('-', '')}`;
+    assertEquals(device.execs, [
+      'id -u',
+      'getent shadow support',
+      `umask 077; install -m 600 /dev/stdin /run/${unit}.sh`,
+      `systemd-run --unit=${unit} --on-active=300 --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=120 /bin/sh /run/${unit}.sh`,
+      'chpasswd',
+      'id -un', // verification: second connection, NEW password
+      `systemctl stop ${unit}.timer`,
+      `rm -f /run/${unit}.sh`,
+      `printf '%s\\n' '${LOG_LINE}' >> /etc/mnscloud-changelog`,
+    ]);
+    assertEquals(device.logins.map((l) => l.ok), [true, true]);
+    assertEquals(device.timers.size, 0);
+    assertEquals(device.scripts.size, 0, 'the rollback script is removed after the commit');
+    // No secret (new password, old password or old hash) ever reaches an argv or the result.
+    const argv = device.execs.join('\n');
+    for (const value of [NEW_PASSWORD, PASSWORD, FAKE_HASH(PASSWORD)]) {
+      assertNotIncludes(argv, value);
+      assertNotIncludes(JSON.stringify(result), value);
+      assertNotIncludes(logs.join('\n'), value);
+    }
+    assertEquals(
+      result.steps.find((s) => s.command === 'getent shadow support')?.output,
+      '',
+    );
+  },
+});
+
+Deno.test({
+  name: 'exec rotate Linux: a refused NEW login restores the old hash from the script',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, logs } = await run('linux', rotate('linux'), {
+      kind: 'linux',
+      level: 'n3',
+      rejectNewPassword: true,
+      unwrap: credentials(),
+    });
+    assertEquals(result.status, 'rolled_back');
+    assertEquals(result.error?.code, 'VERIFY_FAILED');
+    assertEquals(device.password, PASSWORD);
+    assertEquals(result.credentialActive, 'current');
+    assertEquals(device.timers.size, 0);
+    assertEquals(device.scripts.size, 0);
+    assertEquals(result.rollback, {
+      method: 'deadman_timer',
+      armed: false,
+      fired: true,
+      pendingReboot: false,
+    });
+    noSecret(result, logs);
+    assertNotIncludes(JSON.stringify(result), FAKE_HASH(PASSWORD));
+  },
+});
+
+Deno.test({
+  name: 'exec rotate Linux: when the timer cannot be stopped it stays armed and restores the hash',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device } = await run('linux', rotate('linux'), {
+      kind: 'linux',
+      level: 'n3',
+      unwrap: credentials(),
+      respond: (command) => command.startsWith('systemctl stop') ? { code: 1 } : undefined,
+      timerFireMs: 1500,
+    });
+    assertEquals(result.status, 'failed');
+    assertEquals(result.error?.code, 'DEADMAN_DISARM_FAILED');
+    // The probe waited for the timer, which fired and restored the old hash.
+    assertEquals(result.credentialActive, 'current');
+    assertEquals(result.rollback.fired, true);
+    assertEquals(device.timers.size, 0);
+    assertEquals(device.password, PASSWORD);
+  },
+});
+
+Deno.test({
+  name:
+    'exec rotate Linux: non-root uses sudo -n, a shadow failure or another user changes nothing',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const sudo = await run('linux', rotate('linux'), {
+      kind: 'linux',
+      level: 'n3',
+      uid: 1000,
+      unwrap: credentials(),
+    });
+    assertEquals(sudo.result.status, 'applied');
+    assertEquals(sudo.device.password, NEW_PASSWORD);
+    assert(sudo.device.execs.includes(`sudo -n /bin/sh -c 'chpasswd'`));
+    assert(sudo.device.execs.includes(`sudo -n /bin/sh -c 'id -un'`));
+    assertNotIncludes(sudo.device.execs.join('\n'), NEW_PASSWORD);
+
+    const noShadow = await run('linux', rotate('linux'), {
+      kind: 'linux',
+      level: 'n3',
+      unwrap: credentials(),
+      respond: (command) => command.startsWith('getent') ? { code: 2 } : undefined,
+    });
+    assertEquals(noShadow.result.status, 'failed');
+    assertEquals(noShadow.result.error?.code, 'SHADOW_UNAVAILABLE');
+    assertEquals(noShadow.device.password, PASSWORD);
+    assertEquals(noShadow.device.timers.size, 0);
+
+    const locked = await run('linux', rotate('linux'), {
+      kind: 'linux',
+      level: 'n3',
+      unwrap: credentials(),
+      respond: (command) =>
+        command.startsWith('getent') ? { stdout: 'support:!$6$x$y:1::::::\n', code: 0 } : undefined,
+    });
+    assertEquals(locked.result.error?.code, 'SHADOW_UNAVAILABLE');
+
+    const other = await run('linux', rotate('linux'), {
+      kind: 'linux',
+      level: 'n3',
+      unwrap: credentials({ username: 'root', password: NEW_PASSWORD }),
+    });
+    assertEquals(other.result.status, 'blocked');
+    assertEquals(other.result.error?.code, 'CREDENTIAL_MISMATCH');
+    assertEquals(other.device.execs, ['id -u'], 'nothing changed or armed');
+    assertEquals(other.device.password, PASSWORD);
+  },
+});
+
+// --- ST-H review: settle probe, VRP save order, level gate, script hygiene -------------------
+
+const rotateOptions = (extra: Partial<ExecDeviceOptions> = {}) => ({
+  level: 'n3' as const,
+  unwrap: credentials(),
+  ...extra,
+});
+
+Deno.test({
+  name: 'exec rotate: needs support level n3 (rule rotate_level), nothing connects',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const r = await run('routeros', rotate('routeros'), {
+      kind: 'routeros',
+      unwrap: credentials(),
+    });
+    assertEquals(r.result.status, 'blocked');
+    assertEquals(r.result.error?.code, 'EXEC_BLOCKED');
+    assertEquals(r.result.steps.find((s) => s.rule === 'rotate_level')?.verdict, 'blocked');
+    assertEquals(r.result.credentialActive, 'unknown');
+    assertEquals(r.device.authenticated, 0);
+    assertEquals(r.api.calls.includes('credential'), false);
+  },
+});
+
+Deno.test({
+  name: 'exec rotate RouterOS: an unconfirmed release is settled by a probe (new password wins)',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, logs } = await run(
+      'routeros',
+      rotate('routeros'),
+      rotateOptions({ kind: 'routeros', silentRelease: true }),
+    );
+    assertEquals(result.error?.code, 'RELEASE_UNCERTAIN');
+    assertEquals(result.status, 'applied', 'the probe proved the new password is live');
+    assertEquals(result.credentialActive, 'new');
+    assertEquals(device.password, NEW_PASSWORD);
+    noSecret(result, logs);
+  },
+});
+
+Deno.test({
+  name:
+    'exec rotate VRP: a failed save keeps the reboot armed (current); a failed undo after save is applied',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const save = await run('vrp', rotate('vrp'), rotateOptions({ kind: 'vrp', failSave: true }));
+    assertEquals(save.result.status, 'rolled_back');
+    assertEquals(save.result.error?.code, 'SAVE_FAILED');
+    assertEquals(save.result.rollback.pendingReboot, true);
+    assertEquals(save.result.credentialActive, 'current');
+    assertEquals(save.device.scheduledReboot, true);
+    save.device.reboot();
+    assertEquals(save.device.password, PASSWORD);
+    noSecret(save.result, save.logs);
+
+    const undo = await run('vrp', rotate('vrp'), rotateOptions({ kind: 'vrp', failUndo: true }));
+    assertEquals(undo.result.status, 'applied');
+    assertEquals(undo.result.error?.code, 'CANCEL_FAILED');
+    assertEquals(undo.result.rollback.pendingReboot, true);
+    assertEquals(undo.result.credentialActive, 'new');
+    undo.device.reboot();
+    assertEquals(undo.device.password, NEW_PASSWORD, 'saved before the reboot');
+    // The save comes before the reboot is cancelled.
+    const order = undo.device.answers.map((a) => a.command);
+    assert(order.indexOf('save') < order.indexOf('undo schedule reboot'));
+    noSecret(undo.result, undo.logs);
+  },
+});
+
+Deno.test({
+  name: 'exec rotate VRP: a user that is not local is refused before anything is scheduled',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const r = await run('vrp', rotate('vrp'), rotateOptions({ kind: 'vrp', localUsers: [] }));
+    assertEquals(r.result.status, 'failed');
+    assertEquals(r.result.error?.code, 'CREDENTIAL_UNSUPPORTED');
+    assertEquals(r.result.credentialActive, 'current');
+    assertEquals(r.device.events, []);
+    assertEquals(r.device.password, PASSWORD);
+  },
+});
+
+Deno.test({
+  name:
+    'exec rotate Linux: connection lost after chpasswd or during the timer stop is settled by a probe',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const afterChange = await run(
+      'linux',
+      rotate('linux'),
+      rotateOptions({ kind: 'linux', dropOn: /^chpasswd$/, timerFireMs: 1500 }),
+    );
+    assertEquals(afterChange.result.status, 'failed');
+    assertEquals(afterChange.result.error?.code, 'CONNECTION_LOST');
+    assertEquals(afterChange.result.credentialActive, 'current');
+    assertEquals(afterChange.result.rollback.fired, true);
+    assertEquals(afterChange.device.password, PASSWORD);
+    noSecret(afterChange.result, afterChange.logs);
+
+    const duringStop = await run(
+      'linux',
+      rotate('linux'),
+      rotateOptions({
+        kind: 'linux',
+        dropOn: /^systemctl stop /,
+        respond: (c) => c.startsWith('systemctl stop') ? { code: 1 } : undefined,
+        timerFireMs: 1500,
+      }),
+    );
+    assertEquals(duringStop.result.error?.code, 'CONNECTION_LOST');
+    assertEquals(duringStop.result.credentialActive, 'current');
+    assertEquals(duringStop.device.password, PASSWORD);
+  },
+});
+
+Deno.test({
+  name:
+    'exec rotate Linux: arming or script failures leave no script; a failed rollback is settled',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const arm = await run(
+      'linux',
+      rotate('linux'),
+      rotateOptions({
+        kind: 'linux',
+        respond: (c) => c.startsWith('systemd-run') ? { code: 1 } : undefined,
+      }),
+    );
+    assertEquals(arm.result.error?.code, 'ARM_FAILED');
+    assertEquals(arm.device.scripts.size, 0);
+    assertEquals(arm.device.password, PASSWORD);
+    assertEquals(arm.result.credentialActive, 'current');
+
+    const install = await run(
+      'linux',
+      rotate('linux'),
+      rotateOptions({
+        kind: 'linux',
+        respond: (c) => c.includes('install -m 600') ? { code: 1 } : undefined,
+      }),
+    );
+    assertEquals(install.result.error?.code, 'ROLLBACK_SCRIPT_FAILED');
+    assertEquals(install.device.scripts.size, 0);
+    assertEquals(install.device.timers.size, 0);
+
+    const rollback = await run(
+      'linux',
+      rotate('linux'),
+      rotateOptions({
+        kind: 'linux',
+        rejectNewPassword: true,
+        respond: (c) => c.startsWith('systemctl start') ? { code: 1 } : undefined,
+        timerFireMs: 1500,
+      }),
+    );
+    assertEquals(rollback.result.status, 'failed');
+    assertEquals(rollback.result.error?.code, 'ROLLBACK_FAILED');
+    assertEquals(rollback.result.credentialActive, 'current');
+    assertEquals(rollback.device.password, PASSWORD);
+    noSecret(rollback.result, rollback.logs);
+  },
+});
+
+Deno.test({
+  name: 'exec rotate proxmox: same flow as linux',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const { result, device, logs } = await run('proxmox', rotate('proxmox'), rotateOptions());
+    assertEquals(result.status, 'applied');
+    assertEquals(result.credentialActive, 'new');
+    assertEquals(device.password, NEW_PASSWORD);
+    noSecret(result, logs);
+  },
+});
+
+Deno.test({
+  name:
+    'controller ST-H: role new is refused outside a rotate; a second request closes the open use',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const sent: unknown[] = [];
+    const scripted = (messages: unknown[]): WorkerLauncher => ({
+      launch: () =>
+        Promise.resolve({
+          send: (m: unknown) => void sent.push(m),
+          messages: (async function* () {
+            for (const m of messages) {
+              await new Promise((r) => setTimeout(r, 30));
+              yield m;
+            }
+          })(),
+          kill: () => Promise.resolve(),
+          exited: Promise.resolve(0),
+        }),
+    });
+    const exit = { t: 'exit', state: 'closed', reason: 'exec_done', bytesIn: 0, bytesOut: 0 };
+    const start = async (kind: 'change' | 'rotate', messages: unknown[]) => {
+      const api = new FakeApi();
+      const connectionUUID = crypto.randomUUID();
+      const options = kind === 'change'
+        ? rosChange(['/system identity set name=x'])
+        : rotate('routeros');
+      const assignment = parseAssignment({
+        ...ASSIGNMENT,
+        connectionUUID,
+        mode: 'exec',
+        ticket: null,
+        shellDialect: 'routeros',
+        recording: { enabled: false, partBytes: 65536, partSeconds: 5 },
+        exec: payloadOf(connectionUUID, options),
+      });
+      const session = new Session(assignment, {
+        api,
+        unwrap: () => Promise.resolve({ username: 'support', password: PASSWORD }),
+        launcher: scripted(messages),
+        networks: null,
+        sandbox: { memoryMaxMB: 256, cpuQuotaPercent: 50, tasksMax: 64 },
+        log: () => {},
+        execResultRetryMs: [20, 20],
+      });
+      session.start();
+      await session.done;
+      return api;
+    };
+    const change = await start('change', [
+      { t: 'started' },
+      { t: 'need_credential', role: 'new' },
+      exit,
+    ]);
+    assertEquals(change.calls.includes('credential:new'), false, 'no API call for role new');
+    assert(
+      sent.some((m) =>
+        (m as { t: string; role?: string }).t === 'credential_unavailable' &&
+        (m as { role?: string }).role === 'new'
+      ),
+    );
+    sent.length = 0;
+    const bad = await start('rotate', [
+      { t: 'started' },
+      { t: 'need_credential', role: 'root' },
+      exit,
+    ]);
+    assertEquals(bad.calls.filter((c) => c.startsWith('credential')), []);
+    // Two requests for the same role: the first use is closed as unused.
+    const twice = await start('rotate', [
+      { t: 'started' },
+      { t: 'need_credential', role: 'new' },
+      { t: 'need_credential', role: 'new' },
+      exit,
+    ]);
+    assertEquals(
+      twice.calls.filter((c) => c.startsWith('credential')),
+      ['credential:new', 'credential:new:unused', 'credential:new', 'credential:new:unused'],
+    );
   },
 });

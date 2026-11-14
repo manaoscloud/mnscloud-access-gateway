@@ -306,7 +306,7 @@ function parseExec(v: Record<string, any>, transport: Assignment['transport']): 
   try {
     const exec = parseExecPayload(v.exec, v.shellDialect, v.connectionUUID);
     // A change verifies in a second SSH connection; the connector bridge carries only one.
-    if (exec.kind === 'change' && transport === 'connector') {
+    if (exec.kind !== 'read' && transport === 'connector') {
       throw new ContractError('exec_change_unsupported_transport');
     }
     return exec;
