@@ -10,10 +10,12 @@ import {
   READY_FRAME,
   utf8Length,
 } from '../shared/framing.ts';
+import type { ExecResult } from '../shared/exec.ts';
 import type { CommandEvent, Facts, WorkerInit, WorkerToController } from '../shared/ipc.ts';
 import type { Assignment, FinishBody, HostKeyResponse } from './contract.ts';
 import { type Bridge, startBridge } from './bridge.ts';
 import { MgmtVpnUnavailable, type SessionNet } from './netns.ts';
+import { ControlPlaneRejected } from './control_plane.ts';
 import type { Unwrapper } from './openvault.ts';
 import { RecordingUploader } from './recording.ts';
 import type { SandboxLimits } from './sandbox.ts';
@@ -56,6 +58,8 @@ export interface SessionApi {
     sha256: string,
   ): Promise<void>;
   finish(connection: string, body: FinishBody): Promise<void>;
+  /** Result of an exec connection (AI copilot); posted once, before `finish`. */
+  execResult(connection: string, result: ExecResult): Promise<void>;
   /** Consumes an attach ticket of a live support connection; rejects when the API refuses. */
   attach(connection: string, sha256: string): Promise<{ role: BrowserRole }>;
   /** The operator browser left a detachable connection (best effort). */
@@ -149,7 +153,12 @@ export interface SessionDeps {
   networks: SessionNetworkManager | null;
   sandbox: Omit<SandboxLimits, 'maxSessionSeconds'>;
   log(message: string): void;
+  /** Waits between attempts to deliver an exec result (tests shorten it). */
+  execResultRetryMs?: number[];
 }
+
+/** Default waits between attempts to deliver an exec result (first attempt is immediate). */
+export const EXEC_RESULT_RETRY_MS = [1000, 3000, 8000, 20000, 30000];
 
 const CLOSE_REASONS: Record<string, [number, string]> = {
   hostkey_mismatch: [4409, 'The device host key changed.'],
@@ -182,6 +191,7 @@ export class Session {
   #eventChain: Promise<void> = Promise.resolve();
   #recording: RecordingUploader | null = null;
   #facts: Facts | null = null;
+  #execResult: ExecResult | null = null;
   #credentialUse: string | null = null;
   #exit: Extract<WorkerToController, { t: 'exit' }> | null = null;
   #finished = false;
@@ -518,6 +528,7 @@ export class Session {
         verdictTimeoutSeconds: 120,
       },
       recording: this.#recording !== null,
+      ...(a.exec ? { exec: a.exec } : {}),
     };
     this.#worker.send(init);
     const worker = this.#worker;
@@ -570,6 +581,9 @@ export class Session {
         break;
       case 'facts':
         this.#facts = message.facts;
+        break;
+      case 'exec_result':
+        this.#execResult ??= message.result;
         break;
       case 'hostkey': {
         let decision: HostKeyResponse = { decision: 'block', pinned: false };
@@ -647,6 +661,37 @@ export class Session {
     }
   }
 
+  /** Posts the exec result once (retry with backoff; the API is idempotent). */
+  async #postExecResult(exit: Extract<WorkerToController, { t: 'exit' }>, reason: string) {
+    const result: ExecResult = this.#execResult ?? {
+      status: 'failed',
+      steps: [],
+      rollback: { method: 'none', armed: false, fired: false, pendingReboot: false },
+      error: {
+        code: (exit.state === 'closed' ? 'EXEC_NO_RESULT' : reason).toUpperCase(),
+        message: 'The request ended without a result.',
+      },
+    };
+    const waits = [0, ...(this.deps.execResultRetryMs ?? EXEC_RESULT_RETRY_MS)];
+    for (const wait of waits) {
+      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+      try {
+        await this.deps.api.execResult(this.uuid, result);
+        return;
+      } catch (error) {
+        // A client error other than timeout/rate limit will not change by retrying.
+        if (
+          error instanceof ControlPlaneRejected && error.status >= 400 && error.status < 500 &&
+          ![408, 425, 429].includes(error.status)
+        ) {
+          this.deps.log(`exec result of ${this.uuid} refused: ${error.message}`);
+          return;
+        }
+        this.deps.log(`exec result of ${this.uuid} not delivered: ${(error as Error).message}`);
+      }
+    }
+  }
+
   async #finish(exit: Extract<WorkerToController, { t: 'exit' }>) {
     if (this.#finished) return;
     this.#finished = true;
@@ -686,6 +731,7 @@ export class Session {
       await this.deps.networks.destroy(this.#net, this.assignment.target, this.assignment.mgmtVpn)
         .catch(() => {});
     }
+    if (this.assignment.mode === 'exec') await this.#postExecResult(exit, reason);
     const body: FinishBody = {
       state: exit.state,
       reason,

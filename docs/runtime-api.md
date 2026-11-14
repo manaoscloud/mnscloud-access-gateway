@@ -158,7 +158,7 @@ ends them (finish reason `cancelled`).
 ```json
 {
   "connectionUUID": "uuid",
-  "mode": "console | test",
+  "mode": "console | test | exec",
   "protocol": "ssh | routeros_api",
   "path": "public | connector | mgmt_vpn",
   "transport": "direct | connector | mgmt_vpn",
@@ -173,6 +173,7 @@ ends them (finish reason `cancelled`).
   "tls": { "pinned": "SHA256:... | null" },
   "ticket": { "sha256": "<64 hex>", "expiresAt": "ISO" },
   "detachable": false,
+  "exec": "(required, and only allowed, when mode is exec; section 13)",
   "terminal": { "cols": 120, "rows": 32 },
   "limits": {
     "maxSessionSeconds": 14400,
@@ -189,6 +190,9 @@ ends them (finish reason `cancelled`).
 - `ticket.sha256` = lowercase hex SHA-256 of the ASCII ticket string the browser receives. The
   ticket is 32 random bytes from the API, base64url without padding (43 characters). The gateway
   accepts it once, until `min(expiresAt, received + 60 s)`.
+- `mode: exec` (AI copilot, section 13): no browser, no ticket (`null`), `detachable` is `false`,
+  `terminal` is ignored and `recording` is never produced (the outputs travel in the result). It
+  needs `protocol: ssh` and the `exec` payload; the gateway connects at once, like `test`.
 - `protocol` `routeros_api` is accepted only with `mode: test` and port 8729 semantics (TLS). Port 23
   and 8728, `telnet`, and any `path` other than `public`, `connector` and `mgmt_vpn` are refused in
   this release. `transport` defaults to the path (`direct` for `public`); `path: connector` requires
@@ -297,7 +301,7 @@ Exactly once per connection (also for refused and expired assignments).
 ```json
 {
   "state": "closed | failed | refused | expired",
-  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | connector_offline | mgmt_vpn_unavailable | connector_key_mismatch | connector_open_failed | not_allowed | api_refused | api_unavailable | connect_timeout | open_timeout | too_many_streams | tunnel_closed | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
+  "reason": "device_closed | browser_closed | idle_timeout | max_duration | output_limit | cancelled | gateway_shutdown | gateway_full | test_ok | exec_done | exec_payload_mismatch | exec_change_unsupported_transport | hostkey_mismatch | hostkey_rejected | auth_failed | credential_unavailable | connect_failed | tls_failed | protocol_error | protocol_refused | destination_refused | invalid_assignment | path_unsupported | connector_offline | mgmt_vpn_unavailable | connector_key_mismatch | connector_open_failed | not_allowed | api_refused | api_unavailable | connect_timeout | open_timeout | too_many_streams | tunnel_closed | ticket_expired | sandbox_failed | shell_refused | device_error | worker_failed",
   "bytesFromDevice": 0,
   "bytesToDevice": 0,
   "durationMs": 0,
@@ -336,6 +340,142 @@ upgrading; the ticket stays spent.
 
 Request `{}`. Sent best effort (failures are only logged) when the operator browser of a
 `detachable` connection closed or errored. Audit only: the connection stays live.
+
+## 13. Exec mode and `POST /connections/:uuid/exec-result` (AI copilot)
+
+`mode: exec` runs a fixed list of commands on one device for the remote support AI copilot (reads
+the AI asked for, or a change the technician approved) and returns the redacted outputs. The
+gateway never invents or edits a command: it classifies the list, runs it or refuses it.
+
+### `exec` payload
+
+```json
+{
+  "kind": "read | change",
+  "requestUUID": "<the connectionUUID: 32 hex or the dashed form, any case>",
+  "steps": ["1..30 commands, each <= 1000 chars, no CR/LF/NUL"],
+  "verify": ["change only: 1..10 read commands, run in a NEW SSH session"],
+  "rollback": ["change + systemd_deadman only: 1..30 commands"],
+  "safeChange": "routeros_safe_mode | vrp5_schedule_reboot | systemd_deadman | none",
+  "rollbackSeconds": 300,
+  "backupName": "^[a-z0-9-]{1,48}$ (change only, else null)",
+  "changeLog": {
+    "kind": "script | file | report_only",
+    "line": "<=300 printable ASCII, no quotes, backslash, $, backtick or ;"
+  },
+  "sha256": "<hex sha256 of the canonical JSON>"
+}
+```
+
+- Validation is strict (unknown keys, wrong types, bounds are refused, never corrected). `read`
+  needs `safeChange: none`, empty `verify`/`rollback`, `backupName` and `changeLog` `null`. `change`
+  needs `rollbackSeconds` 120..900, `verify`, a `backupName`, and a `safeChange` that matches the
+  dialect: `routeros_safe_mode` (routeros, `changeLog` script or report_only),
+  `vrp5_schedule_reboot` (vrp, report_only), `systemd_deadman` (linux/proxmox, `rollback` required,
+  `changeLog` file or report_only). `none` is refused for a change. `rollbackSeconds` is 0..900 for
+  a read (it is part of the hash).
+- `sha256` = hex SHA-256 of `JSON.stringify({kind, steps, verify, rollback, safeChange,
+  rollbackSeconds, backupName, changeLog})` (that key order; `changeLog` is `{kind, line}` or
+  `null`). The gateway recomputes it in the controller and again in the worker. A mismatch (or any
+  invalid payload) is refused before anything runs: `POST /exec-result` with status `failed` and
+  `error.code` `EXEC_PAYLOAD_MISMATCH` (`EXEC_INVALID_ASSIGNMENT` otherwise), then `finish`
+  `refused` with reason `exec_payload_mismatch` (`invalid_assignment`).
+- A `change` over `transport: connector` is refused (`finish` `refused`,
+  `exec_change_unsupported_transport`): the verification needs a second SSH connection and the
+  connector bridge carries one stream.
+
+### Policy (before anything runs)
+
+Every `steps`, `verify` and `rollback` command is classified by the dialect rules
+(`Classifier(loadRules(dialect))`, `level` of the assignment). Any blocked command makes the whole
+request `blocked`: nothing connects, no credential is pulled.
+
+- `read`: every step must be class `read` and known (`unknown=false`).
+- `change`: a step or rollback command runs only when `decide(level, class)` is `allow` or
+  `confirm` (the technician approved it in the API); `double_confirm` and `block` are blocked and
+  `destructive` / `secret_read` are always blocked. `verify` must be `read` and known.
+- Commands run one per exec channel start at the root menu (RouterOS), so they are classified one
+  by one; a shell session (RouterOS safe mode, VRP) keeps the menu between commands.
+
+### Execution
+
+Per command: timeout 20 s (steps of a change 30 s), output cap 64 KiB (head kept, `truncated`,
+last partial line dropped), ANSI stripped, then redacted (dialect patterns plus the credential
+password/passphrase/key as literals). Raw output is never logged.
+
+- `read` routeros/linux/proxmox: one SSH connection, one exec channel per command, exit code
+  (`null` when the device sends none). `read` vrp/other: shell with prompt detection (VRP
+  `screen-length 0 temporary` first, output ignored); a command that does not return to the prompt
+  ends the request `failed` (`COMMAND_TIMEOUT`).
+- `change` `routeros_safe_mode`: login `<user>+ct` on a PTY. `/export file=<backupName>`, Ctrl-X
+  (safe mode), each step (fails on the RouterOS error patterns), verification in a NEW SSH
+  connection (same worker, same in-memory credential, same host key), Ctrl-X again (commit), the
+  change log script lines, `/export file=pos-<name>`, `/quit`. Any failure drops the socket without
+  logout (RouterOS reverts safe mode): `rolled_back`.
+- `change` `vrp5_schedule_reboot`: `save <backupName>.cfg`, `schedule reboot delay 00:<mm>`
+  (both answered `Y`), `system-view`, steps, `return`, verification in a NEW session, then
+  `undo schedule reboot` and `save` (`Y`). A `[Y/N]` question during a step is answered `N` and
+  fails the request. On failure nothing is saved and the device reboots into the saved
+  configuration: `rolled_back` with `rollback.pendingReboot: true`.
+- `change` `systemd_deadman`: `id -u` (non-root: system and AI commands run as
+  `sudo -n /bin/sh -c '<command>'`), `systemd-run --unit=mns-rb-<first 8 hex of requestUUID>
+  --on-active=<rollbackSeconds> ... /bin/sh -c 'echo <base64 of rollback> | base64 -d | /bin/sh'`
+  (exit != 0: `failed`, nothing applied), steps, verification in a NEW connection, then
+  `systemctl stop mns-rb-<id>.timer` and the change log line. A failing step or verification runs
+  `systemctl start mns-rb-<id>.service` and stops the timer: `rolled_back`.
+- The finish reason is always `exec_done` (state `closed`) once a result exists, also for
+  `blocked`, `failed` and `rolled_back`; host key, authentication and connection failures keep
+  their usual reasons (`hostkey_mismatch`, `auth_failed`, `connect_failed`, ...) and also carry
+  an `exec-result` with the matching `error.code`.
+
+### `POST /connections/:uuid/exec-result`
+
+Sent once per exec connection by the controller (Agent identity, like `/events`), before
+`/finish`. A network or 5xx failure is retried with backoff (1, 3, 8, 20, 30 s); a 4xx other than
+408/425/429 is not retried, so the API must treat a repeated identical result as a no-op.
+
+```json
+{
+  "status": "ok | blocked | failed | applied | rolled_back",
+  "steps": [
+    {
+      "phase": "system | step | verify | rollback",
+      "command": "<redacted>",
+      "class": "read | write_low | write_risky | destructive | pivot | secret_read | null",
+      "rule": "<rule id> | null",
+      "verdict": "allowed | blocked",
+      "exitCode": 0,
+      "output": "<redacted, <= 64 KiB>",
+      "truncated": false,
+      "ms": 120
+    }
+  ],
+  "rollback": {
+    "method": "safe_mode | scheduled_reboot | deadman_timer | none",
+    "armed": true,
+    "fired": false,
+    "pendingReboot": false
+  },
+  "error": { "code": "STEP_FAILED", "message": "<fixed text, no device output>" }
+}
+```
+
+- `ok`: a read finished (individual exit codes may be non-zero; a command that timed out has exit
+  code 124). `applied`: the change was verified and committed (`error` may carry
+  `CHANGELOG_FAILED` / `EXPORT_FAILED` when only the documentation failed). `rolled_back`: the
+  vendor rollback ran or is pending (`error.code` `STEP_FAILED`, `VERIFY_FAILED`,
+  `RELEASE_FAILED`, `CANCEL_FAILED`, `EXEC_ABORTED`, `CONNECTION_LOST`). `failed`: nothing was
+  committed or the state needs attention (`BACKUP_FAILED`, `SAFE_MODE_UNAVAILABLE`,
+  `SCHEDULE_FAILED`, `ARM_FAILED`, `IDENTITY_UNKNOWN`, `SAVE_FAILED`, `DEADMAN_DISARM_FAILED`
+  (the timer may still revert the change), `PROMPT_TIMEOUT`, `COMMAND_TIMEOUT`, `AUTH_FAILED`,
+  `HOSTKEY_MISMATCH`, `HOSTKEY_REJECTED`, `CREDENTIAL_UNAVAILABLE`, `CONNECT_FAILED`,
+  `EXEC_NO_RESULT`, `EXEC_INTERNAL`). `blocked`: `error.code` `EXEC_BLOCKED`, every step carries
+  its class/rule/verdict, `output` empty.
+- `system` steps are the gateway's own commands (backup, safe mode, `id -u`, arming, change log);
+  their `class` is `null`. The AI `rollback` commands are executed by the device (timer script),
+  so only the commands the gateway runs to fire the rollback appear in phase `rollback`.
+- The body stays below 1 MiB: when the sum of the outputs would exceed it, the largest outputs
+  are halved (`truncated: true`) until it fits.
 
 ## 9. `POST /heartbeat`
 

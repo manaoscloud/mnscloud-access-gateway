@@ -16,7 +16,9 @@ import type {
   WorkerToController,
 } from '../shared/ipc.ts';
 import { validBridgePath } from '../shared/ipc.ts';
+import { parseExecPayload } from '../shared/exec.ts';
 import { Classifier } from './classifier.ts';
+import { runExec } from './exec.ts';
 import { InputGate } from './input_gate.ts';
 import { Redactor } from './redaction.ts';
 import { connectApiSsl, RouterOsApi, RouterOsApiError } from './routeros_api.ts';
@@ -46,7 +48,7 @@ class WorkerExit extends Error {
 export function validateInit(value: unknown): WorkerInit {
   const v = value as WorkerInit;
   const ok = v && v.t === 'init' && /^[0-9a-f-]{36}$/.test(v.connectionUUID) &&
-    (v.mode === 'console' || v.mode === 'test') &&
+    (v.mode === 'console' || v.mode === 'test' || v.mode === 'exec') &&
     (v.protocol === 'ssh' || v.protocol === 'routeros_api') &&
     parseAddress(v.target?.address) !== null && Number.isInteger(v.target?.port) &&
     v.target.port >= 1 && v.target.port <= 65535 && DIALECTS.includes(v.shellDialect) &&
@@ -63,6 +65,17 @@ export function validateInit(value: unknown): WorkerInit {
   }
   if (v.protocol === 'routeros_api' && v.mode !== 'test') {
     throw new WorkerExit('refused', 'protocol_refused');
+  }
+  if (v.mode === 'exec') {
+    // The sha256 is recomputed here too: the worker trusts nothing it did not check.
+    try {
+      if (v.protocol !== 'ssh') throw new Error('protocol');
+      v.exec = parseExecPayload(v.exec, v.shellDialect, v.connectionUUID);
+    } catch {
+      throw new WorkerExit('refused', 'invalid_assignment');
+    }
+  } else if (v.exec !== undefined) {
+    throw new WorkerExit('refused', 'invalid_assignment');
   }
   return v;
 }
@@ -204,7 +217,20 @@ export async function runWorker(io: WorkerIO): Promise<Exit> {
 
   {
     let exit: Exit;
-    if (init.protocol === 'routeros_api') {
+    if (init.mode === 'exec') {
+      exit = await runExec({
+        init,
+        rules,
+        redactor,
+        verifyKey,
+        requestCredential,
+        fingerprintOf: sshFingerprint,
+        algorithmOf: sshKeyAlgorithm,
+        onClose: (handler) => mailbox.onClose(handler),
+        send: (message) => io.send(message),
+        finish,
+      });
+    } else if (init.protocol === 'routeros_api') {
       exit = await routerOsTest(init, { verifyKey, requestCredential, io, finish });
     } else {
       exit = await sshSession(init, {

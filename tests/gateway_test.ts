@@ -31,6 +31,7 @@ function api(
     recordingPart: () => Promise.resolve(),
     attach,
     detach: () => Promise.resolve(),
+    execResult: () => Promise.resolve(),
     finish: (uuid, body) => {
       finished.set(uuid, body);
       return Promise.resolve();

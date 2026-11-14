@@ -7,6 +7,7 @@ import {
   type Assignment,
   type AttachTicket,
   ContractError,
+  EXEC_PAYLOAD_MISMATCH,
   type FinishBody,
   parseAssignment,
 } from './contract.ts';
@@ -120,9 +121,24 @@ export class Gateway {
       assignment = parseAssignment(raw);
     } catch (error) {
       if (uuid && /^[0-9a-f-]{36}$/.test(uuid)) {
-        const reason = error instanceof ContractError && /^[a-z_]+$/.test(error.message)
-          ? error.message
+        const code = error instanceof ContractError ? error.message : '';
+        const reason = code === EXEC_PAYLOAD_MISMATCH
+          ? 'exec_payload_mismatch'
+          : /^[a-z_]+$/.test(code)
+          ? code
           : 'invalid_assignment';
+        if ((raw as { mode?: unknown }).mode === 'exec') {
+          // The API waits for a result: say why nothing ran (no command was executed).
+          await this.options.deps.api.execResult(uuid, {
+            status: 'failed',
+            steps: [],
+            rollback: { method: 'none', armed: false, fired: false, pendingReboot: false },
+            error: {
+              code: code === EXEC_PAYLOAD_MISMATCH ? code : 'EXEC_INVALID_ASSIGNMENT',
+              message: 'The assignment was refused; nothing was executed.',
+            },
+          }).catch(() => {});
+        }
         await this.options.deps.api.finish(uuid, refusal({ connectionUUID: uuid }, reason)).catch(
           () => {},
         );
@@ -147,7 +163,7 @@ export class Gateway {
       ).catch(() => {});
       return 'refused';
     }
-    if (assignment.mode === 'test') {
+    if (assignment.mode === 'test' || assignment.mode === 'exec') {
       this.#startSession(assignment).start();
       return 'started';
     }
