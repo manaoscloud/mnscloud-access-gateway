@@ -31,6 +31,7 @@ import {
   disarmsRollback,
   readProblem,
 } from './exec_policy.ts';
+import { observedChange } from './junos/change.ts';
 import { decide } from './policy.ts';
 import { type Redactor, stripAnsi } from './redaction.ts';
 import type { DialectRules } from './rules.ts';
@@ -457,6 +458,16 @@ class Shell {
 
   send(data: string) {
     this.stream.write(data);
+  }
+
+  /** Closes only this channel (never the SSH connection); used when a helper shell is cancelled. */
+  close() {
+    this.closed = true;
+    try {
+      this.stream.close?.();
+      this.stream.destroy?.();
+    } catch { /* closed */ }
+    this.#waiter?.();
   }
 
   /** Output received so far (text only) and clears it. */
@@ -950,7 +961,8 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
   // --- verification in a NEW SSH session -----------------------------------------------------
 
   /** Runs the verify commands in a second connection; true when they all pass. */
-  const verifyNewSession = async (): Promise<boolean> => {
+  const verifyNewSession = async (signal?: AbortSignal): Promise<boolean> => {
+    if (signal?.aborted) return false;
     let ok = false;
     const before = clients.length;
     let connection: { end(): void; destroy(): void } | null = null;
@@ -1007,16 +1019,23 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     const timeout = new Promise<boolean>((resolve) =>
       setTimeout(() => resolve(false), VERIFY_TIMEOUT_MS)
     );
+    // A cancelled caller (Junos) gets false at once; the finally below destroys the connection.
+    let onAbort = () => {};
+    const cancelled = new Promise<boolean>((resolve) => {
+      onAbort = () => resolve(false);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
     try {
-      ok = await guard(Promise.race([work, timeout]));
+      ok = await guard(Promise.race([work, timeout, cancelled]));
     } catch (error) {
       if (error instanceof ExecAbort) throw error;
       ok = false;
     } finally {
+      signal?.removeEventListener('abort', onAbort);
       // Also a verify connection that never got to `ready` (timeout while connecting).
       for (const client of clients.slice(before)) client.destroy();
     }
-    return ok;
+    return ok && !signal?.aborted;
   };
 
   // --- credential rotation (kind rotate) ------------------------------------------------------
@@ -2185,166 +2204,108 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     }
   };
 
-  // --- Juniper Junos: exclusive candidate and `commit confirmed` -------------------------------
+  // --- Juniper Junos: NETCONF candidate lock and confirmed commit -----------------------------
 
+  // The change runs over the NETCONF subsystem of the already pinned and authenticated SSH
+  // connection (`junos/change.ts`): candidate lock without discarding a foreign candidate, native
+  // non-persistent confirmed commit, no `rollback 1`, no kill-session. Backups are device-local
+  // files written by a separate CLI channel of the same connection; verification uses a new
+  // pinned connection. Only `confirmed` is `applied`; the gateway never reports `rolled_back`,
+  // because no independent proof of the restored baseline exists.
   const junosChange = async () => {
     const profile = CLI.junos!;
-    const backup = exec.backupName!;
-    const minutes = Math.ceil(exec.rollbackSeconds / 60);
     const conn = await connectFirst('');
-    let armed = false;
-    let armedAt = 0;
-    const setRollback = (isArmed: boolean, fired = false) => {
-      result.rollback = {
-        method: 'confirmed_commit',
-        armed: isArmed,
-        fired,
-        pendingReboot: false,
-      };
+    const control = new AbortController();
+    const cancel: { error: ExecAbort | null } = { error: null };
+    aborted.catch((error) => {
+      if (error instanceof ExecAbort) cancel.error = error;
+      control.abort();
+    });
+    const setRollback = (armed: boolean) => {
+      result.rollback = { method: 'confirmed_commit', armed, fired: false, pendingReboot: false };
     };
-    try {
-      const shell = await openCli(raw(conn), profile);
-      const run = async (
-        command: string,
-        phase: ExecPhase = 'system',
-        answer: 'Y' | 'N' | null = 'N',
-        timeout = STEP_TIMEOUT_MS,
-      ) => {
-        const r = await runShell(shell, phase, command, timeout, answer, command, profile);
-        const failed = r.run.timedOut || r.run.unexpectedConfirm || profile.error.test(r.output);
-        return { ...r, failed };
-      };
-      const stop = (code: string, message: string) => {
-        conn.end();
-        emit('failed', { code, message });
-      };
-      /** Leaves configuration mode discarding the candidate (our own exclusive copy). */
-      const discard = async () => {
-        await run('rollback 0');
-        await run('exit configuration-mode', 'system', 'Y');
-      };
-      const pendingTimer = (output: string) => /rollback in \d+ ?mins?/i.test(output);
-      const complete = (output: string) => /commit complete/i.test(output);
-      const wrote = (output: string) => /Wrote \d+ lines? of configuration/i.test(output);
+    setRollback(false);
+    const BACKUP_FILE = /^\/var\/tmp\/[a-z0-9-]{1,48}-(pre|post)\.conf$/;
 
-      if (!/>\s*$/.test(shell.firstPrompt)) {
-        stop('PROMPT_UNSUPPORTED', 'Operational CLI mode is required; nothing was changed.');
-        return;
-      }
-      // A confirmed commit of somebody else is pending: our confirmation would confirm it too.
-      let r = await run('show system commit');
-      if (r.failed || pendingTimer(r.output)) {
-        stop('COMMIT_PENDING', 'A confirmed commit is pending or unknown; nothing was changed.');
-        return;
-      }
-      r = await run('configure exclusive');
-      if (r.failed || !/Entering configuration mode/i.test(r.output)) {
-        stop(
-          'CONFIG_LOCKED',
-          'The exclusive configuration lock was not obtained; nothing was changed.',
-        );
-        return;
-      }
-      // The exclusive candidate must be the committed configuration: nobody else's edits.
-      r = await run('show | compare');
-      const diff = r.output.split('\n').map((l) => l.trim()).filter((l) => l && l !== '[edit]');
-      if (r.failed || diff.length) {
-        await discard();
-        stop('CANDIDATE_DIRTY', 'The candidate holds other changes; nothing was changed.');
-        return;
-      }
-      r = await run(`save /var/tmp/${backup}-pre.conf`, 'system', 'N', EXPORT_TIMEOUT_MS);
-      if (r.failed || !wrote(r.output)) {
-        await discard();
-        stop('BACKUP_FAILED', 'The configuration backup failed; nothing was changed.');
-        return;
-      }
-      for (const command of exec.steps) {
-        if ((await run(command, 'step')).failed) {
-          await discard();
-          stop('STEP_FAILED', 'A step failed; the candidate was discarded, nothing was committed.');
-          return;
+    /** Writes one device-local configuration file; proves success, never overwrites, no output. */
+    const backup = async (phase: 'pre' | 'post', filename: string, signal: AbortSignal) => {
+      const match = BACKUP_FILE.exec(filename);
+      if (!match || match[1] !== phase) throw new ExecFail('BACKUP_PATH_INVALID');
+      if (signal.aborted) throw new ExecFail('CANCELLED');
+      let shell: Shell | null = null;
+      const onAbort = () => shell?.close();
+      signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        shell = await openCli(raw(conn), profile);
+        if (signal.aborted) shell.close();
+        const run = async (command: string, timeoutMs: number) => {
+          const started = Date.now();
+          const r = await runInShell(shell!, command, timeoutMs, 'N', profile);
+          const output = shellBody(r, command).replace(/\r/g, '').trim();
+          record(
+            'system',
+            command,
+            r.timedOut ? 124 : null,
+            '[bounded device proof response withheld]',
+            r.truncated,
+            Date.now() - started,
+            undefined,
+            true,
+          );
+          if (
+            signal.aborted || r.closed || r.timedOut || r.truncated || r.unexpectedConfirm ||
+            profile.error.test(output) || /--\(?more\)?--/i.test(output)
+          ) throw new ExecFail('BACKUP_FAILED');
+          return output;
+        };
+        // The target must not exist: a retry or collision never overwrites an audit file.
+        const listed = await run(`file list ${filename}`, COMMAND_TIMEOUT_MS);
+        if (listed !== `${filename}: No such file or directory`) {
+          throw new ExecFail('BACKUP_EXISTS');
         }
-      }
-      r = await run('show | compare');
-      if (r.failed || !r.output.split('\n').some((l) => /^[+-]/.test(l.trim()))) {
-        await discard();
-        stop('NO_CHANGE', 'The steps changed nothing; nothing was committed.');
-        return;
-      }
-      r = await run(`save /var/tmp/${backup}-post.conf`, 'system', 'N', EXPORT_TIMEOUT_MS);
-      if (r.failed || !wrote(r.output)) {
-        await discard();
-        stop('BACKUP_FAILED', 'The post-change backup failed; nothing was committed.');
-        return;
-      }
-      r = await run('commit check', 'system', 'N', EXPORT_TIMEOUT_MS);
-      if (r.failed || !/configuration check succeeds/i.test(r.output)) {
-        await discard();
-        stop('COMMIT_CHECK_FAILED', 'The commit check failed; nothing was committed.');
-        return;
-      }
-      armedAt = Date.now();
-      armed = true; // from here on the device may have the confirmed commit pending
-      setRollback(true);
-      r = await run(`commit confirmed ${minutes}`, 'system', 'N', EXPORT_TIMEOUT_MS);
-      if (r.failed || !complete(r.output)) {
-        // Unknown outcome: if it went through, the device rolls back by itself.
-        stop(
-          'COMMIT_UNKNOWN',
-          'The confirmed commit did not answer cleanly; the timer reverts it.',
+        const written = await run(`show configuration | save ${filename}`, EXPORT_TIMEOUT_MS);
+        const proof = new RegExp(
+          `^Wrote \\d+ lines? of configuration to '${filename.replace(/[.]/g, '\\.')}'$`,
         );
-        return;
+        if (!proof.test(written)) throw new ExecFail('BACKUP_FAILED');
+      } finally {
+        signal.removeEventListener('abort', onAbort);
+        shell?.close();
       }
-      /** Reverts at once with the previous commit when possible; the timer stays the fallback. */
-      const revertNow = async (code: string, message: string) => {
-        const back = await run('rollback 1');
-        const done = back.failed ? null : await run('commit', 'system', 'N', EXPORT_TIMEOUT_MS);
-        if (done && !done.failed && complete(done.output)) {
-          armed = false;
-          setRollback(false, true);
-          await run('exit configuration-mode', 'system', 'Y');
-          conn.end();
-          emit('rolled_back', { code, message: message + ' The previous configuration is back.' });
-          return;
-        }
-        conn.end();
-        setRollback(true);
-        emit('rolled_back', { code, message: message + ' The timer reverts the change.' });
-      };
-      if (!(await verifyNewSession())) {
-        await revertNow('VERIFY_FAILED', 'The verification failed.');
-        return;
-      }
-      if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
-        await revertNow('DEADLINE', 'The time budget of the change ran out.');
-        return;
-      }
-      // Confirm in the original exclusive context: the same candidate, the same lock.
-      r = await run('commit', 'system', 'N', EXPORT_TIMEOUT_MS);
-      // Still in configuration mode: `run` executes the operational command.
-      const check = r.failed ? null : await run('run show system commit');
-      if (r.failed || !complete(r.output) || !check || check.failed || pendingTimer(check.output)) {
-        stop('CONFIRM_FAILED', 'The commit was not confirmed; the timer reverts the change.');
-        return;
-      }
-      armed = false;
-      setRollback(false);
-      await run('exit configuration-mode', 'system', 'Y');
-      conn.end();
-      emit('applied');
-    } catch (error) {
-      if (armed) {
-        // The confirmed commit reverts by itself when its timer ends: no further action needed.
-        conn.destroy();
-        setRollback(true);
+    };
+
+    try {
+      const change = await observedChange(raw(conn), {
+        commands: exec.steps,
+        backupName: exec.backupName!,
+        rollbackSeconds: exec.rollbackSeconds,
+        signal: control.signal,
+        hooks: { backup, verify: (signal) => verifyNewSession(signal) },
+      });
+      const code = /^[A-Z0-9_]{1,40}$/.test(change.code) ? change.code : 'FAILED';
+      if (change.state === 'confirmed') {
+        setRollback(false);
+        emit('applied');
+      } else {
+        // `rollback_pending`: a confirmed commit may be pending on the device; the NETCONF session
+        // is closed, which reverts it. That reversal is NOT observed here. `unknown`: the final
+        // confirmation was sent and its outcome is not proven either way.
+        setRollback(change.state === 'rollback_pending');
         emit('failed', {
-          code: error instanceof ExecAbort ? 'EXEC_ABORTED' : 'CONNECTION_LOST',
-          message: 'The request ended before the confirmation; the timer reverts the change.',
+          code: `JUNOS_${code}`,
+          message: change.state === 'refused'
+            ? 'The device or request is not eligible; nothing was changed.'
+            : change.state === 'failed'
+            ? 'The candidate load did not complete; nothing was committed.'
+            : change.state === 'rollback_pending'
+            ? 'A confirmed commit may be pending; the closed session lets the device revert it, which is not observed.'
+            : 'The confirmation outcome is unknown; no rollback or success is claimed.',
         });
-        if (error instanceof ExecAbort) throw error;
-        return;
       }
+      conn.end();
+      // A cancelled request ends as a cancellation even when the change result was recorded above.
+      if (cancel.error) throw cancel.error;
+    } catch (error) {
       conn.destroy();
       throw error;
     }

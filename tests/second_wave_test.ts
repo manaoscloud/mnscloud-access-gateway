@@ -17,11 +17,12 @@ import {
 } from '../src/shared/exec.ts';
 import { planExec } from '../src/worker/exec.ts';
 import { changeGrammarProblem, exactReadProblem, readProblem } from '../src/worker/exec_policy.ts';
+import { BASE, CAP } from '../src/worker/junos/netconf.ts';
 import { loadRules } from '../src/worker/rules.ts';
 import { validateInit } from '../src/worker/worker.ts';
-import { assert, assertEquals, assertNotIncludes, assertThrows } from './assert.ts';
+import { assert, assertEquals, assertMatch, assertNotIncludes, assertThrows } from './assert.ts';
 import { ASSIGNMENT } from './fixtures.ts';
-import { generateHostKey, PASSWORD, startExecDevice } from './hostile_ssh_server.ts';
+import { fingerprintOf, generateHostKey, PASSWORD, startExecDevice } from './hostile_ssh_server.ts';
 import {
   CLI_PASSWORD,
   type CliDevice,
@@ -101,6 +102,7 @@ async function runSession(
   exec: Options,
   level: 'n1' | 'n2' | 'n3',
   password: string,
+  extra: { assignment?: Record<string, unknown>; started?: (session: Session) => void } = {},
 ) {
   const api = new FakeApi();
   const connectionUUID = crypto.randomUUID();
@@ -115,6 +117,7 @@ async function runSession(
     level,
     recording: { enabled: false, partBytes: 65536, partSeconds: 5 },
     exec: payloadOf(connectionUUID, exec),
+    ...extra.assignment,
   });
   const session = new Session(assignment, {
     api,
@@ -126,6 +129,7 @@ async function runSession(
     execResultRetryMs: [20, 20],
   });
   session.start();
+  extra.started?.(session);
   await session.done;
   return { api, result: api.results[0] };
 }
@@ -136,10 +140,11 @@ async function run(
   exec: Options,
   device: Omit<CliDeviceOptions, 'kind'> = {},
   level: 'n1' | 'n2' | 'n3' = 'n2',
+  extra: Parameters<typeof runSession>[5] = {},
 ) {
   const fake = await startCliDevice(generateHostKey(), { kind, ...device });
   try {
-    const { api, result } = await runSession(kind, fake.port, exec, level, CLI_PASSWORD);
+    const { api, result } = await runSession(kind, fake.port, exec, level, CLI_PASSWORD, extra);
     return { api, device: fake, result };
   } finally {
     await fake.close();
@@ -986,98 +991,169 @@ Deno.test('ios change: lines outside the grammar block everything; risky lines n
 });
 
 // ---------------------------------------------------------------------------------------------
-// Integration: Junos exclusive candidate + commit confirmed
+// Integration: Junos NETCONF candidate lock + native confirmed commit (simulator, not hardware)
 
-Deno.test('junos change: exclusive candidate, commit confirmed, new-session verify, confirm in the same context', async () => {
+const JUNOS_LINE = 'set interfaces ge-0/0/1 description "uplink new"';
+const JUNOS_BASE = ['set interfaces ge-0/0/1 description old'];
+const FORBIDDEN_RPC = /rollback|discard-changes|kill-session|persist|cancel-commit/;
+const rpcName = (body: string) => /^<([^ >/]+)(\/?)/.exec(body)!.slice(1).join('');
+
+Deno.test('junos change: NETCONF confirmed commit, backups around it, new-session verify, one confirm', async () => {
   const { result, device } = await run('junos', junosChange());
-  assertEquals(result.status, 'applied', JSON.stringify([result.error, typed(device)]));
+  assertEquals(result.status, 'applied', JSON.stringify([result.error, device.netconf]));
   assertEquals(result.rollback, {
     method: 'confirmed_commit',
     armed: false,
     fired: false,
     pendingReboot: false,
   });
-  const lines = typed(device);
-  const order = [
-    'show system commit',
-    'configure exclusive',
-    'show | compare',
-    `save /var/tmp/${BACKUP}-pre.conf`,
-    'set interfaces ge-0/0/1 description "uplink new"',
-    'show | compare',
-    `save /var/tmp/${BACKUP}-post.conf`,
-    'commit check',
-    'commit confirmed 5',
-    'commit',
-    'run show system commit',
-    'exit configuration-mode',
-  ].map((l, n, all) => lines.indexOf(l, n ? lines.indexOf(all[n - 1]) + 1 : 0));
-  assert(order.every((i, n) => i >= 0 && (n === 0 || i > order[n - 1])), JSON.stringify(lines));
+  const pre = `/var/tmp/${BACKUP}-pre.conf`;
+  const post = `/var/tmp/${BACKUP}-post.conf`;
+  // Pre is saved before the load, post after the unconfirmed commit and before the confirmation.
+  assertEquals(device.events, ['saved:pre', 'load', 'commit-confirmed', 'saved:post', 'commit']);
+  assertEquals(device.fileContent.get(pre), JUNOS_BASE);
+  assertEquals(device.fileContent.get(post), [...JUNOS_BASE, JUNOS_LINE]);
+  assertEquals(
+    device.netconf.map(rpcName).filter((n) => !n.startsWith('get')),
+    ['lock', 'load-configuration', 'validate', 'commit', 'commit/', 'unlock'],
+  );
+  const commits = device.netconf.filter((b) => b.startsWith('<commit'));
+  assert(commits[0].includes('<confirmed/>') && commits[1] === '<commit/>');
+  assert(!device.netconf.some((b) => FORBIDDEN_RPC.test(b)), 'no rollback, discard or kill');
+  // Verification runs in a new SSH connection; no CLI configuration mode is ever entered.
   assert(device.lines.includes('1:show version'), 'verified in a fresh SSH connection');
-  // The confirming `commit` came from connection 0, the one that holds the exclusive candidate.
-  assert(device.lines.includes('0:commit'));
-  assert(!device.lines.includes('1:commit'));
-  assertEquals(device.events, ['commit-confirmed', 'commit']);
+  assert(!typed(device).some((l) => /configure|rollback|commit|exclusive/.test(l)));
+  assertEquals(device.connections, 2);
+  assertEquals([device.netconfOpened, device.netconfClosed], [1, 1]);
+  assertEquals(device.shellsClosed, device.shellsOpened);
   assertEquals(device.confirmTimer, false);
-  assert(device.committed.includes('set interfaces ge-0/0/1 description "uplink new"'));
+  assert(device.committed.includes(JUNOS_LINE));
+  // The proof output of the backups is withheld, the file names are the audit trail.
+  const saves = result.steps.filter((x) => x.command.startsWith('show configuration | save'));
+  assertEquals(saves.map((x) => x.command), [
+    `show configuration | save ${pre}`,
+    `show configuration | save ${post}`,
+  ]);
+  assert(saves.every((x) => x.output === '[bounded device proof response withheld]'));
   secretFree(result);
 });
 
-Deno.test('junos change: lock, foreign candidate, pending confirmed commit, backup, check -> nothing committed', async () => {
-  const cases: [Omit<CliDeviceOptions, 'kind'>, string][] = [
-    [{ locked: true }, 'CONFIG_LOCKED'],
-    [{ candidateDirty: true }, 'CANDIDATE_DIRTY'],
-    [{ confirmedPending: true }, 'COMMIT_PENDING'],
-    [{ failBackupJunos: true }, 'BACKUP_FAILED'],
-    [{ failCommitCheck: true }, 'COMMIT_CHECK_FAILED'],
-    [{ badStep: 'description' }, 'STEP_FAILED'],
-  ];
-  for (const [options, code] of cases) {
+Deno.test('junos change: dirty candidate or lock denied never loads, backs up or discards', async () => {
+  for (const options of [{ candidateDirty: true }, { lockDenied: true }]) {
     const { result, device } = await run('junos', junosChange(), options);
-    assertEquals(result.status, 'failed', code);
-    assertEquals(result.error?.code, code);
-    assertEquals(result.rollback.armed, false, code);
-    assertEquals(device.events.filter((e) => e.startsWith('commit')), [], code);
-    assert(!device.committed.includes('set interfaces ge-0/0/1 description "uplink new"'), code);
+    assertEquals(result.status, 'failed');
+    assertEquals(result.error?.code, 'JUNOS_LOCK_REFUSED');
+    assertEquals(result.rollback.armed, false);
+    assertEquals(device.netconf.map(rpcName), ['lock']);
+    assertEquals(device.events, []);
+    assertEquals(device.files, []);
+    assert(!device.committed.includes(JUNOS_LINE));
+    assertNotIncludes(JSON.stringify(result), 'device detail');
+    assertEquals(device.netconfClosed, 1);
   }
 });
 
-Deno.test('junos change: an unknown commit confirmed outcome keeps the timer, and failed verification reverts', async () => {
-  const unknown = await run('junos', junosChange(), { failCommitConfirmed: true });
-  assertEquals(unknown.result.status, 'failed');
-  assertEquals(unknown.result.error?.code, 'COMMIT_UNKNOWN');
-  assertEquals(unknown.result.rollback.armed, true);
+Deno.test('junos change: a missing NETCONF capability refuses before the lock', async () => {
+  const { result, device } = await run('junos', junosChange(), {
+    netconfCapabilities: [BASE, CAP + 'candidate:1.0'],
+  });
+  assertEquals(result.status, 'failed');
+  assertEquals(result.error?.code, 'JUNOS_UNSUPPORTED_CAPABILITY');
+  assertEquals(device.netconf, []);
+  assertEquals(device.events, []);
+  assertEquals(result.rollback.armed, false);
+});
 
-  const verify = await run('junos', junosChange(), { failVerify: /^show version$/ });
-  assertEquals(verify.result.status, 'rolled_back');
-  assertEquals(verify.result.error?.code, 'VERIFY_FAILED');
-  // The previous commit was restored at once and the confirmed commit is no longer pending.
-  assertEquals(verify.result.rollback, {
+Deno.test('junos change: an existing backup file or a failed save loads nothing', async () => {
+  for (const options of [{ backupExists: true }, { failBackupSave: true }]) {
+    const { result, device } = await run('junos', junosChange(), options);
+    assertEquals(result.status, 'failed');
+    assertEquals(result.error?.code, 'JUNOS_HOOK_FAILED');
+    assertEquals(result.rollback.armed, false);
+    assert(!device.netconf.some((b) => b.startsWith('<load-configuration')));
+    assertEquals(device.events, []);
+    assertEquals(device.files, []);
+    assert(!device.committed.includes(JUNOS_LINE));
+    // A refused overwrite never reaches the save command.
+    if (options.backupExists) assert(!typed(device).some((l) => l.includes('| save')));
+    assertEquals(device.shellsClosed, device.shellsOpened);
+  }
+});
+
+Deno.test('junos change: failed verification never confirms and is never reported rolled back', async () => {
+  const { result, device } = await run('junos', junosChange(), { failVerify: /^show version$/ });
+  assertEquals(result.status, 'failed');
+  assertEquals(result.error?.code, 'JUNOS_VERIFY_FAILED');
+  // A confirmed commit may be pending; closing the session lets the device revert it (not observed).
+  assertEquals(result.rollback, {
     method: 'confirmed_commit',
-    armed: false,
-    fired: true,
+    armed: true,
+    fired: false,
     pendingReboot: false,
   });
-  assertEquals(verify.device.committed, ['set interfaces ge-0/0/1 description old']);
-  assertEquals(verify.device.confirmTimer, false);
+  assert(!device.netconf.includes('<commit/>'));
+  assert(!device.netconf.some((b) => FORBIDDEN_RPC.test(b)));
+  assertEquals(device.events, [
+    'saved:pre',
+    'load',
+    'commit-confirmed',
+    'saved:post',
+    'session-closed-revert',
+  ]);
+  assertEquals(device.committed, JUNOS_BASE);
+  assertEquals(device.netconfClosed, 1);
+});
 
-  // If even the immediate revert fails the confirmed-commit timer is the rollback.
-  const stuck = await run('junos', junosChange(), {
-    failVerify: /^show version$/,
-    failRollback1: true,
+Deno.test('junos change: a lost confirming reply is unknown, never applied or rolled back', async () => {
+  const { result, device } = await run('junos', junosChange(), { lostConfirmReply: true });
+  assertEquals(result.status, 'failed');
+  assert(result.error?.code.startsWith('JUNOS_'));
+  assertMatch(result.error!.message, /unknown/);
+  assertEquals(result.rollback.armed, false);
+  assertEquals(device.netconf.filter((b) => b === '<commit/>').length, 1);
+  assert(!device.netconf.some((b) => FORBIDDEN_RPC.test(b)));
+});
+
+Deno.test('junos change: a refused host key never opens the NETCONF subsystem', async () => {
+  const { result, device } = await run('junos', junosChange(), {}, 'n2', {
+    assignment: { hostKey: { pinned: fingerprintOf(generateHostKey()) } },
   });
-  assertEquals(stuck.result.status, 'rolled_back');
-  assertEquals(stuck.result.rollback.armed, true);
-  assertEquals(stuck.device.confirmTimer, true);
-  stuck.device.fire();
-  assertEquals(stuck.device.committed, ['set interfaces ge-0/0/1 description old']);
+  assert(result?.status !== 'applied');
+  assertEquals(result?.error?.code, 'HOSTKEY_MISMATCH');
+  assertEquals([device.netconfOpened, device.shellsOpened, device.netconf], [0, 0, []]);
+  assertEquals(device.logins.filter((l) => l.ok).length, 0);
+});
 
-  const confirm = await run('junos', junosChange(), { failConfirm: true });
-  assertEquals(confirm.result.status, 'failed');
-  assertEquals(confirm.result.error?.code, 'CONFIRM_FAILED');
-  assertEquals(confirm.result.rollback.armed, true);
-  assertEquals(confirm.device.confirmTimer, true);
-  for (const r of [unknown, verify, stuck, confirm]) assert(r.result.status !== 'applied');
+Deno.test('junos change: cancellation during verification closes every channel and never confirms', async () => {
+  let session: Session | null = null;
+  const fake = await startCliDevice(generateHostKey(), { kind: 'junos', hangVerify: true });
+  try {
+    const watcher = (async () => {
+      const until = Date.now() + 30000;
+      while (!fake.events.includes('verify-hang') && Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      session!.close('controller_gone');
+    })();
+    const { result } = await runSession('junos', fake.port, junosChange(), 'n2', CLI_PASSWORD, {
+      started: (s) => session = s,
+    });
+    await watcher;
+    assert(result.status !== 'applied');
+    assertEquals(result.status, 'failed');
+    assert(!fake.netconf.includes('<commit/>'));
+    assert(!fake.netconf.some((b) => FORBIDDEN_RPC.test(b)));
+    // The NETCONF subsystem and the helper shell are closed; the device reverts by itself.
+    for (let n = 0; n < 100 && fake.netconfClosed < 1; n++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assertEquals(fake.netconfClosed, 1);
+    assertEquals(fake.shellsClosed, fake.shellsOpened);
+    assertEquals(fake.confirmTimer, false);
+    assertEquals(fake.committed, JUNOS_BASE);
+  } finally {
+    await fake.close();
+  }
 });
 
 Deno.test('junos change: grammar and rotation are refused before any connection', async () => {

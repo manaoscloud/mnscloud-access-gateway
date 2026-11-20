@@ -1,10 +1,14 @@
 // Fake SSH devices for the second-wave CLI dialects (ios, junos, fortios, vsol, dmos). They are
 // protocol simulators written from the vendors' documented CLI behaviour: prompts, modes, pager,
-// confirmations, `reload in`, `commit confirmed`. They prove the gateway's protocol handling and
+// confirmations, `reload in`, and for Junos the NETCONF subsystem (candidate lock, load, confirmed
+// commit with the nonpersistent session-close revert). They prove the gateway's protocol handling and
 // its fail-closed branches; they are NOT evidence that any hardware or firmware behaves this way.
 
 // @ts-types="../src/types/ssh2.d.ts"
 import ssh2 from 'ssh2';
+import { BASE, CAP, JUNOS, NC } from '../src/worker/junos/netconf.ts';
+import { MON } from '../src/worker/junos/namespaces.ts';
+import { escapeXml } from '../src/worker/junos/xml.ts';
 
 // deno-lint-ignore no-explicit-any
 const { Server } = ssh2 as any;
@@ -47,15 +51,21 @@ export interface CliDeviceOptions {
   badStep?: string;
   /** The connection drops when this command (regexp) is received. */
   dropOn?: RegExp;
-  // --- junos
-  locked?: boolean;
+  // --- junos (NETCONF subsystem on the authenticated SSH connection + CLI helper shells)
+  /** Hello capabilities of the NETCONF server (default: everything the gateway requires). */
+  netconfCapabilities?: string[];
+  /** The candidate is locked by another session. */
+  lockDenied?: boolean;
+  /** The candidate already holds foreign uncommitted edits (the lock is refused). */
   candidateDirty?: boolean;
-  confirmedPending?: boolean;
-  failCommitCheck?: boolean;
-  failCommitConfirmed?: boolean;
-  failConfirm?: boolean;
-  failBackupJunos?: boolean;
-  failRollback1?: boolean;
+  /** The backup target already exists. */
+  backupExists?: boolean;
+  /** `show configuration | save` answers an error. */
+  failBackupSave?: boolean;
+  /** The confirming `<commit/>` is applied but its reply is lost (the channel closes). */
+  lostConfirmReply?: boolean;
+  /** A verification connection never answers `show version` (to cancel the request there). */
+  hangVerify?: boolean;
 }
 
 export interface CliDevice {
@@ -71,6 +81,14 @@ export interface CliDevice {
   committed: string[];
   candidate: string[];
   files: string[];
+  /** junos: content of every file saved by `show configuration | save`. */
+  fileContent: Map<string, string[]>;
+  /** junos: every NETCONF RPC body received, in order. */
+  netconf: string[];
+  netconfOpened: number;
+  netconfClosed: number;
+  shellsOpened: number;
+  shellsClosed: number;
   reloadScheduled: boolean;
   confirmTimer: boolean;
   events: string[];
@@ -96,10 +114,16 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
     running: [...base, ...(options.dirtyBaseline ? ['ntp server 192.0.2.7'] : [])],
     startup: [...base],
     committed: [...base],
-    candidate: [],
+    candidate: [...base, ...(options.candidateDirty ? ['set foreign x'] : [])],
     files: [],
+    fileContent: new Map(),
+    netconf: [],
+    netconfOpened: 0,
+    netconfClosed: 0,
+    shellsOpened: 0,
+    shellsClosed: 0,
     reloadScheduled: options.reloadPending ?? false,
-    confirmTimer: options.confirmedPending ?? false,
+    confirmTimer: false,
     events: [],
     fire: () => {
       if (options.kind === 'junos') {
@@ -312,108 +336,32 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
       return done(IOS_ERR);
     };
 
-    const commitHistory = () =>
-      done(
-        '0   2026-11-19 10:00:00 UTC by support via cli' +
-          (device.confirmTimer ? ' commit confirmed, rollback in 5mins' : '') +
-          '\n1   2026-11-18 10:00:00 UTC by root via cli',
-      );
-
     const junosLine = (cmd: string) => {
       if (cmd === 'set cli screen-length 0') return done('Screen length set to 0');
-      if (mode === 'config') {
-        if (cmd === 'show | compare') {
-          const d = diff(device.committed, device.candidate);
-          return done(
-            d.length ? '[edit]\n' + d.map((l) => l[0] + '  ' + l.slice(1)).join('\n') : '',
-          );
-        }
-        const save = /^save (\S+)$/.exec(cmd);
-        if (save) {
-          if (options.failBackupJunos) return done('error: cannot write ' + save[1]);
-          device.files.push(save[1]);
-          return done(
-            `Wrote ${device.candidate.length + 3} lines of configuration to '${save[1]}'`,
-          );
-        }
-        if (cmd === 'commit check') {
-          return done(
-            options.failCommitCheck
-              ? 'error: configuration check-out failed'
-              : 'configuration check succeeds',
-          );
-        }
-        const confirmed = /^commit confirmed (\d+)$/.exec(cmd);
-        if (confirmed) {
-          if (options.failCommitConfirmed) return done('error: commit failed');
-          junosBefore = [...device.committed];
-          device.committed = [...device.candidate];
-          device.confirmTimer = true;
-          device.events.push('commit-confirmed');
-          return done(
-            `commit confirmed will be automatically rolled back in ${
-              confirmed[1]
-            } minutes unless confirmed\ncommit complete`,
-          );
-        }
-        if (cmd === 'commit') {
-          if (options.failConfirm) return done('error: commit failed');
-          device.committed = [...device.candidate];
-          device.confirmTimer = false;
-          device.events.push('commit');
-          return done('commit complete');
-        }
-        if (cmd === 'rollback 0') {
-          device.candidate = [...device.committed];
-          return done('load complete');
-        }
-        if (cmd === 'rollback 1') {
-          if (options.failRollback1) return done('error: rollback failed');
-          device.candidate = [...junosBefore];
-          return done('load complete');
-        }
-        if (cmd === 'exit configuration-mode') {
-          if (diff(device.committed, device.candidate).length) {
-            return ask('Exit with uncommitted changes? [yes,no] (yes) ', (a) => {
-              device.answers.push(`exit:${a}`);
-              if (a === 'yes') {
-                mode = 'exec';
-                exclusiveOwner = null;
-                done('Exiting configuration mode');
-              } else done();
-            });
-          }
-          mode = 'exec';
-          exclusiveOwner = null;
-          return done('Exiting configuration mode');
-        }
-        if (cmd === 'run show system commit') return commitHistory();
-        if (options.badStep && cmd.includes(options.badStep)) return done(error());
-        const del = /^delete (interfaces \S+) disable$/.exec(cmd);
-        if (del) {
-          device.candidate = device.candidate.filter((l) => l !== `set ${del[1]} disable`);
-          return done();
-        }
-        if (/^set /.test(cmd)) {
-          device.candidate.push(cmd);
-          return done();
-        }
-        return done(error());
+      const listed = /^file list (\/var\/tmp\/\S+)$/.exec(cmd);
+      if (listed) {
+        return done(
+          options.backupExists || device.files.includes(listed[1])
+            ? listed[1]
+            : `${listed[1]}: No such file or directory`,
+        );
       }
-      if (cmd === 'show system commit') return commitHistory();
-      if (cmd === 'configure exclusive') {
-        if (options.locked) {
-          return done('error: configuration database locked by:\n  other terminal p0');
-        }
-        exclusiveOwner = client;
-        mode = 'config';
-        device.candidate = [
-          ...device.committed,
-          ...(options.candidateDirty ? ['set foreign x'] : []),
-        ];
-        return done('Entering configuration mode');
+      const save = /^show configuration \| save (\/var\/tmp\/\S+)$/.exec(cmd);
+      if (save) {
+        if (options.failBackupSave) return done('error: cannot write ' + save[1]);
+        device.files.push(save[1]);
+        device.fileContent.set(save[1], [...device.committed]);
+        device.events.push(`saved:${save[1].replace(/^.*-(pre|post)\.conf$/, '$1')}`);
+        return done(
+          `Wrote ${device.committed.length + 3} lines of configuration to '${save[1]}'`,
+        );
       }
       if (index > 0 && options.failVerify?.test(cmd)) return done('unknown command.');
+      if (index > 0 && options.hangVerify && cmd === 'show version') {
+        hung = true;
+        device.events.push('verify-hang');
+        return;
+      }
       if (cmd === 'show version') return done(`Hostname: fw\nJunos: 21.4R3${options.banner ?? ''}`);
       if (/^show (?:system uptime|interfaces terse|chassis alarms)/.test(cmd)) {
         return done('ge-0/0/1 up up');
@@ -487,6 +435,135 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
     });
   };
 
+  let candidateLock: string | null = options.lockDenied ? 'foreign' : null;
+  let pendingOwner: string | null = null;
+  let revision = 1;
+  const unescape = (text: string) =>
+    text.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+  /** A scripted NETCONF server in the documented wire shapes; not captured device output. */
+  // deno-lint-ignore no-explicit-any
+  const netconf = (stream: any, index: number) => {
+    const sessionId = String(4000 + index);
+    let buffer = '';
+    device.netconfOpened++;
+    const send = (xml: string) => stream.write(xml + ']]>]]>');
+    const reply = (id: string, body = '<ok/>') =>
+      send(`<rpc-reply xmlns="${NC}" message-id="${id}">${body}</rpc-reply>`);
+    const refuse = (id: string, tag: string) =>
+      reply(
+        id,
+        `<rpc-error><error-type>protocol</error-type><error-tag>${tag}</error-tag><error-message>device detail</error-message></rpc-error>`,
+      );
+    const config = (lines: string[]) =>
+      `<configuration xmlns:junos="http://xml.juniper.net/junos/23.4R1/junos" junos:commit-seconds="100"><interfaces><interface><name>ge-0/0/1</name><description>${
+        escapeXml(lines.join('\n'))
+      }</description></interface></interfaces></configuration>`;
+    const capabilities = options.netconfCapabilities ??
+      [BASE, CAP + 'candidate:1.0', CAP + 'confirmed-commit:1.1', CAP + 'validate:1.1', JUNOS, MON];
+    stream.on('close', () => {
+      device.netconfClosed++;
+      if (candidateLock === sessionId) candidateLock = null;
+      // Nonpersistent confirmed commit: the session that issued it ends, the device reverts.
+      if (device.confirmTimer && pendingOwner === sessionId) {
+        device.committed = [...junosBefore];
+        device.confirmTimer = false;
+        pendingOwner = null;
+        revision++;
+        device.events.push('session-closed-revert');
+      }
+    });
+    const handle = (frame: string) => {
+      if (frame.startsWith('<hello')) {
+        send(
+          `<hello xmlns="${NC}"><capabilities>${
+            capabilities.map((c) => `<capability>${escapeXml(c)}</capability>`).join('')
+          }</capabilities><session-id>${sessionId}</session-id></hello>`,
+        );
+        return;
+      }
+      const id = /message-id="(\d+)"/.exec(frame)![1];
+      const body = frame.slice(frame.indexOf('>') + 1, frame.lastIndexOf('</rpc>'));
+      device.netconf.push(body);
+      if (body.startsWith('<lock>')) {
+        if (candidateLock || diff(device.committed, device.candidate).length) {
+          return refuse(id, 'lock-denied');
+        }
+        candidateLock = sessionId;
+        return reply(id);
+      }
+      if (body.startsWith('<unlock>')) {
+        if (candidateLock === sessionId) candidateLock = null;
+        return reply(id);
+      }
+      if (body.startsWith('<get><filter')) {
+        return reply(
+          id,
+          `<data><netconf-state xmlns="${MON}"><datastores><datastore><name>candidate</name>${
+            candidateLock
+              ? `<locks><locked-by-session>${candidateLock}</locked-by-session><locked-time>2026-11-19T00:00:00Z</locked-time></locks>`
+              : ''
+          }</datastore><datastore><name>running</name></datastore></datastores></netconf-state></data>`,
+        );
+      }
+      if (body.startsWith('<get-commit-information')) {
+        return reply(
+          id,
+          `<commit-information><commit-history><sequence-number>0</sequence-number><user>support</user><client>netconf</client><configuration-revision>re0-100-${revision}</configuration-revision>${
+            device.confirmTimer ? '<commit-confirmed>rollback pending</commit-confirmed>' : ''
+          }</commit-history></commit-information>`,
+        );
+      }
+      if (body.startsWith('<get-configuration')) {
+        return reply(
+          id,
+          config(body.includes('database="candidate"') ? device.candidate : device.committed),
+        );
+      }
+      if (body.startsWith('<load-configuration')) {
+        const text = /<configuration-set>([\s\S]*)<\/configuration-set>/.exec(body)![1];
+        for (const line of unescape(text).split('\n')) {
+          const del = /^delete (interfaces \S+) disable$/.exec(line);
+          if (del) device.candidate = device.candidate.filter((l) => l !== `set ${del[1]} disable`);
+          else device.candidate.push(line);
+        }
+        device.events.push('load');
+        return reply(id, '<load-configuration-results><ok/></load-configuration-results>');
+      }
+      if (body.startsWith('<validate>')) return reply(id);
+      if (body.startsWith('<commit><confirmed/>')) {
+        junosBefore = [...device.committed];
+        device.committed = [...device.candidate];
+        device.confirmTimer = true;
+        pendingOwner = sessionId;
+        revision++;
+        device.events.push('commit-confirmed');
+        return reply(id);
+      }
+      if (body === '<commit/>') {
+        device.committed = [...device.candidate];
+        device.confirmTimer = false;
+        pendingOwner = null;
+        device.events.push('commit');
+        if (options.lostConfirmReply) {
+          stream.close();
+          return;
+        }
+        return reply(id);
+      }
+      return refuse(id, 'operation-not-supported');
+    };
+    stream.on('data', (chunk: Uint8Array) => {
+      buffer += new TextDecoder().decode(chunk);
+      for (let at = buffer.indexOf(']]>]]>'); at >= 0; at = buffer.indexOf(']]>]]>')) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 6);
+        handle(frame);
+      }
+    });
+  };
+
   // deno-lint-ignore no-explicit-any
   const server = new Server({ hostKeys: [hostKey] }, (client: any) => {
     // deno-lint-ignore no-explicit-any
@@ -506,7 +583,17 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
         // deno-lint-ignore no-explicit-any
         session.on('pty', (ok: any) => ok());
         // deno-lint-ignore no-explicit-any
-        session.on('shell', (ok: any) => shell(ok(), client, index));
+        session.on('shell', (ok: any) => {
+          device.shellsOpened++;
+          const stream = ok();
+          stream.on('close', () => device.shellsClosed++);
+          shell(stream, client, index);
+        });
+        // deno-lint-ignore no-explicit-any
+        session.on('subsystem', (ok: any, reject: any, info: { name: string }) => {
+          if (options.kind === 'junos' && info.name === 'netconf') netconf(ok(), index);
+          else reject();
+        });
       });
     });
   });

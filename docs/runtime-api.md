@@ -368,7 +368,7 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
   "steps": ["1..30 commands, each <= 1000 chars, no CR/LF/NUL"],
   "verify": ["change only: 1..10 read commands, run in a NEW SSH session"],
   "rollback": ["change + systemd_deadman only: 1..30 commands"],
-  "safeChange": "routeros_safe_mode | vrp5_schedule_reboot | systemd_deadman | none",
+  "safeChange": "routeros_safe_mode | vrp5_schedule_reboot | systemd_deadman | reload_in | commit_confirmed | none",
   "rollbackSeconds": 300,
   "backupName": "^[a-z0-9-]{1,48}$ (change only, else null)",
   "changeLog": {
@@ -406,6 +406,51 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
 - A `change` or `rotate` over `transport: connector` is refused (`finish` `refused`,
   `exec_change_unsupported_transport`): the verification needs a second SSH connection and the
   connector bridge carries one stream.
+
+### Junos change (`safeChange: commit_confirmed`, dialect `junos`)
+
+A Junos change does not use the CLI configuration mode. After the pinned SSH login the worker opens
+the `netconf` subsystem on that same authenticated connection (no other destination, no other
+credential) and runs a bounded NETCONF state machine:
+
+1. Refusal before any lock: the hello must advertise `base:1.0`, `candidate:1.0`,
+   `confirmed-commit:1.1`, `validate` and the Junos extension; the gateway itself offers only
+   `base:1.0` (no chunked framing). Candidate-lock monitoring (`ietf-netconf-monitoring`) must be
+   advertised and its answers must have the exact documented shape, else the request is refused
+   before the first backup or load.
+2. `lock` of the candidate. A candidate with foreign edits, or locked by someone else, is refused
+   by the device and the gateway sends nothing else: it never discards a foreign candidate, never
+   uses `configure exclusive`, `kill-session` or `rollback 1`.
+3. Baseline proof (lock owner equals our session, candidate equals running, no pending or foreign
+   commit), then the pre backup, then `load-configuration` of the validated steps, `validate`, and
+   a native non-persistent `commit` `confirmed` (`confirm-timeout` = `rollbackSeconds`).
+4. Backups are real device-local files written by a separate CLI channel of the same connection:
+   `file list <file>` must answer the not-found form (an existing file is never overwritten), then
+   the fixed internal command `show configuration | save <file>` must answer `Wrote N lines of
+   configuration to '<file>'`. Files are `/var/tmp/<backupName>-pre.conf` (before the load) and
+   `-post.conf` (after the unconfirmed commit, before the verification); they are kept for audit
+   and recovery, never deleted. The result records the two commands with the proof output
+   withheld.
+5. Verification runs in a NEW pinned SSH connection (read commands only) while the NETCONF session
+   and its lock stay open; an abort closes that connection. Ownership, pending state and the
+   candidate/running digests are proven again, then one `commit` confirms. The pending
+   indication must be gone and the content retained afterwards.
+
+Result semantics: only a proven confirmation is `applied` (`rollback`: `confirmed_commit`,
+`armed` false). Every other ending is `failed` with a fixed `error.code` `JUNOS_<reason>` and a
+fixed message, never device text, XML, RPC error-info or configuration. `rollback.armed` is `true`
+only when a confirmed commit may be pending: the NETCONF session is then closed, which makes the
+device revert a nonpersistent confirmed commit; that reversal is NOT observed, so the gateway never
+emits `rolled_back` for Junos. A lost or unacknowledged final confirmation is `failed` with a
+message saying the outcome is unknown (`armed` false, no success or rollback claimed). A request
+cancelled in any phase closes the NETCONF subsystem and the helper channels and sends no
+confirmation.
+
+Limits: the profile follows the Juniper documentation and YANG module shapes (legacy NETCONF
+namespace for the commit history, NETCONF or `xnm/1.1` namespace for the configuration). It is
+covered by synthetic protocol tests only; it is not validated on hardware and makes no claim for
+any firmware or platform generation. Monitoring datastores are platform specific (Junos 23.4R1+
+on some platforms); a device that does not answer in the documented shape is refused.
 
 ### Kind `rotate` (password rotation, ST-H)
 
