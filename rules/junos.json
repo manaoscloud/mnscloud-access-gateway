@@ -1,0 +1,84 @@
+{
+  "dialect": "junos",
+  "description": "Juniper Junos CLI (operational and configuration mode). Only an explicit list of show commands is read; configuration dumps (`show configuration`, bare `show`, `show system login`, `| display`, `save`) are secret_read; pivots, shells and unknown lines are blocked or write_risky (fail-closed).",
+  "syntax": "plain",
+  "flags": "i",
+  "clearKeys": [
+    "\u0003"
+  ],
+  "untrackable": [
+    "?"
+  ],
+  "cancelLine": "\u0015",
+  "rules": [
+    {
+      "id": "junos-simple-read",
+      "class": "read",
+      "pattern": "^(?:(?:ping|traceroute) [^?|;<>&`$]*(?: \\| (?:match|except|count|no-more|last|find)\\b[^|;<>&`$?]*)*|set cli (?:screen-length|screen-width) \\d+)$"
+    },
+    {
+      "id": "junos-read",
+      "class": "read",
+      "pattern": "^show (?:version|system (?:uptime|information|alarms|storage|commit|users|processes extensive|memory|boot-messages)|interfaces(?: terse| brief| descriptions| extensive| [a-z]{2,3}-\\d+/\\d+/\\d+(?:\\.\\d+)?)?|route(?: summary| \\S+)?|chassis (?:hardware|alarms|environment|routing-engine|fpc|firmware)|arp(?: no-resolve)?|bgp (?:summary|neighbor)|ospf (?:neighbor|interface|database)|lldp neighbors|ethernet-switching (?:table|interface)|vlans|log \\S+|ntp (?:associations|status)|security (?:flow session summary|zones|policies hit-count))(?: \\| (?:match|except|count|no-more|last|find)\\b[^|>]*)*$"
+    },
+    {
+      "id": "junos-secret",
+      "class": "secret_read",
+      "pattern": "^(?:show(?: configuration| system login| system root-authentication| snmp| security (?:ike|ipsec|keychain|pki)| groups)?(?: .*)?|run show configuration.*|file (?:show|archive|copy)\\b.*|request system configuration rescue\\b.*|save\\b.*)$",
+      "hint": "Configuration dumps and secrets are never shown in the console."
+    },
+    {
+      "id": "junos-redirect",
+      "class": "write_risky",
+      "pattern": "\\|\\s*(?:save|request|append|tee|redirect|file|load|start|run|commit)\\b|[>;]",
+      "hint": "Output pipes that write files or run commands are not reads."
+    },
+    {
+      "id": "junos-destructive",
+      "class": "destructive",
+      "pattern": "^(?:request system (?:reboot|halt|power-off|zeroize|snapshot|software)|request chassis|load (?:override|factory-default)|rollback|file delete|delete|clear (?:system|configuration))\\b"
+    },
+    {
+      "id": "junos-pivot",
+      "class": "pivot",
+      "pattern": "^(?:ssh|telnet|start (?:shell|cli)|run|request (?:routing-engine login|support)|file copy|scp|ftp)\\b"
+    },
+    {
+      "id": "junos-write",
+      "class": "write_low",
+      "pattern": "^(?:set interfaces \\S+ description \\\"?[A-Za-z0-9 ._:/,-]{1,64}\\\"?|set vlans \\S+ vlan-id \\d{1,4})$"
+    },
+    {
+      "id": "junos-risky",
+      "class": "write_risky",
+      "pattern": "^(?:set|edit|top|up|configure|commit|activate|deactivate|rename|copy|insert|annotate|protect|unprotect|replace|restart|request|load|exit|quit)\\b"
+    },
+    {
+      "id": "empty",
+      "class": "read",
+      "pattern": "^$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "junos-encrypted",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:encrypted-password|authentication-key|secret|pre-shared-key (?:ascii-text|hexadecimal)|ascii-text|key|community)\\s+)(?<value>\\\"[^\\\"]*\\\"|\\S+)"
+    },
+    {
+      "id": "junos-9",
+      "flags": "g",
+      "pattern": "(?<value>\\$9\\$[A-Za-z0-9./\\-]+)"
+    },
+    {
+      "id": "kw-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key-string|pre-shared-key|psk|community|enable secret|enable password|passphrase|auth-password|priv-password)\\s+(?:\\d\\s+)?)(?<value>\\S+)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    }
+  ]
+}

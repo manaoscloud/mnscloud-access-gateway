@@ -1,0 +1,19 @@
+<rpc-reply xmlns:junos="http://xml.juniper.net/junos/23.4R1.12-EVO/junos"
+  xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+  <data>
+    <netconf-state xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring">
+      <datastores>
+        <datastore>
+          <name>candidate</name>
+          <locks>
+            <locked-by-session>0</locked-by-session>
+            <locked-time junos:seconds="1691539727">2023-08-08T17:08:47-07:00</locked-time>
+          </locks>
+        </datastore>
+        <datastore>
+          <name>running</name>
+        </datastore>
+      </datastores>
+    </netconf-state>
+  </data>
+</rpc-reply>

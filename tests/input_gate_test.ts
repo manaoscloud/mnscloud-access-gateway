@@ -227,3 +227,73 @@ Deno.test('gate: an unrequested or extra terminal report still taints the line',
   ]);
   h.gate.close();
 });
+
+Deno.test('second wave console N1 never submits clock mutations or configuration/environment dumps', () => {
+  for (
+    const [dialect, line, expected] of [
+      ['fortios', 'execute date 2026-01-01', 'write_risky'],
+      ['fortios', 'execute time 00:00:00', 'write_risky'],
+      ['bsd', 'ps e', 'secret_read'],
+      ['bsd', 'ps auxe', 'secret_read'],
+      ['bsd', 'ps -ef', 'secret_read'],
+      ['ios', 'show derived-config', 'secret_read'],
+    ] as const
+  ) {
+    const h = harness(dialect, 'n1');
+    h.gate.input(line + '\r');
+    assertEquals(h.events[0].class, expected);
+    assertEquals(h.events[0].verdict, 'blocked');
+    assert(!h.device().includes('\r'));
+    h.gate.close();
+  }
+  for (
+    const [dialect, line] of [
+      ['fortios', 'execute date'],
+      ['fortios', 'execute time'],
+      ['junos', 'set cli screen-length 0'],
+      ['junos', 'set cli screen-width 0'],
+    ] as const
+  ) {
+    const h = harness(dialect, 'n1');
+    h.gate.input(line + '\r');
+    assertEquals(h.events[0].verdict, 'allowed');
+    h.gate.close();
+  }
+});
+
+Deno.test('gate: windows Ctrl+U clears the buffered line exactly like the device does', () => {
+  const h = harness('windows', 'n3');
+  h.gate.input('hostname\x15shutdown /r\r');
+  const verdict = h.controls.find((c) => c.type === 'verdict') as Extract<
+    ControlMessage,
+    { type: 'verdict' }
+  >;
+  // The verdict shows what cmd.exe will run (the device also drops `hostname` on Ctrl+U).
+  assertEquals([verdict.line, verdict.class, verdict.requires], [
+    'shutdown /r',
+    'destructive',
+    'double_confirm',
+  ]);
+  h.gate.close();
+});
+
+Deno.test('gate: windows chained or path-qualified lines are never read or one-step writes', () => {
+  for (
+    const [line, cls] of [
+      ['hostname & reg save HKLM\\SAM c:\\s', 'secret_read'],
+      ['@shutdown /r', 'destructive'],
+      ['C:\\Windows\\System32\\shutdown.exe /r', 'destructive'],
+      ['more C:\\x\\id_rsa', 'secret_read'],
+    ]
+  ) {
+    const h = harness('windows', 'n3');
+    h.gate.input(line + '\r');
+    const verdict = h.controls.find((c) => c.type === 'verdict') as
+      | Extract<ControlMessage, { type: 'verdict' }>
+      | undefined;
+    assertEquals(verdict?.class ?? h.events[0]?.class, cls, line);
+    // Nothing reaches the device before the (double) confirmation; a secret read is blocked.
+    assert(!h.device().includes('\r'), line);
+    h.gate.close();
+  }
+});

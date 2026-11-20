@@ -368,7 +368,7 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
   "steps": ["1..30 commands, each <= 1000 chars, no CR/LF/NUL"],
   "verify": ["change only: 1..10 read commands, run in a NEW SSH session"],
   "rollback": ["change + systemd_deadman only: 1..30 commands"],
-  "safeChange": "routeros_safe_mode | vrp5_schedule_reboot | systemd_deadman | none",
+  "safeChange": "routeros_safe_mode | vrp5_schedule_reboot | systemd_deadman | reload_in | commit_confirmed | none",
   "rollbackSeconds": 300,
   "backupName": "^[a-z0-9-]{1,48}$ (change only, else null)",
   "changeLog": {
@@ -406,6 +406,54 @@ gateway never invents or edits a command: it classifies the list, runs it or ref
 - A `change` or `rotate` over `transport: connector` is refused (`finish` `refused`,
   `exec_change_unsupported_transport`): the verification needs a second SSH connection and the
   connector bridge carries one stream.
+
+### Junos change (`safeChange: commit_confirmed`, dialect `junos`)
+
+A Junos change does not use the CLI configuration mode. After the pinned SSH login the worker opens
+the `netconf` subsystem on that same authenticated connection (no other destination, no other
+credential) and runs a bounded NETCONF state machine:
+
+1. Refusal before any lock: the hello must advertise `base:1.0`, `candidate:1.0`,
+   `confirmed-commit:1.1`, `validate` and the Junos extension; the gateway itself offers only
+   `base:1.0` (no chunked framing). Candidate-lock monitoring (`ietf-netconf-monitoring`) must be
+   advertised and its answers must have the exact documented shape, else the request is refused
+   before the first backup or load.
+2. `lock` of the candidate. A candidate with foreign edits, or locked by someone else, is refused
+   by the device and the gateway sends nothing else: it never discards a foreign candidate, never
+   uses `configure exclusive`, `kill-session` or `rollback 1`.
+3. Baseline proof (lock owner equals our session, candidate equals running, no pending or foreign
+   commit), then the pre backup, then `load-configuration` of the validated steps, `validate`, and
+   a native non-persistent `commit` `confirmed` (`confirm-timeout` = `rollbackSeconds`).
+4. Backups are real device-local files written by a separate CLI channel of the same connection:
+   `file list <file>` must answer the not-found form (an existing file is never overwritten), then
+   the fixed internal command `show configuration | save <file>` must answer `Wrote N lines of
+   configuration to '<file>'`. Files are `/var/tmp/<backupName>-pre.conf` (before the load) and
+   `-post.conf` (after the unconfirmed commit, before the verification); they are kept for audit
+   and recovery, never deleted. They contain the FULL device configuration (including secret
+   material the device stores in it): the path is under `/var/tmp` and the gateway changes no
+   permission, so treat them as sensitive and prune them under the operator's retention policy. The
+   result records the two commands with the proof output
+   withheld.
+5. Verification runs in a NEW pinned SSH connection (read commands only) while the NETCONF session
+   and its lock stay open; an abort closes that connection. Ownership, pending state and the
+   candidate/running digests are proven again, then one `commit` confirms. The pending
+   indication must be gone and the content retained afterwards.
+
+Result semantics: only a proven confirmation is `applied` (`rollback`: `confirmed_commit`,
+`armed` false). Every other ending is `failed` with a fixed `error.code` `JUNOS_<reason>` and a
+fixed message, never device text, XML, RPC error-info or configuration. `rollback.armed` is `true`
+only when a read-back proved a pending confirmed commit owned by this session: the NETCONF session is then closed, which makes the
+device revert a nonpersistent confirmed commit; that reversal is NOT observed, so the gateway never
+emits `rolled_back` for Junos. A lost or unacknowledged final confirmation is `failed` with a
+message saying the outcome is unknown (`armed` false, no success or rollback claimed). A commit that was sent but never read back as pending is `failed` / `JUNOS_COMMIT_STATE_UNKNOWN` with `armed` false: its outcome and timer are unknown. RPCs have a 30 s budget, the backup hook 60 s and the verification 30 s, all capped by the confirmed-commit deadline minus a 5 s margin. A request
+cancelled in any phase closes the NETCONF subsystem and the helper channels and sends no
+confirmation.
+
+Limits: the profile follows the Juniper documentation and YANG module shapes (legacy NETCONF
+namespace for the commit history, NETCONF or `xnm/1.1` namespace for the configuration). It is
+covered by synthetic protocol tests only; it is not validated on hardware and makes no claim for
+any firmware or platform generation. Monitoring datastores are platform specific (Junos 23.4R1+
+on some platforms); a device that does not answer in the documented shape is refused.
 
 ### Kind `rotate` (password rotation, ST-H)
 
@@ -881,3 +929,33 @@ pinning, redaction, recording and command policy are unchanged. The gateway fini
 connection with `connector_offline` (state `failed`) when no tunnel is attached, or with the OPEN_FAIL
 code of the connector (`refused` for the refusal codes, `failed` for the others; any code outside the fixed list is
 reported as `connector_open_failed`).
+
+## Windows WinRM (ST-K)
+
+`protocol: "winrm"`, `shellDialect: "windows"` use the existing assignment fields and
+credential flow. `target` remains one fixed address and port (5985 is refused); `tls.pinned`
+uses the same SHA256/base64 leaf-certificate format as API-SSL. Direct and connector paths
+both negotiate native TLS on the assigned stream and await the API pin decision before
+requesting a password or emitting an authenticated HTTP request. A cancellation during
+connection, pin or credential waits prevents subsequent Create/Command operations.
+
+The worker implements HTTPS `POST /wsman`, HTTP Basic with a password credential, and the
+WinRS `cmd` resource. It creates a shell, sends Command/Receive, and attempts Signal terminate
+and Delete on early completion. Cleanup requests are bounded to two seconds each; a closed or
+unusable transport cannot prove remote cleanup. There is no redirect, plaintext fallback,
+NTLM/Kerberos/CredSSP, PSRP, or second destination. Test mode requires successful shell creation
+and attempts deletion; console mode uses the existing input gate, policy, redaction and recording;
+exec accepts diagnostic reads only. No Windows automatic changes or credential rotations.
+
+SOAP parsing requires namespace URIs, single correlation/Action/ID elements, matching
+RelatesTo and response Action, and consistent ShellId (including a named WS-Man ShellId/ShellID
+selector). Output streams must identify the issued CommandId. DTD/entities, duplicate attributes,
+conflicting IDs, malformed base64 and oversized messages fail closed. Fault metadata contains
+only the documented operation-timeout code or `unknown`, never arbitrary numeric codes or remote fault text. One command deadline
+covers Command and Receive, checks cancellation and elapsed time after waits, and suppresses
+late output; cleanup has its own small bound.
+
+`tests/winrm_test.ts` runs the real controller/worker against a synthetic HTTPS WS-Man endpoint,
+including malformed responses, cancellation, pin refusal and output/deadline limits. These tests
+establish protocol behavior; they do not certify a Windows host or firmware. The wire lifecycle
+follows [Microsoft MS-WSMV remote shells](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wsmv/593f3ed0-0c7a-4158-a4be-0b429b597e31).

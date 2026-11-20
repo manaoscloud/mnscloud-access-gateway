@@ -178,3 +178,29 @@ escape sequences, prompt-injection text) and a RouterOS API-SSL mock. The runtim
 Dependencies (`ssh2` and its pure-JavaScript dependencies, `@types/node` for type checking) are
 vendored in `node_modules/` and pinned by `deno.lock`; the runtime runs with `--cached-only --frozen`
 and never downloads. Update them with `deno install` and commit the result.
+
+## Junos changes
+
+A Junos change (`safeChange: commit_confirmed`) runs over the NETCONF subsystem of the already
+pinned and authenticated SSH connection: candidate lock without discarding a foreign candidate, device-local
+`/var/tmp/<backupName>-pre.conf` and `-post.conf` backups (never overwritten), a native
+non-persistent confirmed commit (the backups hold the full configuration and are retained for audit), verification in a new pinned SSH connection, and one confirming
+commit. It refuses before any lock when a capability, the lock monitoring or a documented reply
+shape is missing. Only a proven confirmation is `applied`; every other ending is `failed` with a
+fixed `JUNOS_*` code, and `rolled_back` is never reported because the device-side reversal is not
+observed. The tests use a synthetic NETCONF server: this is protocol proof, not hardware or
+firmware validation, and it makes no generic Junos compatibility claim. See
+[Junos change](docs/runtime-api.md#junos-change-safechange-commit_confirmed-dialect-junos).
+
+## Windows support
+
+Windows sessions use native WinRM HTTPS/WinRS (`cmd`), with the leaf TLS pin checked before
+password delivery on both direct and connector paths. Test mode proves shell readiness;
+console input passes through the same classifier and redactor; AI exec is diagnostic reads
+only. Automatic Windows changes, password rotation, plaintext WinRM, PSRP and delegated
+credentials are unsupported. Command execution and cleanup are bounded; remote cleanup
+cannot be confirmed after a transport failure. See the precise
+[Windows runtime contract](docs/runtime-api.md#windows-winrm-st-k).
+
+The synthetic WS-Man tests exercise a real worker process. They are protocol integration
+proof, not validation of Windows installations or vendor firmware.

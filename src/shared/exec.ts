@@ -5,7 +5,13 @@
 import { createHash } from 'node:crypto';
 
 export type ExecKind = 'read' | 'change' | 'rotate';
-export type SafeChange = 'routeros_safe_mode' | 'vrp5_schedule_reboot' | 'systemd_deadman' | 'none';
+export type SafeChange =
+  | 'routeros_safe_mode'
+  | 'vrp5_schedule_reboot'
+  | 'systemd_deadman'
+  | 'reload_in'
+  | 'commit_confirmed'
+  | 'none';
 export type ChangeLogKind = 'script' | 'file' | 'report_only';
 
 export interface ExecPayload {
@@ -45,7 +51,13 @@ export interface ExecResult {
   status: ExecStatus;
   steps: ExecStepResult[];
   rollback: {
-    method: 'safe_mode' | 'scheduled_reboot' | 'deadman_timer' | 'none';
+    method:
+      | 'safe_mode'
+      | 'scheduled_reboot'
+      | 'deadman_timer'
+      | 'scheduled_reload'
+      | 'confirmed_commit'
+      | 'none';
     armed: boolean;
     fired: boolean;
     pendingReboot: boolean;
@@ -61,7 +73,13 @@ export interface ExecResult {
 export class ExecPayloadError extends Error {}
 
 const MAX_COMMAND = 1000;
-const SAFE_CHANGES = ['routeros_safe_mode', 'vrp5_schedule_reboot', 'systemd_deadman'];
+const SAFE_CHANGES = [
+  'routeros_safe_mode',
+  'vrp5_schedule_reboot',
+  'systemd_deadman',
+  'reload_in',
+  'commit_confirmed',
+];
 const KEYS = [
   'kind',
   'requestUUID',
@@ -119,7 +137,8 @@ function commands(
   }
   // Control characters (Tab included) could trigger completion or editing in a device shell, and
   // `?` is inline help on RouterOS and VRP.
-  const inlineHelp = dialect === 'routeros' || dialect === 'vrp';
+  const inlineHelp = dialect !== 'linux' && dialect !== 'proxmox' && dialect !== 'bsd' &&
+    dialect !== 'windows';
   for (const item of value) {
     if (
       typeof item !== 'string' || !item.trim() || item.length > MAX_COMMAND ||
@@ -130,12 +149,23 @@ function commands(
   return value as string[];
 }
 
+// An empty list is a read-only dialect: no automatic change (fortios, bsd, vsol, dmos, windows)
+// until a separate implementation and proof exist. `other` is not listed: no exec at all.
 const SAFE_FOR_DIALECT: Record<string, string[]> = {
   routeros: ['routeros_safe_mode'],
   vrp: ['vrp5_schedule_reboot'],
   linux: ['systemd_deadman'],
   proxmox: ['systemd_deadman'],
+  ios: ['reload_in'],
+  junos: ['commit_confirmed'],
+  fortios: [],
+  bsd: [],
+  vsol: [],
+  dmos: [],
+  windows: [],
 };
+/** Dialects whose credential the gateway can rotate (templates exist only for these). */
+const ROTATABLE = ['routeros', 'vrp', 'linux', 'proxmox'];
 
 /**
  * Validates an `exec` payload for a device dialect. `connectionUUID` is the one the payload must
@@ -157,6 +187,10 @@ export function parseExecPayload(
     throw new ExecPayloadError('Invalid exec kind');
   }
   const kind = v.kind;
+  if (kind === 'rotate' && !ROTATABLE.includes(dialect)) {
+    // No rotation template exists for the other dialects: refuse, never approximate.
+    throw new ExecPayloadError('Invalid exec kind');
+  }
   if (
     typeof v.requestUUID !== 'string' ||
     !(HEX32.test(v.requestUUID) || UUID_FORM.test(v.requestUUID)) ||
@@ -260,7 +294,14 @@ export function parseExecPayload(
 }
 
 const STATUSES = ['ok', 'blocked', 'failed', 'applied', 'rolled_back'];
-const METHODS = ['safe_mode', 'scheduled_reboot', 'deadman_timer', 'none'];
+const METHODS = [
+  'safe_mode',
+  'scheduled_reboot',
+  'deadman_timer',
+  'scheduled_reload',
+  'confirmed_commit',
+  'none',
+];
 
 /** Light shape and size check of a result produced by the worker (before it is posted). */
 export function validExecResult(value: unknown): value is ExecResult {

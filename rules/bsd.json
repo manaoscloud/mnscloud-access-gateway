@@ -1,0 +1,84 @@
+{
+  "dialect": "bsd",
+  "description": "BSD POSIX shells (pfSense, OPNsense, FreeBSD): sh/csh syntax, each segment of a list or pipeline is classified, the strictest class wins. No systemd, no Linux-only tools. Unknown commands are write_risky (fail-closed).",
+  "syntax": "posix",
+  "clearKeys": [
+    "\u0003",
+    "\u0015"
+  ],
+  "untrackable": [],
+  "cancelLine": "\u0015",
+  "macros": {
+    "SECRETFILE": "(?:/conf/|/cf/conf/|/var/etc/|/etc/(?:master\\.passwd|spwd\\.db|pwd\\.db|ssh/ssh_host_[a-z0-9]+_key\\b|ssl/private|opnsense|sudoers(?:\\.d)?)|/usr/local/etc/(?:openvpn|ipsec|strongswan|wireguard|ssl|ssh)|config\\.xml|/root/\\.ssh/|/\\.ssh/id_|\\.pem\\b|\\.key\\b|\\.netrc\\b|\\.pgpass\\b)"
+  },
+  "rules": [
+    {
+      "id": "bsd-secret-file",
+      "class": "secret_read",
+      "pattern": "^(?:cat|less|more|head|tail|grep|egrep|fgrep|zgrep|awk|sed|strings|xxd|hexdump|od|base64|cp|scp|vi|ee|nano|cut|sort|uniq|diff|tee|dd|install|tar|gzip|zcat|openssl|cmp|xmllint|php|sqlite3)\\b.*{SECRETFILE}",
+      "hint": "Secret files and the firewall configuration are never shown in the console."
+    },
+    {
+      "id": "bsd-ps-environment",
+      "class": "secret_read",
+      "pattern": "^ps(?:\\s+-?[a-zA-Z]*)*e[a-zA-Z]*(?:\\s|$)"
+    },
+    {
+      "id": "bsd-env-dump",
+      "class": "secret_read",
+      "pattern": "^(?:env|printenv|set|export|setenv|declare|typeset)$"
+    },
+    {
+      "id": "bsd-key-material",
+      "class": "secret_read",
+      "pattern": "^(?:openssl (?:rsa|pkey|ec|pkcs12)\\b.*-in\\b|ssh-keygen\\b.*\\s-y\\b|wg showconf\\b|configctl\\b.*(?:backup|config))"
+    },
+    {
+      "id": "bsd-destructive",
+      "class": "destructive",
+      "pattern": "^(?:rm\\b.*(?:\\s-[a-zA-Z]*[rR][a-zA-Z]*\\b|\\s--no-preserve-root\\b)|newfs\\S*|gpart (?:destroy|delete|create|modify|recover)|geli|gmirror|graid|zpool (?:destroy|labelclear)|zfs destroy|dd\\b.*\\bof=/dev/(?!null\\b)|mkfs\\S*|fdisk|bsdlabel|pkg (?:delete|remove) -a|pkg autoremove)\\b"
+    },
+    {
+      "id": "bsd-pivot",
+      "class": "pivot",
+      "pattern": "^(?:ssh|scp|sftp|telnet|nc|ncat|netcat|socat|curl|wget|fetch|ftp|lftp|rsync|tftp|nmap|su|sudo|doas|sh|csh|tcsh|bash|zsh|ksh|dash|python[0-9.]*|perl|ruby|php|lua|tclsh|expect|chroot|jexec|eval|exec|source|pfSsh\\.php|opnsense-shell|opnsense-importer|script|tmux|screen)\\b"
+    },
+    {
+      "id": "bsd-pfctl-show",
+      "class": "read",
+      "pattern": "^pfctl(?: -[nv]+)* -s ?(?:info|rules|nat|state|states|Interfaces|labels|timeouts|memory|Running|osfp|queue|all|i|r|n|s|I|l|t|m|R|q|a|A)(?: -[nv]+)*$"
+    },
+    {
+      "id": "bsd-risky",
+      "class": "write_risky",
+      "pattern": "^(?:reboot|shutdown|poweroff|halt|init|fastboot|fasthalt|service|pfctl|sysctl\\b.*(?:\\s-w|=)|ifconfig\\b.*\\s(?:down|up|delete|destroy|create|inet|inet6|alias|-alias|promisc|mtu|vlan|vlandev|name)\\b|route\\s+(?:add|delete|change|flush)|ipfw|killall|kill|pkill|pw|passwd|chpass|vipw|crontab|kldload|kldunload|mount|umount|swapoff|chmod|chown|chflags|mv|cp|ln|mkdir|touch|rm|tee|truncate|pkg|freebsd-update|opnsense-update|opnsense-code|pluginctl|configctl|rc\\.\\S+)\\b"
+    },
+    {
+      "id": "bsd-read",
+      "class": "read",
+      "pattern": "^(?:uname(?: -[a-z]+)*|uptime|hostname|date|whoami|id|ifconfig(?: -[a-zA-Z]+)?(?: \\S+)?|netstat(?: -[a-zA-Z]+)*|df(?: -[a-zA-Z]+)*|sysctl(?: -[anNe]+)*(?: [a-z0-9_.]+)*|dmesg|ps(?: -?[a-zA-Z]+)*|top -b(?: -[a-zA-Z]+)*|ls(?: -[a-zA-Z]+)*(?: [^;|&<>*?]+)?|pwd|sockstat(?: -[a-zA-Z0-9]+)*|arp -[an]+|ndp -[an]+|swapinfo(?: -[a-zA-Z]+)*|vmstat(?: -[a-zA-Z]+)*(?: \\d+)*|freebsd-version(?: -[a-z]+)*|ping -c ?\\d+ \\S+|traceroute -[nI]* ?\\S+|drill \\S+|host \\S+|true|exit|logout)$"
+    },
+    {
+      "id": "empty",
+      "class": "read",
+      "pattern": "^$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "bsd-xml-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|bcrypt-hash|passwd|secret|psk|pre-shared-key|prv|private-key|auth_pass|authpass|apikey|api_secret|key)>)(?<value>[^<]*)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    },
+    {
+      "id": "url-userinfo",
+      "flags": "g",
+      "pattern": "(?<key>[a-z][a-z0-9+.-]*://[^:/@\\s]+:)(?<value>[^@\\s]+)(?=@)"
+    }
+  ]
+}

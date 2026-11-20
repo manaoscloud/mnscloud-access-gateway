@@ -12,14 +12,27 @@ export function validBridgePath(path: unknown): path is string {
     !path.includes('..') && !path.includes('//');
 }
 
-export type ShellDialect = 'routeros' | 'linux' | 'proxmox' | 'vrp' | 'other';
+export type ShellDialect =
+  | 'routeros'
+  | 'linux'
+  | 'proxmox'
+  | 'vrp'
+  | 'other'
+  | 'ios'
+  | 'junos'
+  | 'fortios'
+  | 'bsd'
+  | 'vsol'
+  | 'dmos'
+  | 'windows';
+export type DeviceProtocol = 'ssh' | 'routeros_api' | 'winrm';
 export type SupportLevel = 'n1' | 'n2' | 'n3';
 
 export interface WorkerInit {
   t: 'init';
   connectionUUID: string;
   mode: 'console' | 'test' | 'exec';
-  protocol: 'ssh' | 'routeros_api';
+  protocol: DeviceProtocol;
   target: { address: string; port: number };
   /** `connector`: connect to the unix socket `bridge` instead of the network. */
   transport?: 'direct' | 'connector';

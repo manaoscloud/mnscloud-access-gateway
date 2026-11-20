@@ -11,7 +11,22 @@ const fixtures = JSON.parse(
   Case[] | Case[][]
 >;
 
-for (const dialect of ['routeros', 'linux', 'proxmox', 'vrp', 'other'] as ShellDialect[]) {
+const DIALECTS_UNDER_TEST = [
+  'routeros',
+  'linux',
+  'proxmox',
+  'vrp',
+  'other',
+  'ios',
+  'junos',
+  'fortios',
+  'bsd',
+  'vsol',
+  'dmos',
+  'windows',
+] as ShellDialect[];
+
+for (const dialect of DIALECTS_UNDER_TEST) {
   Deno.test(`classifier fixtures: ${dialect}`, () => {
     const failures: string[] = [];
     for (const [line, expected, unknown] of fixtures[dialect] as Case[]) {
@@ -49,7 +64,7 @@ Deno.test('classifier: navigation is not applied before the line runs', () => {
 });
 
 Deno.test('classifier: every rule file compiles and every rule is reachable data', () => {
-  for (const dialect of ['routeros', 'linux', 'proxmox', 'vrp', 'other'] as ShellDialect[]) {
+  for (const dialect of DIALECTS_UNDER_TEST) {
     const rules = loadRules(dialect);
     assertEquals(rules.rules.length > 0, true, dialect);
     assertEquals(
