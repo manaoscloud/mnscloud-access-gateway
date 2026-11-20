@@ -19,7 +19,9 @@ import {
   hostAuthority,
   HttpConnection,
   parseXml,
+  runWinrmCommand,
   WinrmError,
+  WsmanClient,
   XML_LIMITS,
 } from '../src/worker/winrm.ts';
 import { assert, assertEquals, assertNotIncludes, assertRejects, assertThrows } from './assert.ts';
@@ -35,7 +37,7 @@ const PASSWORD = 'W1nRM-Pa55word!';
 
 Deno.test('winrm xml: bounded, no DTD/entities/CDATA/comments, predefined references only', () => {
   const doc = parseXml(
-    '<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="urn:x"><s:Body a="1 &amp; 2">' +
+    '<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="urn:x" xmlns:rsp="urn:rsp"><s:Body a="1 &amp; 2">' +
       '<rsp:Text>a &lt; b &#65;&#x42;</rsp:Text><empty/></s:Body></s:Envelope>',
   );
   assertEquals(doc.name, 'Envelope');
@@ -76,7 +78,7 @@ Deno.test('winrm xml: bounded, no DTD/entities/CDATA/comments, predefined refere
 Deno.test('winrm units: base64, Basic header and host authority', () => {
   assertEquals(new TextDecoder().decode(decodeBase64('aGVsbG8=')), 'hello');
   assertEquals(new TextDecoder().decode(decodeBase64('aGVs\r\nbG8=')), 'hello');
-  for (const bad of ['aGVsbG8', '@@@@', 'a=bc', '====']) {
+  for (const bad of ['aGVsbG8', '@@@@', 'a=bc', '====', 'AB==', 'AAB=']) {
     assertThrows(() => decodeBase64(bad), /base64/);
   }
   assertEquals(basicAuthorization('support', 'p:w'), 'Basic c3VwcG9ydDpwOnc=');
@@ -312,6 +314,7 @@ function build(
     steps?: string[];
     level?: 'n1' | 'n2' | 'n3';
     password?: string;
+    unwrap?: () => Promise<{ username: string; password: string }>;
     apiPin?: 'accept' | 'block';
     limits?: Record<string, number>;
   } = {},
@@ -336,7 +339,8 @@ function build(
   });
   const session = new Session(assignment, {
     api,
-    unwrap: () => Promise.resolve({ username: 'support', password: options.password ?? PASSWORD }),
+    unwrap: options.unwrap ??
+      (() => Promise.resolve({ username: 'support', password: options.password ?? PASSWORD })),
     launcher: new DirectLauncher(ROOT),
     networks: null,
     sandbox: { memoryMaxMB: 256, cpuQuotaPercent: 50, tasksMax: 64 },
@@ -583,7 +587,7 @@ Deno.test({
       assertEquals(h.mock.deletes.length, 1);
     });
     const kinds: Record<string, string> = {
-      fault: 'WINRM_FAULT_2150858780',
+      fault: 'WINRM_FAULT_unknown',
       dtd: 'WINRM_XML',
       'bad-base64': 'WINRM_PROTOCOL',
       'wrong-command-id': 'WINRM_PROTOCOL',
@@ -759,7 +763,7 @@ Deno.test({
     }, async (h) => {
       const { session, api, browser } = await console_(h, 'n3');
       assertEquals(api.calls.slice(0, 3), ['hostkey:tls:match', 'credential', 'result:used']);
-      assert(browser.output().includes('Windows command shell'));
+      await browser.waitFor(() => browser.output().includes('Windows command shell'));
       // read: runs at once, echoed, output redacted
       browser.type('hostname\r');
       await browser.waitFor(() => browser.output().includes('SRV leaks'));
@@ -921,5 +925,222 @@ Deno.test({
       await session.done;
       assertEquals(api.finished?.reason, 'protocol_error');
     });
+  },
+});
+
+Deno.test('winrm XML rejects duplicate attributes, unbound prefixes and aliased closing tags', () => {
+  for (
+    const xml of [
+      '<a x="1" x="2"/>',
+      '<p:a/>',
+      '<p:a xmlns:p="urn:x" xmlns:q="urn:x"></q:a>',
+      '<a xmlns:p="urn:x" xmlns:q="urn:x" p:x="1" q:x="2"/>',
+    ]
+  ) assertThrows(() => parseXml(xml));
+});
+
+Deno.test('winrm close settles pending request and closes transport once', async () => {
+  let closes = 0;
+  const wire = scripted([[]]);
+  const original = wire.transport.close;
+  wire.transport.close = () => {
+    closes++;
+    original();
+  };
+  const conn = new HttpConnection(wire.transport, 'fixture:5986', 'Basic synthetic');
+  const pending = conn.request('synthetic', 10000);
+  conn.close();
+  conn.close();
+  await assertRejects(() => pending, /Closed/);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assertEquals(closes, 1);
+});
+
+Deno.test('winrm integral deadline and cancellation suppress Command and late Receive output', async () => {
+  for (const stage of ['pre', 'command', 'receive', 'cancel-receive']) {
+    let starts = 0, receives = 0, output = 0, cancelled = stage === 'pre';
+    const client = {
+      startCommand: async () => {
+        starts++;
+        if (stage === 'command') await new Promise((r) => setTimeout(r, 30));
+        return 'id';
+      },
+      receive: async () => {
+        receives++;
+        if (stage === 'receive') await new Promise((r) => setTimeout(r, 30));
+        if (stage === 'cancel-receive') cancelled = true;
+        return {
+          done: true,
+          exitCode: 0,
+          chunks: [{ stream: 'stdout', bytes: new Uint8Array([65]) }],
+        };
+      },
+      terminate: () => Promise.resolve(),
+    } as unknown as WsmanClient;
+    const result = await runWinrmCommand(client, 'shell', 'hostname', {
+      timeoutMs: stage === 'cancel-receive' ? 1000 : 10,
+      maxBytes: 100,
+      cancelled: () => cancelled,
+      onChunk: () => {
+        output++;
+      },
+    });
+    assertEquals(output, 0);
+    assertEquals(starts, stage === 'pre' ? 0 : 1);
+    assertEquals(receives, ['pre', 'command'].includes(stage) ? 0 : 1);
+    assertEquals(result.cancelled, ['pre', 'cancel-receive'].includes(stage));
+    assertEquals(result.timedOut, ['command', 'receive'].includes(stage));
+  }
+});
+
+Deno.test({
+  name:
+    'winrm real worker rejects namespace, Action, duplicate correlation and conflicting shell IDs',
+  ...sanitize,
+  fn: async () => {
+    const mutations = [
+      (xml: string) => xml.replace('http://www.w3.org/2003/05/soap-envelope', 'urn:wrong'),
+      (xml: string) => xml.replace('http://schemas.xmlsoap.org/ws/2004/08/addressing', 'urn:wrong'),
+      (xml: string) =>
+        xml.replace('http://schemas.microsoft.com/wbem/wsman/1/windows/shell', 'urn:wrong'),
+      (xml: string) => xml.replace('transfer/CreateResponse', 'transfer/DeleteResponse'),
+      (xml: string) => xml.replace(/(<a:RelatesTo>.*?<\/a:RelatesTo>)/, '$1$1'),
+      (xml: string) =>
+        xml.replace(
+          '</rsp:Shell>',
+          '<rsp:ShellId>11111111-2222-4333-8444-555555555555</rsp:ShellId></rsp:Shell>',
+        ),
+      (xml: string) =>
+        xml.replace(
+          '</s:Body>',
+          '<t:ResourceCreated xmlns:t="http://schemas.xmlsoap.org/ws/2004/09/transfer"><a:ReferenceParameters><w:SelectorSet xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"><w:Selector Name="OtherId">11111111-2222-4333-8444-555555555555</w:Selector></w:SelectorSet></a:ReferenceParameters></t:ResourceCreated></s:Body>',
+        ),
+    ];
+    for (const mutate of mutations) {
+      await withMock({
+        transformResponse: (xml, action) => action === 'create' ? mutate(xml) : xml,
+      }, async (h) => {
+        const { result, reason } = await runMode('exec', h);
+        assertEquals(result.status, 'failed');
+        assertEquals(reason, 'protocol_error');
+        assertEquals(h.mock.commands.length, 0);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: 'winrm real worker never exposes fault code text as result metadata',
+  ...sanitize,
+  fn: async () => {
+    await withMock({
+      failReceive: 'fault',
+      transformResponse: (xml, action) =>
+        action === 'receive'
+          ? xml.replace('Code="2150858780"', 'Code="synthetic-secret-do-not-leak"')
+          : xml,
+    }, async (h) => {
+      const { result } = await runMode('exec', h);
+      assertEquals(result.error?.code, 'WINRM_FAULT_unknown');
+      assertNotIncludes(JSON.stringify(result), 'synthetic-secret-do-not-leak');
+      assertEquals(h.mock.openShells.size, 0);
+    });
+  },
+});
+
+Deno.test({
+  name: 'winrm real worker cancelled during pin decision never requests a credential or sends SOAP',
+  ...sanitize,
+  fn: async () => {
+    await withMock({}, async (h) => {
+      const { session, api } = build('exec', h.mock.port, h);
+      api.hostKey = async () => {
+        session.close('cancelled');
+        await new Promise((r) => setTimeout(r, 30));
+        return { decision: 'accept', pinned: true };
+      };
+      session.start();
+      await session.done;
+      assertEquals(api.calls.includes('credential'), false);
+      assertEquals(h.mock.requests.length, 0);
+    });
+  },
+});
+
+Deno.test('winrm WS-Man request timeout bounds Create', async () => {
+  const wire = scripted([[]]);
+  const http = new HttpConnection(wire.transport, 'fixture:5986', 'Basic synthetic');
+  const client = new WsmanClient(http, 'https://fixture:5986/wsman', 5);
+  const started = Date.now();
+  await assertRejects(() => client.createShell(), /in time/);
+  assert(Date.now() - started < 1000);
+  assert(wire.closed());
+});
+
+Deno.test({
+  name: 'winrm real worker cancellation while unwrap waits never sends Basic or Create',
+  ...sanitize,
+  fn: async () => {
+    await withMock({}, async (h) => {
+      const built = build('exec', h.mock.port, h, {
+        unwrap: async () => {
+          built.session.close('cancelled');
+          await new Promise((r) => setTimeout(r, 40));
+          return { username: 'support', password: PASSWORD };
+        },
+      });
+      const session = built.session;
+      session.start();
+      await session.done;
+      assert(built.api.calls.includes('credential'));
+      assertEquals(h.mock.requests.length, 0);
+      assertEquals(h.mock.commands.length, 0);
+      assert(built.api.calls.includes('result:unused'));
+    });
+  },
+});
+
+Deno.test({
+  name:
+    'winrm real worker accepts named ShellID selector and rejects conflicting or duplicated operation IDs',
+  ...sanitize,
+  fn: async () => {
+    const selector = (id: string) =>
+      `<t:ResourceCreated xmlns:t="http://schemas.xmlsoap.org/ws/2004/09/transfer"><a:ReferenceParameters><w:SelectorSet xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"><w:Selector Name="ShellID">${id}</w:Selector></w:SelectorSet></a:ReferenceParameters></t:ResourceCreated>`;
+    await withMock({
+      transformResponse: (xml, action) =>
+        action === 'create'
+          ? xml.replace(
+            /<rsp:Shell><rsp:ShellId>(.*?)<\/rsp:ShellId><\/rsp:Shell>/,
+            (_, id) => selector(id),
+          )
+          : xml,
+    }, async (h) => {
+      const r = await runMode('test', h);
+      assertEquals(r.reason, 'test_ok');
+      assertEquals(h.mock.openShells.size, 0);
+    });
+    for (const stage of ['create', 'command', 'receive']) {
+      await withMock({
+        commands: { ver: { stdout: 'version' } },
+        transformResponse: (xml, action) => {
+          if (action !== stage) return xml;
+          if (stage === 'create') {
+            return xml.replace(
+              '</s:Body>',
+              selector('11111111-2222-4333-8444-555555555555') + '</s:Body>',
+            );
+          }
+          if (stage === 'command') {
+            return xml.replace(/(<rsp:CommandId>.*?<\/rsp:CommandId>)/, '$1$1');
+          }
+          return xml.replace(/(<rsp:CommandState .*?<\/rsp:CommandState>)/, '$1$1');
+        },
+      }, async (h) => {
+        const r = await runMode('exec', h);
+        assertEquals(r.result.status, 'failed');
+        assertEquals(r.result.steps.length, 0);
+      });
+    }
   },
 });

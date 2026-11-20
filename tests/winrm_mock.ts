@@ -19,6 +19,8 @@ export interface WinrmReply {
 
 export interface WinrmMockOptions {
   user?: string;
+  /** Adversarial response mutation for real-worker protocol checks. */
+  transformResponse?: (xml: string, action: string) => string;
   password: string;
   commands?: Record<string, WinrmReply>;
   /** Behaviour for a command line that is not in `commands`. */
@@ -105,8 +107,8 @@ export function startWinrm(
       req.on('data', (c: Uint8Array) => chunks.push(c));
       req.on('end', () => {
         const body = Buffer.concat(chunks).toString('utf8');
-        const action = ACTIONS[/<a:Action[^>]*>([^<]+)<\/a:Action>/.exec(body)?.[1] ?? ''] ??
-          'unknown';
+        const requestAction = /<a:Action[^>]*>([^<]+)<\/a:Action>/.exec(body)?.[1] ?? '';
+        const action = ACTIONS[requestAction] ?? 'unknown';
         mock.requests.push({
           path: req.url ?? '',
           action,
@@ -120,6 +122,9 @@ export function startWinrm(
           extra: Record<string, string | number> = {},
           type = SOAP,
         ) => {
+          if (options.transformResponse && type === SOAP) {
+            text = options.transformResponse(text, action);
+          }
           const headers: Record<string, string | number> = {
             'Content-Type': type,
             ...(options.chunked ? {} : { 'Content-Length': Buffer.byteLength(text) }),
@@ -145,7 +150,11 @@ export function startWinrm(
         const shellSelector = /<w:Selector Name="ShellId">([^<]+)<\/w:Selector>/.exec(body)?.[1] ??
           '';
         const envelope = (inner: string, relates = messageId) =>
-          `<?xml version="1.0" encoding="UTF-8"?><s:Envelope ${NS}><s:Header><a:RelatesTo>${relates}</a:RelatesTo></s:Header><s:Body>${inner}</s:Body></s:Envelope>`;
+          `<?xml version="1.0" encoding="UTF-8"?><s:Envelope ${NS}><s:Header><a:Action>${
+            inner.includes('<s:Fault>')
+              ? 'http://schemas.dmtf.org/wbem/wsman/1/wsman/fault'
+              : requestAction + 'Response'
+          }</a:Action><a:RelatesTo>${relates}</a:RelatesTo></s:Header><s:Body>${inner}</s:Body></s:Envelope>`;
         const fault = (code: string, text = 'The operation failed') =>
           envelope(
             `<s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text xml:lang="en-US">${text}</s:Text></s:Reason><s:Detail><f:WSManFault Code="${code}"><f:Message>${text}</f:Message></f:WSManFault></s:Detail></s:Fault>`,

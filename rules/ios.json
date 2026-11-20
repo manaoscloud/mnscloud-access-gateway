@@ -14,7 +14,7 @@
     {
       "id": "ios-secret",
       "class": "secret_read",
-      "pattern": "^(?:s|sh|sho|show)\\s+(?:run|star|tech|conf|key|cry|snmp|aaa|tacacs|radius|ssh|archive|vtp pass|ip ssh|secret|password|users|privilege|login|crypto)\\w*|^more\\b|^dir\\b.*(?:config|nvram)|^(?:type|copy)\\b.*(?:running|startup)-config",
+      "pattern": "^(?:s|sh|sho|show)\\s+(?:run|star|tech|conf|derived-config|key|cry|snmp|aaa|tacacs|radius|ssh|archive|vtp pass|ip ssh|secret|password|users|privilege|login|crypto)\\w*|^more\\b|^dir\\b.*(?:config|nvram)|^(?:type|copy)\\b.*(?:running|startup)-config",
       "hint": "Configuration dumps and keys are never shown in the console."
     },
     {

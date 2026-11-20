@@ -31,7 +31,6 @@ import {
 type Exit = Extract<WorkerToController, { t: 'exit' }>;
 
 export const WINRM_COMMAND_TIMEOUT_MS = 20000;
-const CANCEL_CLEANUP_MS = 8000;
 
 export interface WinrmHelpers {
   init: WorkerInit;
@@ -71,7 +70,11 @@ interface Open {
  * TLS, pin decision, credential, then Create. Order matters: the pin is decided on the raw TLS
  * connection before the credential is even requested, so a mismatch never sees a password.
  */
-async function open(h: WinrmHelpers): Promise<Open> {
+async function open(h: WinrmHelpers, signal: AbortSignal): Promise<Open> {
+  const check = () => {
+    if (signal.aborted) throw new SessionFail('closed', 'cancelled');
+  };
+  check();
   const { init } = h;
   h.control({ type: 'state', state: 'connecting' });
   let connection;
@@ -85,64 +88,86 @@ async function open(h: WinrmHelpers): Promise<Open> {
         : undefined,
     );
   } catch (error) {
+    check();
     const code = (error as RouterOsApiError).code;
     throw new SessionFail('failed', code === 'tls_failed' ? 'tls_failed' : 'connect_failed');
   }
-  if (!(await h.verifyKey('tls', 'x509', connection.pin, init.tls.pinned))) {
-    connection.transport.close();
-    throw new SessionFail('refused', init.tls.pinned ? 'hostkey_mismatch' : 'hostkey_rejected');
-  }
-  h.control({ type: 'state', state: 'authenticating' });
-  const credential = await h.requestCredential();
-  const username = credential?.username || init.username;
-  // Basic cannot carry ':' in the user name; control characters never belong in a header.
-  // deno-lint-ignore no-control-regex
-  if (!credential?.password || /[:\x00-\x1f\x7f]/.test(username)) {
-    connection.transport.close();
-    throw new SessionFail('failed', 'credential_unavailable');
-  }
-  const authority = hostAuthority(init.target.address, init.target.port);
-  const http = new HttpConnection(
-    connection.transport,
-    authority,
-    basicAuthorization(username, credential.password),
-  );
-  credential.password = '';
-  const client = new WsmanClient(http, `https://${authority}/wsman`);
-  let shellId: string;
+  const abort = () => connection.transport.close();
+  signal.addEventListener('abort', abort, { once: true });
   try {
-    shellId = await client.createShell();
-  } catch (error) {
-    http.close();
-    if (error instanceof WinrmError && error.code === 'auth_failed') {
-      h.send({ t: 'credential_result', result: 'auth_failed' });
-      throw new SessionFail('failed', 'auth_failed');
+    check();
+    if (!(await h.verifyKey('tls', 'x509', connection.pin, init.tls.pinned))) {
+      connection.transport.close();
+      throw new SessionFail('refused', init.tls.pinned ? 'hostkey_mismatch' : 'hostkey_rejected');
     }
-    // The login may have worked but the shell could not be created (WinRS disabled, quotas):
-    // the access is not ready, and the reason is a protocol one, not a credential one.
-    throw new SessionFail(
-      'failed',
-      error instanceof WinrmError && error.code === 'timeout' ? 'connect_failed' : 'protocol_error',
-    );
-  }
-  h.send({ t: 'credential_result', result: 'used' });
-  let closed = false;
-  return {
-    client,
-    http,
-    shellId,
-    close: async () => {
-      if (closed) return;
-      closed = true;
-      if (http.usable) {
-        await Promise.race([
-          client.deleteShell(shellId).catch(() => {}),
-          new Promise((resolve) => setTimeout(resolve, CANCEL_CLEANUP_MS)),
-        ]);
+    check();
+    h.control({ type: 'state', state: 'authenticating' });
+    check();
+    const credential = await h.requestCredential();
+    if (signal.aborted) {
+      if (credential) {
+        credential.password = '';
       }
+      check();
+    }
+    const username = credential?.username || init.username;
+    // Basic cannot carry ':' in the user name; control characters never belong in a header.
+    // deno-lint-ignore no-control-regex
+    if (!credential?.password || /[:\x00-\x1f\x7f]/.test(username)) {
+      connection.transport.close();
+      throw new SessionFail('failed', 'credential_unavailable');
+    }
+    const authority = hostAuthority(init.target.address, init.target.port);
+    const http = new HttpConnection(
+      connection.transport,
+      authority,
+      basicAuthorization(username, credential.password),
+    );
+    credential.password = '';
+    const client = new WsmanClient(http, `https://${authority}/wsman`);
+    let shellId: string;
+    try {
+      check();
+      shellId = await client.createShell();
+      check();
+    } catch (error) {
       http.close();
-    },
-  };
+      check();
+      if (error instanceof WinrmError && error.code === 'auth_failed') {
+        h.send({ t: 'credential_result', result: 'auth_failed' });
+        throw new SessionFail('failed', 'auth_failed');
+      }
+      // The login may have worked but the shell could not be created (WinRS disabled, quotas):
+      // the access is not ready, and the reason is a protocol one, not a credential one.
+      throw new SessionFail(
+        'failed',
+        error instanceof WinrmError && error.code === 'timeout'
+          ? 'connect_failed'
+          : 'protocol_error',
+      );
+    }
+    h.send({ t: 'credential_result', result: 'used' });
+    signal.removeEventListener('abort', abort);
+    let closed = false;
+    return {
+      client,
+      http,
+      shellId,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        if (http.usable) {
+          await client.deleteShell(shellId).catch(() => {});
+        }
+        http.close();
+      },
+    };
+  } catch (error) {
+    signal.removeEventListener('abort', abort);
+    connection.transport.close();
+    check();
+    throw error;
+  }
 }
 
 function failureOf(error: unknown): { state: Exit['state']; reason: string } {
@@ -162,11 +187,14 @@ function failExit(h: WinrmHelpers, error: unknown): Exit {
 // Access test: login AND a created (then deleted) WinRS shell = the console would be ready.
 
 export async function winrmTest(h: WinrmHelpers): Promise<Exit> {
+  const cancel = new AbortController();
+  h.onClose(() => cancel.abort());
   let session: Open | null = null;
   try {
-    session = await open(h);
+    session = await open(h, cancel.signal);
     await session.close();
     session = null;
+    if (cancel.signal.aborted) return h.finish('closed', 'cancelled');
     h.send({ t: 'facts', facts: {} });
     return h.finish('closed', 'test_ok');
   } catch (error) {
@@ -223,12 +251,14 @@ export async function winrmExec(h: WinrmHelpers): Promise<Exit> {
     return h.finish('closed', 'exec_done');
   }
   let cancelled: string | null = null;
+  const cancel = new AbortController();
   h.onClose((reason) => {
     cancelled = reason;
+    cancel.abort();
   });
   let session: Open | null = null;
   try {
-    session = await open(h);
+    session = await open(h, cancel.signal);
     for (const command of exec.steps) {
       const started = Date.now();
       const decoder = new TextDecoder();
@@ -373,6 +403,7 @@ export function winrmConsole(h: WinrmHelpers): Promise<Exit> {
   const { init } = h;
   return new Promise<Exit>((resolve) => {
     let done = false;
+    const cancel = new AbortController();
     let session: Open | null = null;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let idleTimer: ReturnType<typeof setInterval> | null = null;
@@ -412,6 +443,7 @@ export function winrmConsole(h: WinrmHelpers): Promise<Exit> {
     const end = async (state: Exit['state'], reason: string) => {
       if (done) return;
       done = true;
+      cancel.abort();
       if (flushTimer) clearTimeout(flushTimer);
       if (idleTimer) clearInterval(idleTimer);
       gate.close();
@@ -485,7 +517,7 @@ export function winrmConsole(h: WinrmHelpers): Promise<Exit> {
       }
     });
 
-    open(h).then((opened) => {
+    open(h, cancel.signal).then((opened) => {
       if (done) {
         void opened.close();
         return;

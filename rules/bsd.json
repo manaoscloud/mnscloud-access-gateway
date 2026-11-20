@@ -19,6 +19,11 @@
       "hint": "Secret files and the firewall configuration are never shown in the console."
     },
     {
+      "id": "bsd-ps-environment",
+      "class": "secret_read",
+      "pattern": "^ps(?:\\s+-?[a-zA-Z]*)*e[a-zA-Z]*(?:\\s|$)"
+    },
+    {
       "id": "bsd-env-dump",
       "class": "secret_read",
       "pattern": "^(?:env|printenv|set|export|setenv|declare|typeset)$"

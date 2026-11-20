@@ -38,8 +38,11 @@ export class WinrmError extends Error {
 // Bounded XML
 
 export interface XmlNode {
-  /** Local name (the namespace prefix is dropped; ids, not prefixes, are what is matched). */
+  /** Expanded name and exact qualified name; prefixes may vary but namespace URIs may not. */
   name: string;
+  ns: string;
+  qname: string;
+  namespaces: Record<string, string>;
   attrs: Record<string, string>;
   children: XmlNode[];
   text: string;
@@ -118,7 +121,7 @@ export function parseXml(input: string): XmlNode {
     if (tag.startsWith('/')) {
       const name = tag.slice(1).trim();
       const open = stack.pop();
-      if (!open || !NAME.test(name) || local(name) !== open.name) {
+      if (!open || !NAME.test(name) || name !== open.qname) {
         throw new WinrmError('xml', 'Mismatched closing tag');
       }
       continue;
@@ -129,6 +132,12 @@ export function parseXml(input: string): XmlNode {
     if (!head || !NAME.test(head[1])) throw new WinrmError('xml', 'Invalid tag');
     if (++nodes > XML_LIMITS.nodes) throw new WinrmError('xml', 'Too many elements');
     const attrs: Record<string, string> = {};
+    const parent = stack[stack.length - 1];
+    const namespaces: Record<string, string> = {
+      xml: 'http://www.w3.org/XML/1998/namespace',
+      ...parent?.namespaces,
+    };
+    const rawAttrs = new Map<string, string>();
     let count = 0;
     for (const m of head[2].matchAll(/\s+([^\s=/>]+)\s*=\s*(?:"([^"<]*)"|'([^'<]*)')/g)) {
       if (++count > XML_LIMITS.attrs || !NAME.test(m[1])) {
@@ -136,11 +145,44 @@ export function parseXml(input: string): XmlNode {
       }
       const raw = m[2] ?? m[3] ?? '';
       assertNoBareAmpersand(raw);
-      if (m[1] === 'xmlns' || m[1].startsWith('xmlns:')) continue;
-      attrs[local(m[1])] = decodeEntities(raw);
+      if (rawAttrs.has(m[1])) throw new WinrmError('xml', 'Duplicate attribute');
+      rawAttrs.set(m[1], decodeEntities(raw));
     }
-    const node: XmlNode = { name: local(head[1]), attrs, children: [], text: '' };
-    const parent = stack[stack.length - 1];
+    for (const [name, value] of rawAttrs) {
+      if (name === 'xmlns') namespaces[''] = value;
+      else if (name.startsWith('xmlns:')) {
+        const prefix = name.slice(6);
+        if (!value || prefix === 'xmlns' || (prefix === 'xml' && value !== namespaces.xml)) {
+          throw new WinrmError('xml', 'Invalid namespace declaration');
+        }
+        namespaces[prefix] = value;
+      }
+    }
+    const namespace = (name: string, attribute = false): string => {
+      if (!name.includes(':')) return attribute ? '' : namespaces[''] ?? '';
+      const ns = namespaces[name.split(':')[0]];
+      if (!ns) throw new WinrmError('xml', 'Unbound namespace prefix');
+      return ns;
+    };
+    const expanded = new Set<string>();
+    for (const [name, value] of rawAttrs) {
+      if (name === 'xmlns' || name.startsWith('xmlns:')) continue;
+      const ns = namespace(name, true);
+      const key = `${ns}|${local(name)}`;
+      if (expanded.has(key)) throw new WinrmError('xml', 'Duplicate expanded attribute');
+      expanded.add(key);
+      // Protocol attributes are unqualified. Never alias an attacker-controlled namespace.
+      attrs[ns ? `{${ns}}${local(name)}` : name] = value;
+    }
+    const node: XmlNode = {
+      name: local(head[1]),
+      ns: namespace(head[1]),
+      qname: head[1],
+      namespaces,
+      attrs,
+      children: [],
+      text: '',
+    };
     if (parent) parent.children.push(node);
     else if (root) throw new WinrmError('xml', 'More than one root element');
     else root = node;
@@ -156,7 +198,12 @@ export function parseXml(input: string): XmlNode {
 export function child(node: XmlNode | undefined, ...path: string[]): XmlNode | undefined {
   let current = node;
   for (const name of path) {
-    current = current?.children.find((c) => c.name === name);
+    const matches = current?.children.filter((c) => c.name === name) ?? [];
+    if (matches.length > 1) throw new WinrmError('protocol', 'Duplicate response element');
+    current = matches[0];
+    if (current && current.ns !== elementNamespace(name)) {
+      throw new WinrmError('protocol', 'Unexpected response namespace');
+    }
     if (!current) return undefined;
   }
   return current;
@@ -390,6 +437,7 @@ export class HttpConnection {
         resolve: (response) => {
           if (response.status === 401 || response.status === 403) {
             reject(new WinrmError('auth_failed', 'The device refused the credential'));
+            this.#fail(new WinrmError('auth_failed', 'Authentication failed'));
           } else if (response.status >= 300 && response.status < 400) {
             // Never follow a redirect: it could move the credential to another destination.
             reject(new WinrmError('redirect', 'The device answered with a redirect'));
@@ -408,13 +456,16 @@ export class HttpConnection {
         reject,
         timer,
       };
-      this.transport.write(concat(head, payload));
+      try {
+        this.transport.write(concat(head, payload));
+      } catch {
+        this.#fail(new WinrmError('closed', 'Connection write failed'));
+      }
     });
   }
 
   close() {
-    this.#closed ??= new WinrmError('closed', 'Closed');
-    this.transport.close();
+    this.#fail(new WinrmError('closed', 'Closed'));
   }
 }
 
@@ -427,7 +478,20 @@ const NS = {
   w: 'http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd',
   p: 'http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd',
   rsp: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell',
+  transfer: 'http://schemas.xmlsoap.org/ws/2004/09/transfer',
+  fault: 'http://schemas.microsoft.com/wbem/wsman/1/wsmanfault',
 };
+function elementNamespace(name: string): string {
+  if (
+    ['Envelope', 'Header', 'Body', 'Fault', 'Detail', 'Code', 'Subcode', 'Value'].includes(name)
+  ) return NS.s;
+  if (['Action', 'RelatesTo', 'ReferenceParameters'].includes(name)) return NS.a;
+  if (['SelectorSet', 'Selector'].includes(name)) return NS.w;
+  if (name === 'ResourceCreated') return NS.transfer;
+  if (name === 'WSManFault') return NS.fault;
+  return NS.rsp;
+}
+
 export const SHELL_URI = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd';
 const ACTION = {
   create: 'http://schemas.xmlsoap.org/ws/2004/09/transfer/Create',
@@ -464,7 +528,12 @@ export class WsmanClient {
   async #call(
     action: string,
     body: string,
-    options: { shellId?: string; operationSeconds?: number; optionSet?: string } = {},
+    options: {
+      shellId?: string;
+      operationSeconds?: number;
+      optionSet?: string;
+      timeoutMs?: number;
+    } = {},
   ): Promise<{ root: XmlNode; body: XmlNode | undefined; fault: string | null }> {
     const messageId = `uuid:${crypto.randomUUID().toUpperCase()}`;
     const operation = options.operationSeconds ?? 20;
@@ -482,23 +551,41 @@ export class WsmanClient {
         ? `<w:SelectorSet><w:Selector Name="ShellId">${options.shellId}</w:Selector></w:SelectorSet>`
         : '') +
       (options.optionSet ?? '') + `</s:Header><s:Body>${body}</s:Body></s:Envelope>`;
-    const response = await this.http.request(xml, (operation + 10) * 1000);
+    const response = await this.http.request(
+      xml,
+      Math.max(
+        1,
+        Math.min(this.requestTimeoutMs, options.timeoutMs ?? Infinity, (operation + 10) * 1000),
+      ),
+    );
     const root = parseXml(response.body);
-    if (root.name !== 'Envelope') throw new WinrmError('protocol', 'Not a SOAP envelope');
+    if (root.name !== 'Envelope' || root.ns !== NS.s) {
+      throw new WinrmError('protocol', 'Not a SOAP envelope');
+    }
     const relates = child(root, 'Header', 'RelatesTo')?.text.trim();
     if (relates !== messageId) {
       throw new WinrmError('protocol', 'Response does not match the request');
     }
     const bodyNode = child(root, 'Body');
+    if (!bodyNode) throw new WinrmError('protocol', 'Missing SOAP body');
+    const responseAction = child(root, 'Header', 'Action')?.text.trim();
     const fault = child(bodyNode, 'Fault');
     if (fault) {
-      // Only codes leave this function, never the free text of a fault.
-      const wsman = fault.children.flatMap((c) => c.children).concat(
-        child(fault, 'Detail')?.children ?? [],
-      ).find((n) => n.name === 'WSManFault');
-      const code = wsman?.attrs.Code ?? child(fault, 'Code', 'Subcode', 'Value')?.text.trim() ??
-        child(fault, 'Code', 'Value')?.text.trim() ?? 'unknown';
-      return { root, body: bodyNode, fault: code.slice(0, 80) };
+      if (
+        !['http://schemas.dmtf.org/wbem/wsman/1/wsman/fault', `${NS.a}/fault`].includes(
+          responseAction ?? '',
+        )
+      ) {
+        throw new WinrmError('protocol', 'Invalid fault action');
+      }
+      if (bodyNode.children.length !== 1) throw new WinrmError('protocol', 'Ambiguous fault body');
+      const code = child(fault, 'Detail', 'WSManFault')?.attrs.Code;
+      // Only the documented timeout is distinguished; arbitrary numeric codes can carry secrets too.
+      const safeCode = code === FAULT_TIMEOUT ? FAULT_TIMEOUT : 'unknown';
+      return { root, body: bodyNode, fault: safeCode };
+    }
+    if (responseAction !== `${action}Response`) {
+      throw new WinrmError('protocol', 'Invalid response action');
     }
     if (response.status !== 200) throw new WinrmError('http_status', `HTTP ${response.status}`);
     return { root, body: bodyNode, fault: null };
@@ -518,19 +605,28 @@ export class WsmanClient {
       },
     );
     this.#require(r.fault);
-    const id = child(r.body, 'Shell', 'ShellId')?.text.trim() ??
-      child(r.body, 'ResourceCreated', 'ReferenceParameters', 'SelectorSet', 'Selector')?.text
-        .trim();
+    const direct = child(r.body, 'Shell', 'ShellId')?.text.trim();
+    const selectorSet = child(r.body, 'ResourceCreated', 'ReferenceParameters', 'SelectorSet');
+    const selector = child(selectorSet, 'Selector');
+    if (selector && !['ShellId', 'ShellID'].includes(selector.attrs.Name)) {
+      throw new WinrmError('protocol', 'Invalid shell selector');
+    }
+    const selected = selector?.text.trim();
+    if (direct && selected && direct.toLowerCase() !== selected.toLowerCase()) {
+      throw new WinrmError('protocol', 'Conflicting ShellId');
+    }
+    const id = direct ?? selected;
     if (!id || !GUID.test(id)) throw new WinrmError('protocol', 'Missing or invalid ShellId');
     return id;
   }
 
-  async startCommand(shellId: string, commandLine: string): Promise<string> {
+  async startCommand(shellId: string, commandLine: string, timeoutMs?: number): Promise<string> {
     const r = await this.#call(
       ACTION.command,
       `<rsp:CommandLine><rsp:Command>${xmlEscape(commandLine)}</rsp:Command></rsp:CommandLine>`,
       {
         shellId,
+        timeoutMs,
         optionSet:
           `<w:OptionSet><w:Option Name="WINRS_CONSOLEMODE_STDIN">TRUE</w:Option><w:Option Name="WINRS_SKIP_CMD_SHELL">FALSE</w:Option></w:OptionSet>`,
       },
@@ -542,11 +638,16 @@ export class WsmanClient {
   }
 
   /** One Receive: output so far, or none when the operation timeout elapsed on the device. */
-  async receive(shellId: string, commandId: string, operationSeconds = 5): Promise<ReceiveResult> {
+  async receive(
+    shellId: string,
+    commandId: string,
+    operationSeconds = 5,
+    timeoutMs?: number,
+  ): Promise<ReceiveResult> {
     const r = await this.#call(
       ACTION.receive,
       `<rsp:Receive><rsp:DesiredStream CommandId="${commandId}">stdout stderr</rsp:DesiredStream></rsp:Receive>`,
-      { shellId, operationSeconds },
+      { shellId, operationSeconds, timeoutMs },
     );
     if (r.fault === FAULT_TIMEOUT) return { chunks: [], done: false, exitCode: null };
     this.#require(r.fault);
@@ -555,7 +656,9 @@ export class WsmanClient {
     const chunks: Chunk[] = [];
     let done = false;
     let exitCode: number | null = null;
+    child(response, 'CommandState'); // singleton; repeated Stream elements are allowed.
     for (const node of response.children) {
+      if (node.ns !== NS.rsp) throw new WinrmError('protocol', 'Unexpected stream namespace');
       if (node.name === 'Stream') {
         if (node.attrs.CommandId !== commandId) {
           throw new WinrmError('protocol', 'Output of another command');
@@ -582,17 +685,21 @@ export class WsmanClient {
     return { chunks, done, exitCode };
   }
 
-  async terminate(shellId: string, commandId: string): Promise<void> {
+  async terminate(shellId: string, commandId: string, timeoutMs = 2000): Promise<void> {
     const r = await this.#call(
       ACTION.signal,
       `<rsp:Signal CommandId="${commandId}"><rsp:Code>${SIGNAL_TERMINATE}</rsp:Code></rsp:Signal>`,
-      { shellId, operationSeconds: 5 },
+      { shellId, operationSeconds: 5, timeoutMs },
     );
     this.#require(r.fault);
   }
 
   async deleteShell(shellId: string): Promise<void> {
-    const r = await this.#call(ACTION.delete, '', { shellId, operationSeconds: 5 });
+    const r = await this.#call(ACTION.delete, '', {
+      shellId,
+      operationSeconds: 5,
+      timeoutMs: 2000,
+    });
     this.#require(r.fault);
   }
 }
@@ -605,7 +712,11 @@ export function decodeBase64(text: string): Uint8Array {
   if (clean.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(clean)) {
     throw new WinrmError('protocol', 'Invalid base64 stream');
   }
-  return new Uint8Array(Buffer.from(clean, 'base64'));
+  const bytes = Buffer.from(clean, 'base64');
+  if (bytes.toString('base64') !== clean) {
+    throw new WinrmError('protocol', 'Noncanonical base64 stream');
+  }
+  return new Uint8Array(bytes);
 }
 
 export function basicAuthorization(username: string, password: string): string {
@@ -634,39 +745,78 @@ export async function runWinrmCommand(
     cancelled(): boolean;
   },
 ): Promise<{ exitCode: number | null; timedOut: boolean; cancelled: boolean; truncated: boolean }> {
-  const commandId = await client.startCommand(shellId, commandLine);
-  const deadline = Date.now() + options.timeoutMs;
+  const deadline = Date.now() + Math.max(0, options.timeoutMs);
+  const result = (timedOut = false, cancelled = false, truncated = false) => ({
+    exitCode: null,
+    timedOut,
+    cancelled,
+    truncated,
+  });
+  if (options.cancelled()) return result(false, true);
+  if (Date.now() >= deadline) return result(true);
+  let commandId: string | null = null;
   let bytes = 0;
   let truncated = false;
   const stop = async (): Promise<void> => {
+    if (!commandId) return;
     try {
-      await client.terminate(shellId, commandId);
-    } catch { /* the shell is deleted next */ }
+      await client.terminate(shellId, commandId, 2000);
+    } catch { /* Delete follows, or the bounded transport has already closed. */ }
   };
-  for (let round = 0; round < 100000; round++) {
-    if (options.cancelled()) {
-      await stop();
-      return { exitCode: null, timedOut: false, cancelled: true, truncated };
-    }
-    if (Date.now() >= deadline) {
-      await stop();
-      return { exitCode: null, timedOut: true, cancelled: false, truncated };
-    }
-    const seconds = Math.max(1, Math.min(5, Math.floor((deadline - Date.now()) / 1000)));
-    const part = await client.receive(shellId, commandId, seconds);
-    for (const chunk of part.chunks) {
-      bytes += chunk.bytes.length;
-      if (bytes > options.maxBytes) {
-        truncated = true;
-        const room = Math.max(0, options.maxBytes - (bytes - chunk.bytes.length));
-        if (room) options.onChunk({ stream: chunk.stream, bytes: chunk.bytes.subarray(0, room) });
+  try {
+    commandId = await client.startCommand(shellId, commandLine, deadline - Date.now());
+    for (let round = 0; round < 100000; round++) {
+      if (options.cancelled()) {
         await stop();
-        return { exitCode: null, timedOut: false, cancelled: false, truncated };
+        return result(false, true, truncated);
       }
-      options.onChunk(chunk);
+      if (Date.now() >= deadline) {
+        await stop();
+        return result(true, false, truncated);
+      }
+      const remaining = deadline - Date.now();
+      // Do not start a one-second WS-Man receive when less than its operation window remains.
+      if (remaining < Math.min(1000, options.timeoutMs / 10)) {
+        await stop();
+        return result(true, false, truncated);
+      }
+      const seconds = Math.max(1, Math.min(5, Math.floor(remaining / 1000)));
+      const part = await client.receive(shellId, commandId, seconds, remaining);
+      // A late or cancelled response must never publish output or report success.
+      if (options.cancelled()) {
+        await stop();
+        return result(false, true, truncated);
+      }
+      if (Date.now() >= deadline) {
+        await stop();
+        return result(true, false, truncated);
+      }
+      for (const chunk of part.chunks) {
+        if (options.cancelled()) {
+          await stop();
+          return result(false, true, truncated);
+        }
+        bytes += chunk.bytes.length;
+        if (bytes > options.maxBytes) {
+          truncated = true;
+          const room = Math.max(0, options.maxBytes - (bytes - chunk.bytes.length));
+          if (room) options.onChunk({ stream: chunk.stream, bytes: chunk.bytes.subarray(0, room) });
+          await stop();
+          return result(false, false, truncated);
+        }
+        options.onChunk(chunk);
+      }
+      if (part.done) {
+        return { exitCode: part.exitCode, timedOut: false, cancelled: false, truncated };
+      }
     }
-    if (part.done) return { exitCode: part.exitCode, timedOut: false, cancelled: false, truncated };
+    throw new WinrmError('protocol', 'Too many receive rounds');
+  } catch (error) {
+    await stop();
+    if (options.cancelled()) return result(false, true, truncated);
+    if (Date.now() >= deadline || error instanceof WinrmError && error.code === 'timeout') {
+      return result(true, false, truncated);
+    }
+    throw error;
   }
-  await stop();
-  throw new WinrmError('protocol', 'Too many receive rounds');
 }

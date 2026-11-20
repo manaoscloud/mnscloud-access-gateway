@@ -227,3 +227,36 @@ Deno.test('gate: an unrequested or extra terminal report still taints the line',
   ]);
   h.gate.close();
 });
+
+Deno.test('second wave console N1 never submits clock mutations or configuration/environment dumps', () => {
+  for (
+    const [dialect, line, expected] of [
+      ['fortios', 'execute date 2026-01-01', 'write_risky'],
+      ['fortios', 'execute time 00:00:00', 'write_risky'],
+      ['bsd', 'ps e', 'secret_read'],
+      ['bsd', 'ps auxe', 'secret_read'],
+      ['bsd', 'ps -ef', 'secret_read'],
+      ['ios', 'show derived-config', 'secret_read'],
+    ] as const
+  ) {
+    const h = harness(dialect, 'n1');
+    h.gate.input(line + '\r');
+    assertEquals(h.events[0].class, expected);
+    assertEquals(h.events[0].verdict, 'blocked');
+    assert(!h.device().includes('\r'));
+    h.gate.close();
+  }
+  for (
+    const [dialect, line] of [
+      ['fortios', 'execute date'],
+      ['fortios', 'execute time'],
+      ['junos', 'set cli screen-length 0'],
+      ['junos', 'set cli screen-width 0'],
+    ] as const
+  ) {
+    const h = harness(dialect, 'n1');
+    h.gate.input(line + '\r');
+    assertEquals(h.events[0].verdict, 'allowed');
+    h.gate.close();
+  }
+});

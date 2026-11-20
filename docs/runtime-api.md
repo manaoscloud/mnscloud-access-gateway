@@ -881,3 +881,33 @@ pinning, redaction, recording and command policy are unchanged. The gateway fini
 connection with `connector_offline` (state `failed`) when no tunnel is attached, or with the OPEN_FAIL
 code of the connector (`refused` for the refusal codes, `failed` for the others; any code outside the fixed list is
 reported as `connector_open_failed`).
+
+## Windows WinRM (ST-K)
+
+`protocol: "winrm"`, `shellDialect: "windows"` use the existing assignment fields and
+credential flow. `target` remains one fixed address and port (5985 is refused); `tls.pinned`
+uses the same SHA256/base64 leaf-certificate format as API-SSL. Direct and connector paths
+both negotiate native TLS on the assigned stream and await the API pin decision before
+requesting a password or emitting an authenticated HTTP request. A cancellation during
+connection, pin or credential waits prevents subsequent Create/Command operations.
+
+The worker implements HTTPS `POST /wsman`, HTTP Basic with a password credential, and the
+WinRS `cmd` resource. It creates a shell, sends Command/Receive, and attempts Signal terminate
+and Delete on early completion. Cleanup requests are bounded to two seconds each; a closed or
+unusable transport cannot prove remote cleanup. There is no redirect, plaintext fallback,
+NTLM/Kerberos/CredSSP, PSRP, or second destination. Test mode requires successful shell creation
+and attempts deletion; console mode uses the existing input gate, policy, redaction and recording;
+exec accepts diagnostic reads only. No Windows automatic changes or credential rotations.
+
+SOAP parsing requires namespace URIs, single correlation/Action/ID elements, matching
+RelatesTo and response Action, and consistent ShellId (including a named WS-Man ShellId/ShellID
+selector). Output streams must identify the issued CommandId. DTD/entities, duplicate attributes,
+conflicting IDs, malformed base64 and oversized messages fail closed. Fault metadata contains
+only the documented operation-timeout code or `unknown`, never arbitrary numeric codes or remote fault text. One command deadline
+covers Command and Receive, checks cancellation and elapsed time after waits, and suppresses
+late output; cleanup has its own small bound.
+
+`tests/winrm_test.ts` runs the real controller/worker against a synthetic HTTPS WS-Man endpoint,
+including malformed responses, cancellation, pin refusal and output/deadline limits. These tests
+establish protocol behavior; they do not certify a Windows host or firmware. The wire lifecycle
+follows [Microsoft MS-WSMV remote shells](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wsmv/593f3ed0-0c7a-4158-a4be-0b429b597e31).

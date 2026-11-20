@@ -12,6 +12,11 @@
   "cancelLine": "\u0015",
   "rules": [
     {
+      "id": "junos-simple-read",
+      "class": "read",
+      "pattern": "^(?:ping [^?]*|traceroute [^?]*|set cli (?:screen-length|screen-width) \\d+)$"
+    },
+    {
       "id": "junos-read",
       "class": "read",
       "pattern": "^show (?:version|system (?:uptime|information|alarms|storage|commit|users|processes extensive|memory|boot-messages)|interfaces(?: terse| brief| descriptions| extensive| [a-z]{2,3}-\\d+/\\d+/\\d+(?:\\.\\d+)?)?|route(?: summary| \\S+)?|chassis (?:hardware|alarms|environment|routing-engine|fpc|firmware)|arp(?: no-resolve)?|bgp (?:summary|neighbor)|ospf (?:neighbor|interface|database)|lldp neighbors|ethernet-switching (?:table|interface)|vlans|log \\S+|ntp (?:associations|status)|security (?:flow session summary|zones|policies hit-count))(?: \\| (?:match|except|count|no-more|last|find)\\b[^|>]*)*$"
@@ -41,11 +46,6 @@
       "id": "junos-risky",
       "class": "write_risky",
       "pattern": "^(?:set|edit|top|up|configure|commit|activate|deactivate|rename|copy|insert|annotate|protect|unprotect|replace|restart|request|load|exit|quit)\\b"
-    },
-    {
-      "id": "junos-simple-read",
-      "class": "read",
-      "pattern": "^(?:ping [^?]*|traceroute [^?]*|set cli (?:screen-length|screen-width) \\d+)$"
     },
     {
       "id": "empty",

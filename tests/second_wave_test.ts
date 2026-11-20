@@ -1067,3 +1067,24 @@ Deno.test('junos change: grammar and rotation are refused before any connection'
     assertEquals(device.connections, 0);
   }
 });
+
+Deno.test('second wave AI exact reads stay narrower than interactive N1 display controls', () => {
+  for (
+    const [dialect, line] of [
+      ['fortios', 'execute date 2026-01-01'],
+      ['fortios', 'execute time 00:00:00'],
+      ['bsd', 'ps e'],
+      ['bsd', 'ps auxe'],
+      ['ios', 'show derived-config'],
+      ['junos', 'set cli screen-length 0'],
+    ] as const
+  ) {
+    assert(exactReadProblem(dialect, line) !== null, `${dialect}: ${line}`);
+    const plan = planExec(
+      payloadOf(ASSIGNMENT.connectionUUID, { steps: [line] }),
+      loadRules(dialect),
+      'n1',
+    );
+    assert(plan.blocked, `${dialect}: ${line}`);
+  }
+});

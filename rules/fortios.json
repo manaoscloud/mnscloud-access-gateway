@@ -30,7 +30,7 @@
     {
       "id": "fortios-read",
       "class": "read",
-      "pattern": "^(?:get \\S[^?]*|execute (?:ping|ping6|traceroute|ping-options|date|time)\\b[^?]*|abort|exit)$"
+      "pattern": "^(?:get \\S[^?]*|execute (?:ping|ping6|traceroute|ping-options)\\b[^?]*|execute (?:date|time)|abort|exit)$"
     },
     {
       "id": "fortios-risky",
