@@ -1241,6 +1241,42 @@
     [
       "ipconfig /all",
       "read"
+    ],
+    [
+      "shutdown/r /t 0",
+      "destructive"
+    ],
+    [
+      "shutdown.exe/r",
+      "destructive"
+    ],
+    [
+      "cmd/c reg save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "cmd /c reg save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "call reg save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "start /b reg save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "if 1==1 reg save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "if exist c:\\ shutdown /r",
+      "destructive"
+    ],
+    [
+      "echo !path!",
+      "destructive"
     ]
   ]
 }

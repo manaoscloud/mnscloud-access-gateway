@@ -385,9 +385,13 @@ function classifyRouterOs(
 // Windows cmd.exe
 // ---------------------------------------------------------------------------------------------
 
-const WIN_META = /[&|^<>()%\r\n]/;
+const WIN_META = /[&|^<>()%!\r\n]/;
 
-/** Strips `@`, separators, quotes, a path prefix and `.exe/.com/.bat/.cmd` from the command word. */
+/**
+ * Strips `@`, separators, quotes, a drive/path prefix and `.exe/.com/.bat/.cmd` from the command
+ * word. cmd.exe ends the command word at the first `/` (`shutdown/r`, `cmd/c`), so a switch glued
+ * to the word is split off instead of being taken for a path.
+ */
 export function normalizeWindows(segment: string): string {
   const text = segment.replace(/^[\s@,;=]+/, '');
   let word: string, rest: string;
@@ -396,13 +400,22 @@ export function normalizeWindows(segment: string): string {
     word = text.slice(1, end < 0 ? undefined : end);
     rest = end < 0 ? '' : text.slice(end + 1);
   } else {
-    const m = /^(\S+)([\s\S]*)$/.exec(text);
+    const m = /^([^\s/]+)([\s\S]*)$/.exec(text);
     word = m?.[1] ?? '';
     rest = m?.[2] ?? '';
   }
-  word = word.replace(/^.*[\\/]/, '').replace(/\.(?:exe|com|bat|cmd)$/i, '');
+  const slash = word.indexOf('/');
+  if (slash >= 0) {
+    rest = word.slice(slash) + rest;
+    word = word.slice(0, slash);
+  }
+  word = word.replace(/^[A-Za-z]:/, '').replace(/^.*\\/, '').replace(/\.(?:exe|com|bat|cmd)$/i, '');
+  rest = rest.replace(/^\//, ' /');
   return (word + rest).trim().replace(/\s+/g, ' ');
 }
+
+/** Classes a command may carry inside a wrapper (`cmd /c`, `call`, `start`, `if`, `for ... do`). */
+const WIN_ESCALATE = new Set(['secret_read', 'destructive', 'pivot']);
 
 function classifyWindows(rules: DialectRules, line: string): Classification {
   let result: Classification | null = null;
@@ -411,6 +424,16 @@ function classifyWindows(rules: DialectRules, line: string): Classification {
     if (!text && result) continue;
     const r = match(rules.rules, text);
     result = result ? strictest(result, r) : r;
+    // Wrappers run another command further on the line. Every word start is also classified as
+    // the start of a command; only the strict classes may raise the verdict, so an argument of a
+    // plain read (`ipconfig /all`) never lowers or confuses it.
+    const words = text.split(' ');
+    for (let i = 1; i < words.length; i++) {
+      const inner = normalizeWindows(words.slice(i).join(' '));
+      if (!inner) continue;
+      const w = match(rules.rules, inner);
+      if (!w.unknown && WIN_ESCALATE.has(w.class)) result = strictest(result, w);
+    }
   }
   result ??= match(rules.rules, '');
   // The raw line goes to cmd.exe: chaining, redirection, escapes and expansion are never reads.
