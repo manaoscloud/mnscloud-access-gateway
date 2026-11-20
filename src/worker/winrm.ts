@@ -134,7 +134,7 @@ export function parseXml(input: string): XmlNode {
     const attrs: Record<string, string> = {};
     const parent = stack[stack.length - 1];
     const namespaces: Record<string, string> = {
-      xml: 'http://www.w3.org/XML/1998/namespace',
+      xml: 'http://www.w3.org/XML/1998/namespace', // NOSONAR namespace identifier, not a URL that is fetched
       ...parent?.namespaces,
     };
     const rawAttrs = new Map<string, string>();
@@ -473,13 +473,13 @@ export class HttpConnection {
 // WS-Man / WinRS
 
 const NS = {
-  s: 'http://www.w3.org/2003/05/soap-envelope',
-  a: 'http://schemas.xmlsoap.org/ws/2004/08/addressing',
-  w: 'http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd',
-  p: 'http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd',
-  rsp: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell',
-  transfer: 'http://schemas.xmlsoap.org/ws/2004/09/transfer',
-  fault: 'http://schemas.microsoft.com/wbem/wsman/1/wsmanfault',
+  s: 'http://www.w3.org/2003/05/soap-envelope', // NOSONAR namespace identifier, not a URL that is fetched
+  a: 'http://schemas.xmlsoap.org/ws/2004/08/addressing', // NOSONAR namespace identifier, not a URL that is fetched
+  w: 'http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd', // NOSONAR namespace identifier, not a URL that is fetched
+  p: 'http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd', // NOSONAR namespace identifier, not a URL that is fetched
+  rsp: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell', // NOSONAR namespace identifier, not a URL that is fetched
+  transfer: 'http://schemas.xmlsoap.org/ws/2004/09/transfer', // NOSONAR namespace identifier, not a URL that is fetched
+  fault: 'http://schemas.microsoft.com/wbem/wsman/1/wsmanfault', // NOSONAR namespace identifier, not a URL that is fetched
 };
 function elementNamespace(name: string): string {
   if (
@@ -492,16 +492,16 @@ function elementNamespace(name: string): string {
   return NS.rsp;
 }
 
-export const SHELL_URI = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd';
+export const SHELL_URI = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd'; // NOSONAR namespace identifier, not a URL that is fetched
 const ACTION = {
-  create: 'http://schemas.xmlsoap.org/ws/2004/09/transfer/Create',
-  delete: 'http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete',
-  command: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command',
-  receive: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive',
-  signal: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal',
+  create: 'http://schemas.xmlsoap.org/ws/2004/09/transfer/Create', // NOSONAR namespace identifier, not a URL that is fetched
+  delete: 'http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete', // NOSONAR namespace identifier, not a URL that is fetched
+  command: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command', // NOSONAR namespace identifier, not a URL that is fetched
+  receive: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive', // NOSONAR namespace identifier, not a URL that is fetched
+  signal: 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal', // NOSONAR namespace identifier, not a URL that is fetched
 };
-const SIGNAL_TERMINATE = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/terminate';
-const STATE_DONE = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done';
+const SIGNAL_TERMINATE = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/terminate'; // NOSONAR namespace identifier, not a URL that is fetched
+const STATE_DONE = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done'; // NOSONAR namespace identifier, not a URL that is fetched
 const GUID = /^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$/;
 /** WSMan fault code of an operation that ran out of its OperationTimeout (no data yet). */
 const FAULT_TIMEOUT = '2150858793';
@@ -535,22 +535,27 @@ export class WsmanClient {
       timeoutMs?: number;
     } = {},
   ): Promise<{ root: XmlNode; body: XmlNode | undefined; fault: string | null }> {
+    const shellId = xmlEscape(options.shellId ?? '');
     const messageId = `uuid:${crypto.randomUUID().toUpperCase()}`;
     const operation = options.operationSeconds ?? 20;
+    // Interpolated into the XML: only a bounded integer (never text) and escaped identifiers.
+    if (!Number.isInteger(operation) || operation < 1 || operation > 600) {
+      throw new WinrmError('protocol', 'Invalid operation timeout');
+    }
     const xml = `<?xml version="1.0" encoding="UTF-8"?>` +
-      `<s:Envelope xmlns:s="${NS.s}" xmlns:a="${NS.a}" xmlns:w="${NS.w}" xmlns:p="${NS.p}" xmlns:rsp="${NS.rsp}">` +
-      `<s:Header><a:To>${xmlEscape(this.toAddress)}</a:To>` +
-      `<w:ResourceURI s:mustUnderstand="true">${SHELL_URI}</w:ResourceURI>` +
-      `<a:ReplyTo><a:Address s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address></a:ReplyTo>` +
-      `<a:Action s:mustUnderstand="true">${action}</a:Action>` +
+      `<s:Envelope xmlns:s="${NS.s}" xmlns:a="${NS.a}" xmlns:w="${NS.w}" xmlns:p="${NS.p}" xmlns:rsp="${NS.rsp}">` + // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
+      `<s:Header><a:To>${xmlEscape(this.toAddress)}</a:To>` + // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
+      `<w:ResourceURI s:mustUnderstand="true">${SHELL_URI}</w:ResourceURI>` + // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
+      `<a:ReplyTo><a:Address s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address></a:ReplyTo>` + // NOSONAR namespace identifier, not a URL that is fetched
+      `<a:Action s:mustUnderstand="true">${action}</a:Action>` + // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
       `<w:MaxEnvelopeSize s:mustUnderstand="true">153600</w:MaxEnvelopeSize>` +
-      `<a:MessageID>${messageId}</a:MessageID>` +
+      `<a:MessageID>${messageId}</a:MessageID>` + // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
       `<w:Locale xml:lang="en-US" s:mustUnderstand="false"/><p:DataLocale xml:lang="en-US" s:mustUnderstand="false"/>` +
-      `<w:OperationTimeout>PT${operation}S</w:OperationTimeout>` +
+      `<w:OperationTimeout>PT${operation}S</w:OperationTimeout>` + // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
       (options.shellId
-        ? `<w:SelectorSet><w:Selector Name="ShellId">${options.shellId}</w:Selector></w:SelectorSet>`
+        ? `<w:SelectorSet><w:Selector Name="ShellId">${shellId}</w:Selector></w:SelectorSet>` // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
         : '') +
-      (options.optionSet ?? '') + `</s:Header><s:Body>${body}</s:Body></s:Envelope>`;
+      (options.optionSet ?? '') + `</s:Header><s:Body>${body}</s:Body></s:Envelope>`; // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
     const response = await this.http.request(
       xml,
       Math.max(
@@ -572,7 +577,7 @@ export class WsmanClient {
     const fault = child(bodyNode, 'Fault');
     if (fault) {
       if (
-        !['http://schemas.dmtf.org/wbem/wsman/1/wsman/fault', `${NS.a}/fault`].includes(
+        !['http://schemas.dmtf.org/wbem/wsman/1/wsman/fault', `${NS.a}/fault`].includes( // NOSONAR namespace identifier, not a URL that is fetched
           responseAction ?? '',
         )
       ) {
@@ -623,7 +628,7 @@ export class WsmanClient {
   async startCommand(shellId: string, commandLine: string, timeoutMs?: number): Promise<string> {
     const r = await this.#call(
       ACTION.command,
-      `<rsp:CommandLine><rsp:Command>${xmlEscape(commandLine)}</rsp:Command></rsp:CommandLine>`,
+      `<rsp:CommandLine><rsp:Command>${xmlEscape(commandLine)}</rsp:Command></rsp:CommandLine>`, // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
       {
         shellId,
         timeoutMs,
@@ -644,9 +649,10 @@ export class WsmanClient {
     operationSeconds = 5,
     timeoutMs?: number,
   ): Promise<ReceiveResult> {
+    const id = xmlEscape(commandId);
     const r = await this.#call(
       ACTION.receive,
-      `<rsp:Receive><rsp:DesiredStream CommandId="${commandId}">stdout stderr</rsp:DesiredStream></rsp:Receive>`,
+      `<rsp:Receive><rsp:DesiredStream CommandId="${id}">stdout stderr</rsp:DesiredStream></rsp:Receive>`, // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
       { shellId, operationSeconds, timeoutMs },
     );
     if (r.fault === FAULT_TIMEOUT) return { chunks: [], done: false, exitCode: null };
@@ -686,9 +692,10 @@ export class WsmanClient {
   }
 
   async terminate(shellId: string, commandId: string, timeoutMs = 2000): Promise<void> {
+    const id = xmlEscape(commandId);
     const r = await this.#call(
       ACTION.signal,
-      `<rsp:Signal CommandId="${commandId}"><rsp:Code>${SIGNAL_TERMINATE}</rsp:Code></rsp:Signal>`,
+      `<rsp:Signal CommandId="${id}"><rsp:Code>${SIGNAL_TERMINATE}</rsp:Code></rsp:Signal>`, // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
       { shellId, operationSeconds: 5, timeoutMs },
     );
     this.#require(r.fault);

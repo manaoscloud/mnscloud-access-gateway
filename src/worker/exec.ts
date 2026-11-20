@@ -336,7 +336,7 @@ export function cleanOutput(redactor: Redactor, raw: string, truncated: boolean)
   return redactor.redactText(
     plain.replace(/-- \[Q quit\|D dump\|down\]\s*/g, '').replace(
       // deno-lint-ignore no-control-regex
-      /(?: *--More-- *| *<--- More ---> *)[\x08 \r]*/g,
+      /(?: *--More-- *| *<--- More ---> *)[\x08 \r]*/g, // NOSONAR intended terminal pager-erase (backspace) stripping
       '',
     ),
   );
@@ -2303,10 +2303,9 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           throw new ExecFail('BACKUP_EXISTS');
         }
         const written = await run(`show configuration | save ${filename}`, EXPORT_TIMEOUT_MS);
-        const proof = new RegExp(
-          `^Wrote \\d+ lines? of configuration to '${filename.replace(/[.]/g, '\\.')}'$`,
-        );
-        if (!proof.test(written)) throw new ExecFail('BACKUP_FAILED');
+        // Exact proof: the captured path must equal the requested file (no dynamic RegExp).
+        const proof = /^Wrote \d+ lines? of configuration to '([^']*)'$/.exec(written);
+        if (proof?.[1] !== filename) throw new ExecFail('BACKUP_FAILED');
       } finally {
         signal.removeEventListener('abort', onAbort);
         shell?.close();

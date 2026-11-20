@@ -2,7 +2,7 @@ import { Element, escapeXml, is, MAX_FRAME, only, parseXml, ProtocolError } from
 export const NC = 'urn:ietf:params:xml:ns:netconf:base:1.0';
 export const BASE = 'urn:ietf:params:netconf:base:1.0';
 export const CAP = 'urn:ietf:params:netconf:capability:';
-export const JUNOS = 'http://xml.juniper.net/netconf/junos/1.0';
+export const JUNOS = 'http://xml.juniper.net/netconf/junos/1.0'; // NOSONAR namespace identifier, not a URL that is fetched
 export interface Channel {
   on(event: 'data', cb: (data: Uint8Array) => void): unknown;
   on(event: 'error', cb: (error: unknown) => void): unknown;
@@ -113,6 +113,7 @@ export class Netconf {
       const waiting = nc.wait(signal, timeoutMs);
       try {
         channel.write(
+          // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
           `<hello xmlns="${NC}"><capabilities><capability>${BASE}</capability></capabilities></hello>]]>]]>`,
         );
       } catch {
@@ -235,6 +236,7 @@ export class Netconf {
     const waiting = this.wait(signal, timeoutMs);
     try {
       this.channel.write(
+        // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
         `<rpc xmlns="${NC}" message-id="${id}">${body}</rpc>]]>]]>`,
       );
     } catch {
@@ -277,6 +279,7 @@ export class Netconf {
     timeoutMs: number,
   ) {
     const el = await this.rpc(
+      // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolations are constants or escaped
       `<load-configuration action="set" format="text"><configuration-set>${
         escapeXml(commands.join('\n'))
       }</configuration-set></load-configuration>`,

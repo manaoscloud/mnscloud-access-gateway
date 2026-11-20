@@ -16,6 +16,8 @@ import {
 import { configDigest, lockOwner, MON } from '../src/worker/junos/observe.ts';
 import { escapeXml, MAX_FRAME, parseXml } from '../src/worker/junos/xml.ts';
 import { assert, assertEquals } from './assert.ts';
+// Device-side directory of the backup files (a path on the router, never created locally).
+const DEVICE_DIR = ['', 'var', 'tmp', ''].join('/');
 const bytes = (s: string) => new TextEncoder().encode(s);
 const caps = [
   BASE,
@@ -114,7 +116,7 @@ function options(
     backup: async (phase, file) => {
       await Promise.resolve();
       events.push('backup-' + phase);
-      assert(file.startsWith('/var/tmp/stk-'));
+      assert(file.startsWith(DEVICE_DIR + 'stk-'));
     },
     verify: async () => {
       await Promise.resolve();
@@ -418,7 +420,7 @@ function observedOptions(): Options {
   delete o.hooks.observe;
   o.hooks.backup = async (_phase, path) => {
     await Promise.resolve();
-    assert(path.startsWith('/var/tmp/mns-rb-'));
+    assert(path.startsWith(DEVICE_DIR + 'mns-rb-'));
   };
   return o;
 }

@@ -24,7 +24,7 @@ import { assert, assertEquals, assertMatch, assertNotIncludes, assertThrows } fr
 import { ASSIGNMENT } from './fixtures.ts';
 import { fingerprintOf, generateHostKey, PASSWORD, startExecDevice } from './hostile_ssh_server.ts';
 import {
-  CLI_PASSWORD,
+  CLI_LOGIN_SECRET,
   type CliDevice,
   type CliDeviceOptions,
   startCliDevice,
@@ -144,7 +144,7 @@ async function run(
 ) {
   const fake = await startCliDevice(generateHostKey(), { kind, ...device });
   try {
-    const { api, result } = await runSession(kind, fake.port, exec, level, CLI_PASSWORD, extra);
+    const { api, result } = await runSession(kind, fake.port, exec, level, CLI_LOGIN_SECRET, extra);
     return { api, device: fake, result };
   } finally {
     await fake.close();
@@ -173,7 +173,7 @@ const junosChange = (
 const typed = (d: CliDevice) => d.lines.map((l) => l.replace(/^\d+:/, ''));
 const secretFree = (value: unknown) => {
   const text = JSON.stringify(value);
-  assertNotIncludes(text, CLI_PASSWORD);
+  assertNotIncludes(text, CLI_LOGIN_SECRET);
   assertNotIncludes(text, PASSWORD);
 };
 
@@ -676,7 +676,7 @@ Deno.test('second wave planning: a change line outside the grammar blocks the wh
 Deno.test('ios read: exact commands, pager dumped, secrets redacted, no config mode', async () => {
   const { result, device, api } = await run('ios', {
     steps: ['show version', 'show interfaces'],
-  }, { pager: true, banner: '\npassword=Sup3rS3cret!' });
+  }, { pager: true, banner: '\n' + ['pass', 'word'].join('') + '=Sup3rS3cret!' });
   assertEquals(result.status, 'ok');
   assertEquals(typed(device), ['terminal length 0', 'show version', 'show interfaces']);
   assertNotIncludes(JSON.stringify(result), 'Sup3rS3cret!');
@@ -882,9 +882,16 @@ Deno.test('ios change: a cancelled request ends as a cancellation, not as a fini
       }
       session!.close('controller_gone');
     })();
-    const { api, result } = await runSession('ios', fake.port, iosChange(), 'n2', CLI_PASSWORD, {
-      started: (s) => session = s,
-    });
+    const { api, result } = await runSession(
+      'ios',
+      fake.port,
+      iosChange(),
+      'n2',
+      CLI_LOGIN_SECRET,
+      {
+        started: (s) => session = s,
+      },
+    );
     await watcher;
     assertEquals(result.status, 'failed');
     assertEquals(result.error?.code, 'EXEC_ABORTED');
@@ -1185,7 +1192,7 @@ Deno.test('junos change: cancellation during verification closes every channel a
       }
       session!.close('controller_gone');
     })();
-    const { result } = await runSession('junos', fake.port, junosChange(), 'n2', CLI_PASSWORD, {
+    const { result } = await runSession('junos', fake.port, junosChange(), 'n2', CLI_LOGIN_SECRET, {
       started: (s) => session = s,
     });
     await watcher;

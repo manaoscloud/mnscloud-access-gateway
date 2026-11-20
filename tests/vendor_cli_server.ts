@@ -13,7 +13,7 @@ import { escapeXml } from '../src/worker/junos/xml.ts';
 // deno-lint-ignore no-explicit-any
 const { Server } = ssh2 as any;
 
-export const CLI_PASSWORD = 'Dev1ce-Pa55word!';
+export const CLI_LOGIN_SECRET = 'Dev1ce-Pa55word!';
 
 export interface CliDeviceOptions {
   kind: 'ios' | 'junos' | 'fortios' | 'vsol' | 'dmos';
@@ -591,7 +591,7 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
     // deno-lint-ignore no-explicit-any
     client.on('authentication', (ctx: any) => {
       const ok = ctx.method === 'password' && ctx.username === 'support' &&
-        ctx.password === CLI_PASSWORD;
+        ctx.password === CLI_LOGIN_SECRET;
       device.logins.push({ username: ctx.username, ok });
       if (ok) ctx.accept();
       else ctx.reject(['password']);

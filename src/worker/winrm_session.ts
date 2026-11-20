@@ -392,7 +392,7 @@ class LineDevice {
       this.emit('A command is still running.' + PROMPT);
     } else {
       this.running = true;
-      this.run(line).finally(() => {
+      void this.run(line).finally(() => {
         this.running = false;
       });
     }

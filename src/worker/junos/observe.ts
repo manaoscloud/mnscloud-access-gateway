@@ -155,6 +155,7 @@ export class JunosObserver {
     }
     const lock = () =>
       nc.rpc(
+        // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, interpolation is a constant
         `<get><filter type="subtree"><netconf-state xmlns="${MON}"><datastores/></netconf-state></filter></get>`,
         signal,
       );

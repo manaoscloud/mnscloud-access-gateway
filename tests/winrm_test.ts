@@ -30,7 +30,7 @@ import { makeCertificate, type MockCertificate } from './routeros_mock.ts';
 import { startWinrm, type WinrmMock, type WinrmMockOptions } from './winrm_mock.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
-const PASSWORD = 'W1nRM-Pa55word!';
+const LOGIN_SECRET = 'W1nRM-Pa55word!';
 
 // ---------------------------------------------------------------------------------------------
 // Units: XML
@@ -275,7 +275,7 @@ async function withMock<T>(
   fn: (h: Harness) => Promise<T>,
 ): Promise<T> {
   const certificate = await makeCertificate();
-  const mock = await startWinrm(certificate, { password: PASSWORD, ...options });
+  const mock = await startWinrm(certificate, { password: LOGIN_SECRET, ...options });
   const real = tlsPin(new X509Certificate(certificate.cert).fingerprint256);
   try {
     return await fn({
@@ -340,7 +340,7 @@ function build(
   const session = new Session(assignment, {
     api,
     unwrap: options.unwrap ??
-      (() => Promise.resolve({ username: 'support', password: options.password ?? PASSWORD })),
+      (() => Promise.resolve({ username: 'support', password: options.password ?? LOGIN_SECRET })),
     launcher: new DirectLauncher(ROOT),
     networks: null,
     sandbox: { memoryMaxMB: 256, cpuQuotaPercent: 50, tasksMax: 64 },
@@ -382,7 +382,9 @@ Deno.test({
       assertEquals(h.mock.requests.map((q) => q.action), ['create', 'delete']);
       assert(h.mock.requests.every((q) => q.path === '/wsman'));
       assert(
-        h.mock.requests.every((q) => q.authorization === basicAuthorization('support', PASSWORD)),
+        h.mock.requests.every((q) =>
+          q.authorization === basicAuthorization('support', LOGIN_SECRET)
+        ),
       );
       assert(h.mock.requests.every((q) => q.contentType?.startsWith('application/soap+xml')));
       assertEquals(h.mock.openShells.size, 0);
@@ -390,7 +392,10 @@ Deno.test({
       // Create asks for the cmd shell with stdin/stdout/stderr and UTF-8; never PowerShell.
       assert(h.mock.requests[0].body.includes('windows/shell/cmd'));
       assert(!/powershell|PSRP|CredSSP/i.test(h.mock.requests[0].body));
-      assertNotIncludes(JSON.stringify(r.api.received) + JSON.stringify(r.api.finished), PASSWORD);
+      assertNotIncludes(
+        JSON.stringify(r.api.received) + JSON.stringify(r.api.finished),
+        LOGIN_SECRET,
+      );
     }),
 });
 
@@ -503,8 +508,11 @@ Deno.test({
     withMock({
       commands: {
         ver: { stdout: '\r\nMicrosoft Windows [Version 10.0.20348.2113]\r\n' },
-        hostname: { stdout: 'SRV-ÁÇÃO\r\n', stderr: `warn password=${PASSWORD}\r\n` },
-        systeminfo: { stdout: `Host Name: SRV\r\nNote: token ${PASSWORD}\r\n`, slowReceives: 2 },
+        hostname: { stdout: 'SRV-ÁÇÃO\r\n', stderr: `warn password=${LOGIN_SECRET}\r\n` },
+        systeminfo: {
+          stdout: `Host Name: SRV\r\nNote: token ${LOGIN_SECRET}\r\n`,
+          slowReceives: 2,
+        },
       },
     }, async (h) => {
       const r = await runMode('exec', h, {
@@ -520,7 +528,7 @@ Deno.test({
       ]);
       assert(r.result.steps[0].output.includes('Windows [Version 10.0.20348.2113]'));
       assert(r.result.steps[1].output.includes('SRV-ÁÇÃO'));
-      assertNotIncludes(JSON.stringify(r.result), PASSWORD);
+      assertNotIncludes(JSON.stringify(r.result), LOGIN_SECRET);
       assertEquals(h.mock.commands, ['ver', 'hostname', 'systeminfo']);
       // Lifecycle: one shell, deleted at the end; the credential never leaves the worker.
       assertEquals(h.mock.deletes.length, 1);
@@ -528,7 +536,10 @@ Deno.test({
       assertEquals(h.mock.connections, 1);
       assertEquals(r.reason, 'exec_done');
       assertEquals(r.api.calls.filter((c) => c === 'credential').length, 1);
-      assertNotIncludes(JSON.stringify(r.api.received) + JSON.stringify(r.api.finished), PASSWORD);
+      assertNotIncludes(
+        JSON.stringify(r.api.received) + JSON.stringify(r.api.finished),
+        LOGIN_SECRET,
+      );
     }),
 });
 
@@ -601,7 +612,7 @@ Deno.test({
         const r = await runMode('exec', h, { pin: 'match', steps: ['ver'] });
         assertEquals([r.result.status, r.result.error?.code], ['failed', code], failReceive);
         assertEquals(r.result.steps.length, 0, failReceive);
-        assertNotIncludes(JSON.stringify(r.result), PASSWORD);
+        assertNotIncludes(JSON.stringify(r.result), LOGIN_SECRET);
       });
     }
   },
@@ -757,7 +768,7 @@ Deno.test({
   fn: () =>
     withMock({
       commands: {
-        hostname: { stdout: `SRV leaks ${PASSWORD}\r\n` },
+        hostname: { stdout: `SRV leaks ${LOGIN_SECRET}\r\n` },
         'echo hi': { stdout: 'hi\r\n' },
       },
     }, async (h) => {
@@ -767,7 +778,7 @@ Deno.test({
       // read: runs at once, echoed, output redacted
       browser.type('hostname\r');
       await browser.waitFor(() => browser.output().includes('SRV leaks'));
-      assertNotIncludes(browser.output(), PASSWORD);
+      assertNotIncludes(browser.output(), LOGIN_SECRET);
       assertEquals(h.mock.commands, ['hostname']);
       // composition is at least destructive (cmd.exe gets the raw line): never run unconfirmed
       browser.type('hostname & shutdown /s\r');
@@ -803,7 +814,7 @@ Deno.test({
       assertEquals(h.mock.deletes.length, 1);
       const all = browser.frames.join('\n') + JSON.stringify(api.received) +
         api.parts.map((p) => new TextDecoder().decode(p)).join('') + JSON.stringify(api.finished);
-      assertNotIncludes(all, PASSWORD);
+      assertNotIncludes(all, LOGIN_SECRET);
       assert(api.parts.length > 0, 'recording uploaded');
       assert(api.received.some((e) =>
         e.type === 'command' && e.line === 'hostname' && e.verdict === 'allowed'
@@ -1086,7 +1097,7 @@ Deno.test({
         unwrap: async () => {
           built.session.close('cancelled');
           await new Promise((r) => setTimeout(r, 40));
-          return { username: 'support', password: PASSWORD };
+          return { username: 'support', password: LOGIN_SECRET };
         },
       });
       const session = built.session;

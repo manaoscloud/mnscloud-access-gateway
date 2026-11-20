@@ -162,6 +162,7 @@ export async function change(
     deadline = now() + options.rollbackSeconds * 1000;
     r.commitSent = true;
     await ok(
+      // nosemgrep: javascript.lang.security.html-in-template-string -- XML wire message, rollbackSeconds is a validated integer 120..900
       `<commit><confirmed/><confirm-timeout>${options.rollbackSeconds}</confirm-timeout></commit>`,
     );
     const pending = await bounded((s) => observe(nc!, 'pending', s));

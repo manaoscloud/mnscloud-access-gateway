@@ -65,19 +65,18 @@ export interface WinrmMock {
 
 const SOAP = 'application/soap+xml;charset=UTF-8';
 const ACTIONS: Record<string, string> = {
-  'http://schemas.xmlsoap.org/ws/2004/09/transfer/Create': 'create',
-  'http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete': 'delete',
-  'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command': 'command',
-  'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive': 'receive',
-  'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal': 'signal',
+  'http://schemas.xmlsoap.org/ws/2004/09/transfer/Create': 'create', // NOSONAR namespace identifier, not a URL that is fetched
+  'http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete': 'delete', // NOSONAR namespace identifier, not a URL that is fetched
+  'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command': 'command', // NOSONAR namespace identifier, not a URL that is fetched
+  'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive': 'receive', // NOSONAR namespace identifier, not a URL that is fetched
+  'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal': 'signal', // NOSONAR namespace identifier, not a URL that is fetched
 };
 const NS =
-  'xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell" xmlns:f="http://schemas.microsoft.com/wbem/wsman/1/wsmanfault"';
+  'xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell" xmlns:f="http://schemas.microsoft.com/wbem/wsman/1/wsmanfault"'; // NOSONAR namespace identifier, not a URL that is fetched
 const unescape = (v: string) =>
   v.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
     .replace(/&amp;/g, '&');
-const b64 = (bytes: Uint8Array | string) =>
-  Buffer.from(typeof bytes === 'string' ? bytes : bytes).toString('base64');
+const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64');
 
 export function startWinrm(
   certificate: MockCertificate,
@@ -152,7 +151,7 @@ export function startWinrm(
         const envelope = (inner: string, relates = messageId) =>
           `<?xml version="1.0" encoding="UTF-8"?><s:Envelope ${NS}><s:Header><a:Action>${
             inner.includes('<s:Fault>')
-              ? 'http://schemas.dmtf.org/wbem/wsman/1/wsman/fault'
+              ? 'http://schemas.dmtf.org/wbem/wsman/1/wsman/fault' // NOSONAR namespace identifier, not a URL that is fetched
               : requestAction + 'Response'
           }</a:Action><a:RelatesTo>${relates}</a:RelatesTo></s:Header><s:Body>${inner}</s:Body></s:Envelope>`;
         const fault = (code: string, text = 'The operation failed') =>
@@ -244,8 +243,8 @@ export function startWinrm(
             200,
             envelope(
               `<rsp:ReceiveResponse>${streams}<rsp:CommandState CommandId="${id}" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>${
-                command.reply.exit ?? 0
-              }</rsp:ExitCode></rsp:CommandState></rsp:ReceiveResponse>`,
+                // NOSONAR namespace identifier, not a URL that is fetched
+                command.reply.exit ?? 0}</rsp:ExitCode></rsp:CommandState></rsp:ReceiveResponse>`,
             ),
           );
         }

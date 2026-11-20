@@ -1,5 +1,5 @@
 import { NC } from './netconf.ts';
-export const XNM = 'http://xml.juniper.net/xnm/1.1/xnm';
+export const XNM = 'http://xml.juniper.net/xnm/1.1/xnm'; // NOSONAR namespace identifier, not a URL that is fetched
 export const MON = 'urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring';
 // Only inherited NETCONF namespace is currently backed by the accepted profile.
 // Do not add a versioned junos-system URI without an official wire fixture.
