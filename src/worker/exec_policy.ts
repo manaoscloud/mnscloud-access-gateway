@@ -164,9 +164,12 @@ const CHANGE_GRAMMAR: Partial<Record<ShellDialect, RegExp[]>> = {
     /^name [A-Za-z0-9_-]{1,32}$/,
   ],
   junos: [
+    // nosemgrep: javascript.lang.correctness.missing-template-string-indicator -- {n,m} are regex quantifiers
     new RegExp(`^set interfaces ${JUNOS_IF} description (?:"${TEXT}"|[A-Za-z0-9._:/-]{1,64})$`),
     new RegExp(`^(?:set|delete) interfaces ${JUNOS_IF} disable$`),
+    // nosemgrep: javascript.lang.correctness.missing-template-string-indicator -- {n,m} are regex quantifiers
     new RegExp(`^set vlans [A-Za-z0-9_-]{1,32} vlan-id ${VLAN}$`),
+    // nosemgrep: javascript.lang.correctness.missing-template-string-indicator -- {n,m} are regex quantifiers
     new RegExp(`^set interfaces ${JUNOS_IF} unit \\d{1,4} family inet address ${IP4}/\\d{1,2}$`),
   ],
 };
