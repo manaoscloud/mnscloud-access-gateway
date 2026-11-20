@@ -814,10 +814,9 @@ Deno.test('bsd read: POSIX exec channels, non-zero exit fails, secret paths bloc
 // ---------------------------------------------------------------------------------------------
 // Integration: Cisco IOS `reload in`
 
-Deno.test('ios change: reload armed on a saved baseline, verified in a NEW session, then saved', async () => {
+Deno.test('ios change: lock retained through baseline, fresh verification, confirmation and persistence', async () => {
   const { result, device } = await run('ios', iosChange());
   assertEquals(result.status, 'applied');
-  assertEquals(result.error, null);
   assertEquals(result.rollback, {
     method: 'scheduled_reload',
     armed: false,
@@ -825,119 +824,145 @@ Deno.test('ios change: reload armed on a saved baseline, verified in a NEW sessi
     pendingReboot: false,
   });
   const lines = typed(device);
-  const at = (text: string, from = 0) => lines.indexOf(text, from);
-  const order = [
-    'show reload',
-    'show archive config differences nvram:startup-config system:running-config',
-    `copy running-config flash:${BACKUP}-pre.cfg`,
-    'reload in 5',
-    'configure terminal',
+  const commands = [
+    'configure terminal lock',
+    'do show configuration lock',
+    'do show reload',
+    'do show archive config differences nvram:startup-config system:running-config',
+    `do dir flash:${BACKUP}-pre.cfg`,
+    `do copy running-config flash:${BACKUP}-pre.cfg`,
+    `do reload in 5 MNSCloud:${BACKUP}`,
     'interface GigabitEthernet0/1',
     'description uplink-new',
-    'end',
-    `copy running-config flash:${BACKUP}-post.cfg`,
-  ].map((l) => at(l));
-  assert(order.every((i, n) => i >= 0 && (n === 0 || i > order[n - 1])), JSON.stringify(lines));
-  // Fresh verification: a second SSH connection ran the verify read, before the reload was cancelled.
+    `do copy running-config flash:${BACKUP}-post.cfg`,
+    'do reload cancel',
+    'do copy running-config startup-config',
+  ];
+  let last = -1;
+  for (const command of commands) {
+    const found = lines.indexOf(command, last + 1);
+    assert(found > last, command + JSON.stringify(lines));
+    last = found;
+  }
+  assert(!lines.includes('end') && !lines.includes('exit'));
   assert(device.lines.includes('1:show ip interface brief'));
-  const cancel = at('reload cancel');
-  assert(cancel > at(`copy running-config flash:${BACKUP}-post.cfg`));
-  assert(at('copy running-config startup-config') > cancel);
-  // The reload timer was cancelled before saving; the reboot never happened.
-  assertEquals(device.events, ['reload-armed', 'reload-cancelled', 'saved']);
-  assertEquals(device.reloadScheduled, false);
+  assert(
+    device.lines.indexOf('1:show ip interface brief') < device.lines.indexOf('0:do reload cancel'),
+  );
+  assertEquals(device.events, ['lock-acquired', 'reload-armed', 'reload-cancelled', 'saved']);
+  assertEquals(device.running, device.startup);
   assert(device.startup.includes('description uplink-new'));
-  // Save was never offered to `reload in`: nothing but our change is persisted.
   assertEquals(device.answers.filter((a) => a.startsWith('save:')), []);
-  // The password never leaves the worker.
   secretFree(result);
-  const phases = result.steps.map((s) => s.phase);
-  assert(phases.includes('system') && phases.includes('step') && phases.includes('verify'));
 });
 
-Deno.test('ios change: no saved baseline, unprivileged, pending reload or no diff command -> nothing changes', async () => {
+Deno.test('ios change: unsupported lock, malformed proof, dirty baseline and backup collisions refuse before mutation', async () => {
   const cases: [Omit<CliDeviceOptions, 'kind'>, string][] = [
+    [{ lockUnsupported: true }, 'LOCK_UNPROVEN'],
+    [{ lockOutput: 'LOCKED' }, 'LOCK_UNPROVEN'],
     [{ dirtyBaseline: true }, 'BASELINE_UNSAFE'],
+    [{ unknownBaseline: true }, 'BASELINE_UNSAFE'],
     [{ noDiffCommand: true }, 'BASELINE_UNSAFE'],
     [{ userMode: true }, 'PRIVILEGE_REQUIRED'],
     [{ reloadPending: true }, 'RELOAD_PENDING'],
     [{ failBackup: true }, 'BACKUP_FAILED'],
+    [{ backupCollision: true }, 'BACKUP_FAILED'],
   ];
   for (const [options, code] of cases) {
     const { result, device } = await run('ios', iosChange(), options);
     assertEquals(result.status, 'failed', code);
     assertEquals(result.error?.code, code);
-    assertEquals(result.rollback.armed, false, code);
-    const lines = typed(device);
-    assert(!lines.includes('configure terminal'), code);
-    assert(!lines.some((l) => l.startsWith('reload in')), code);
-    assert(!device.events.includes('saved'), code);
+    assert(!typed(device).includes('interface GigabitEthernet0/1'));
+    assert(!typed(device).some((l) => l.startsWith('do reload in')));
+    assert(!typed(device).includes('do reload cancel'));
     assertEquals(device.reloadScheduled, options.reloadPending ?? false);
-    assertEquals(device.connections, 1, code);
+    assert(!device.events.includes('saved'));
   }
 });
 
-Deno.test('ios change: a refused reload command is cancelled and nothing is applied', async () => {
-  const { result, device } = await run('ios', iosChange(), { refuseReload: true });
-  assertEquals(result.status, 'failed');
-  assertEquals(result.error?.code, 'SCHEDULE_FAILED');
-  assert(!typed(device).includes('configure terminal'));
-  assertEquals(device.reloadScheduled, false);
-  assertEquals(result.rollback.armed, false);
+Deno.test('ios change: rejected arm or foreign timer is never blindly cancelled', async () => {
+  for (const options of [{ refuseReload: true }, { foreignTimerAfterArm: true }]) {
+    const { result, device } = await run('ios', iosChange(), options);
+    assertEquals(result.status, 'failed');
+    assertEquals(result.error?.code, 'SCHEDULE_FAILED');
+    assert(!typed(device).includes('do reload cancel'));
+    assert(!typed(device).includes('interface GigabitEthernet0/1'));
+    assertEquals(result.rollback.armed, false);
+  }
 });
 
-Deno.test('ios change: a step error leaves the reload armed and nothing is saved', async () => {
-  const { result, device } = await run('ios', iosChange(), { badStep: 'description' });
-  assertEquals(result.status, 'rolled_back');
-  assertEquals(result.error?.code, 'STEP_FAILED');
-  assertEquals(result.rollback, {
-    method: 'scheduled_reload',
-    armed: true,
-    fired: false,
-    pendingReboot: true,
-  });
-  assertEquals(device.reloadScheduled, true);
-  assert(!device.events.includes('saved'));
-  // The pending reload reverts the running configuration to the saved one.
-  device.fire();
-  assert(!device.running.includes('description uplink-new'));
-  assertEquals(device.running, device.startup);
+Deno.test('ios change: step failure or ownership loss reports pending, never completed rollback', async () => {
+  for (
+    const [options, code] of [[{ badStep: 'description' }, 'STEP_FAILED'], [{
+      loseLockAfterStep: true,
+    }, 'LOCK_LOST']] as const
+  ) {
+    const { result, device } = await run('ios', iosChange(), options);
+    assertEquals(result.status, 'failed');
+    assertEquals(result.error?.code, code);
+    assertEquals(result.rollback, {
+      method: 'scheduled_reload',
+      armed: true,
+      fired: false,
+      pendingReboot: true,
+    });
+    assert(!device.events.includes('saved'));
+    assert(!device.events.includes('reload-cancelled'));
+    device.fire();
+    assertEquals(device.running, device.startup);
+  }
 });
 
-Deno.test('ios change: failed verification, failed save, failed cancel and a foreign change never report applied', async () => {
-  const verify = await run('ios', iosChange(), { failVerify: /^show ip interface brief$/ });
-  assertEquals(verify.result.status, 'rolled_back');
-  assertEquals(verify.result.error?.code, 'VERIFY_FAILED');
-  assertEquals(verify.device.reloadScheduled, true);
-  assert(!verify.device.events.includes('saved'));
-
-  const save = await run('ios', iosChange(), { failSave: true });
-  assertEquals(save.result.status, 'failed');
-  assertEquals(save.result.error?.code, 'SAVE_FAILED');
-  assertEquals(save.result.rollback.armed, false);
-  assertEquals(save.device.startup.includes('description uplink-new'), false);
-
-  const cancel = await run('ios', iosChange(), { cancelFails: true });
-  assertEquals(cancel.result.status, 'rolled_back');
-  assertEquals(cancel.result.error?.code, 'CANCEL_FAILED');
-  assertEquals(cancel.result.rollback.armed, true);
-  assert(!cancel.device.events.includes('saved'));
-
+Deno.test('ios change: verification failure retains timer; lock prevents foreign configuration writes', async () => {
+  const bad = await run('ios', iosChange(), { failVerify: /^show ip interface brief$/ });
+  assertEquals(bad.result.status, 'failed');
+  assertEquals(bad.result.error?.code, 'VERIFY_FAILED');
+  assert(bad.result.rollback.armed && bad.result.rollback.pendingReboot);
+  assert(!bad.device.events.includes('saved'));
   const foreign = await run('ios', iosChange(), { foreignAfterApply: true });
-  assertEquals(foreign.result.status, 'rolled_back');
-  assertEquals(foreign.result.error?.code, 'FOREIGN_CHANGE');
-  assertEquals(foreign.device.reloadScheduled, true);
-  assert(!foreign.device.events.includes('saved'));
-  assert(!foreign.device.startup.includes('ntp server 203.0.113.9'));
-  for (const r of [verify, save, cancel, foreign]) assert(r.result.status !== 'applied');
+  assertEquals(foreign.result.status, 'applied');
+  assert(foreign.device.events.includes('foreign-write-refused'));
+  assert(!foreign.device.running.includes('ntp server 203.0.113.9'));
 });
 
-Deno.test('ios change: the connection lost after arming is reported as a pending reload, not applied', async () => {
-  const { result, device } = await run('ios', iosChange(), { dropOn: /^configure terminal$/ });
-  assertEquals(result.status, 'rolled_back');
+Deno.test('ios change: save errors or readback mismatch after confirmation are not applied or rolled back', async () => {
+  for (
+    const options of [{ failSave: true }, { saveReadbackMismatch: true }, { saveLostAck: true }]
+  ) {
+    const { result, device } = await run('ios', iosChange(), options);
+    assertEquals(result.status, 'failed');
+    assertEquals(result.error?.code, 'SAVE_FAILED');
+    assertEquals(result.rollback.armed, false);
+    assertEquals(result.rollback.pendingReboot, false);
+    assert(device.events.includes('reload-cancelled'));
+    assert(result.error?.message.includes('unarmed'));
+  }
+});
+
+Deno.test('ios change: cancel refusal, unknown acknowledgement and lost reply never save startup', async () => {
+  for (
+    const options of [{ cancelFails: true }, { cancelUnknownAck: true }, { cancelLostAck: true }]
+  ) {
+    const { result, device } = await run('ios', iosChange(), options);
+    assertEquals(result.status, 'failed');
+    assertEquals(
+      result.error?.code,
+      options.cancelLostAck ? 'CONFIRMATION_UNKNOWN' : 'CANCEL_FAILED',
+    );
+    assert(!device.events.includes('saved'));
+    assertEquals(result.rollback.fired, false);
+    if (options.cancelFails) assert(result.rollback.armed && result.rollback.pendingReboot);
+    if (options.cancelLostAck) assert(!result.rollback.armed && result.rollback.pendingReboot);
+  }
+});
+
+Deno.test('ios change: connection loss after arm reports pending state without claiming restoration', async () => {
+  const { result, device } = await run('ios', iosChange(), {
+    dropOn: /^interface GigabitEthernet0\/1$/,
+  });
+  assertEquals(result.status, 'failed');
   assertEquals(result.error?.code, 'CONNECTION_LOST');
-  assertEquals(result.rollback.armed, true);
-  assertEquals(device.reloadScheduled, true);
+  assert(result.rollback.armed && result.rollback.pendingReboot && !result.rollback.fired);
   assert(!device.events.includes('saved'));
 });
 

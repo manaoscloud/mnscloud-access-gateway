@@ -1922,205 +1922,266 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
 
   // --- Cisco IOS / IOS-XE: `reload in` ---------------------------------------------------------
 
-  /** True when the IOS configuration diff holds only lines the steps explain (fail closed). */
-  const diffIsOurs = (output: string): boolean => {
-    const ours = new Set(exec.steps.map((step) => step.trim()));
-    const words = new Set(exec.steps.map((step) => step.trim().replace(/^no /, '').split(' ')[0]));
-    for (const line of output.replace(/\r/g, '').split('\n')) {
-      const m = /^([+-])(.*)$/.exec(line);
-      const text = m?.[2].trim();
-      if (!m || !text) continue;
-      if (m[1] === '+' ? !ours.has(text) : !words.has(text.replace(/^no /, '').split(' ')[0])) {
-        return false;
-      }
-    }
-    return true;
-  };
-
+  // IOS reload protection applies only until explicit confirmation. Persistence after confirmation
+  // is a separate, observable step: a failed save is never reported as applied or rolled back.
   const iosChange = async () => {
     const profile = CLI.ios!;
     const backup = exec.backupName!;
+    const reason = `MNSCloud:${backup}`;
     const minutes = Math.ceil(exec.rollbackSeconds / 60);
     const conn = await connectFirst('');
-    let armed = false;
     let armedAt = 0;
-    const setRollback = (isArmed: boolean, pendingReboot: boolean) => {
-      result.rollback = {
-        method: 'scheduled_reload',
-        armed: isArmed,
-        fired: false,
-        pendingReboot,
-      };
+    let confirming = false;
+    let confirmed = false;
+    let lockIdentity: string | null = null;
+    const setRollback = (armed: boolean, pendingReboot: boolean) => {
+      result.rollback = { method: 'scheduled_reload', armed, fired: false, pendingReboot };
+    };
+    setRollback(false, false);
+    const stop = (code: string, message: string) => {
+      conn.end();
+      emit('failed', { code, message });
+    };
+    const remaining = () =>
+      armedAt ? exec.rollbackSeconds * 1000 - (Date.now() - armedAt) - 30000 : Infinity;
+    const budget = (required = 0) => {
+      if (remaining() <= required) throw new ExecFail('DEADLINE');
     };
     try {
       const shell = await openCli(raw(conn), profile);
       const run = async (
         command: string,
         phase: ExecPhase = 'system',
-        answer: 'Y' | 'N' | null = 'N',
+        answer: 'Y' | 'N' = 'N',
         timeout = STEP_TIMEOUT_MS,
       ) => {
-        const r = await runShell(shell, phase, command, timeout, answer, command, profile);
-        const failed = r.run.timedOut || r.run.unexpectedConfirm || profile.error.test(r.output);
-        return { ...r, failed };
+        budget();
+        const started = Date.now();
+        const r = await guard(
+          runInShell(shell, command, Math.min(timeout, remaining()), answer, profile),
+        );
+        const output = shellBody(r, command).replace(/\r/g, '').trim();
+        // Configuration comparisons are proof material, never configuration output for the operator.
+        record(
+          phase,
+          command,
+          r.timedOut ? 124 : null,
+          phase === 'system'
+            ? '[bounded device proof response withheld]'
+            : cleanOutput(redactor, output, r.truncated),
+          r.truncated,
+          Date.now() - started,
+          planOf(phase, command),
+          false,
+        );
+        if (r.closed) throw new ExecFail('CONNECTION_LOST');
+        budget();
+        return {
+          output,
+          complete: !r.timedOut && !r.truncated && !r.unexpectedConfirm,
+          failed: r.timedOut || r.truncated || r.unexpectedConfirm || profile.error.test(output),
+        };
       };
-      const stop = (code: string, message: string) => {
-        conn.end();
-        emit('failed', { code, message });
+      const lock = async (): Promise<boolean> => {
+        const r = await run('do show configuration lock');
+        if (r.failed) return false;
+        const lines = r.output.split('\n').map((line) => line.trim());
+        if (lines.shift() !== 'Parser Configure Lock' || !/^-+$/.test(lines.shift() ?? '')) {
+          return false;
+        }
+        const fields = new Map<string, string>();
+        for (const line of lines) {
+          const m = /^(Owner PID|User|TTY|Type|State|Class|Count|Pending Requests)\s*:\s*(\S+)$/
+            .exec(line);
+          if (!m || fields.has(m[1])) return false;
+          fields.set(m[1], m[2]);
+        }
+        const user = secrets.credential?.username || init.username;
+        if (
+          fields.size !== 8 || fields.get('User') !== user || user === 'unknown' ||
+          fields.get('Type') !== 'EXCLUSIVE' || fields.get('State') !== 'LOCKED' ||
+          fields.get('Class') !== 'EXPOSED' || fields.get('Count') !== '1' ||
+          fields.get('Pending Requests') !== '0' ||
+          !/^[1-9]\d*$/.test(fields.get('Owner PID') ?? '') ||
+          !/^\d+$/.test(fields.get('TTY') ?? '')
+        ) return false;
+        const identity = `${fields.get('Owner PID')}:${fields.get('TTY')}:${user}`;
+        if (lockIdentity && lockIdentity !== identity) return false;
+        lockIdentity = identity;
+        return true;
       };
-      const rolledBack = (code: string, message: string) => {
-        // The device reloads into the saved startup configuration when the timer ends.
-        conn.end();
-        setRollback(true, true);
-        emit('rolled_back', { code, message });
+      const noReload = (r: { failed: boolean; output: string }) =>
+        !r.failed && r.output === 'No reload is scheduled.';
+      const ownedReload = (r: { failed: boolean; output: string }) => {
+        const user = secrets.credential?.username || init.username;
+        const lines = r.output.split('\n');
+        // Narrow supported profile: explicit operator plus unique reason, not merely "scheduled".
+        return !r.failed && lines.length === 2 &&
+          /^Reload scheduled (?:in|for) [A-Za-z0-9 :,().-]+ by [A-Za-z0-9_.@-]+$/.test(lines[0]) &&
+          lines[0].endsWith(` by ${user}`) && lines[1] === `Reload reason: ${reason}`;
       };
-      const cancelReload = async () => {
-        await run('reload cancel');
-        const c = await run('show reload');
-        return !c.failed && /No reload is scheduled/i.test(c.output);
+      const sameConfig = async (left: string, right: string) => {
+        const r = await run(
+          `do show archive config differences ${left} ${right}`,
+          'system',
+          'N',
+          EXPORT_TIMEOUT_MS,
+        );
+        return !r.failed && r.output === 'No changes were found';
       };
-      // Undo what the gateway armed when nothing was applied, else let the timer revert.
-      const abandon = async (code: string, message: string) => {
-        if (await cancelReload()) {
-          armed = false;
-          setRollback(false, false);
-          stop(code, message + ' Nothing was changed.');
-        } else rolledBack(code, message);
+      const backupConfig = async (suffix: string) => {
+        const file = `flash:${backup}-${suffix}.cfg`;
+        const exists = await run(`do dir ${file}`);
+        if (
+          !exists.complete || exists.output !== `%Error opening ${file} (No such file or directory)`
+        ) return false;
+        const copy = await run(`do copy running-config ${file}`, 'system', 'Y', EXPORT_TIMEOUT_MS);
+        return !copy.failed && /\b\d+ bytes copied\b/.test(copy.output) &&
+          await sameConfig(file, 'system:running-config');
       };
-
       if (!/#\s*$/.test(shell.firstPrompt)) {
         stop('PRIVILEGE_REQUIRED', 'Privileged EXEC mode is required; nothing was changed.');
         return;
       }
-      let r = await run('show reload');
-      if (r.failed || !/No reload is scheduled/i.test(r.output)) {
-        stop('RELOAD_PENDING', 'A reload is scheduled or unknown; nothing was changed.');
+      const acquired = await run('configure terminal lock');
+      if (
+        acquired.failed || !acquired.output.includes('Configuration mode locked exclusively.') ||
+        !(await lock())
+      ) {
+        stop(
+          'LOCK_UNPROVEN',
+          'Exclusive configuration ownership is unavailable; nothing was changed.',
+        );
         return;
       }
-      // The reload returns to the startup configuration: it must equal the running one now, and
-      // saving later must not commit anybody else's pending change.
-      r = await run(
-        'show archive config differences nvram:startup-config system:running-config',
-        'system',
-        'N',
-        EXPORT_TIMEOUT_MS,
-      );
-      if (r.failed || !/No changes were found/i.test(r.output)) {
+      if (!noReload(await run('do show reload'))) {
+        stop('RELOAD_PENDING', 'A preexisting reload is pending or unknown; it was not cancelled.');
+        return;
+      }
+      if (!(await sameConfig('nvram:startup-config', 'system:running-config'))) {
         stop(
           'BASELINE_UNSAFE',
-          'The running configuration is not provably saved; nothing was changed.',
+          'Running and startup configurations are not provably equal; nothing was changed.',
         );
         return;
       }
-      r = await run(
-        `copy running-config flash:${backup}-pre.cfg`,
-        'system',
-        'Y',
-        EXPORT_TIMEOUT_MS,
-      );
-      if (r.failed || !/bytes copied/i.test(r.output)) {
-        stop('BACKUP_FAILED', 'The configuration backup failed; nothing was changed.');
-        return;
-      }
-      armedAt = Date.now(); // the delay starts when the device accepts the command
-      r = await run(`reload in ${minutes}`, 'system', 'Y');
-      armed = true;
-      setRollback(true, false);
-      const dirty = /configuration has been modified/i.test(r.output) || r.run.unexpectedConfirm;
-      const shown = await run('show reload');
-      if (r.failed || dirty || shown.failed || !/Reload scheduled/i.test(shown.output)) {
-        await abandon(
-          dirty ? 'BASELINE_CHANGED' : 'SCHEDULE_FAILED',
-          'The rollback reload could not be armed on a saved baseline.',
+      if (!(await backupConfig('pre'))) {
+        stop(
+          'BACKUP_FAILED',
+          'A unique verified baseline backup could not be created; nothing was changed.',
         );
         return;
       }
-      if ((await run('configure terminal')).failed) {
-        await run('end');
-        await abandon('CONFIG_MODE_FAILED', 'Configuration mode could not be entered.');
+      if (!(await lock()) || !noReload(await run('do show reload'))) {
+        stop('LOCK_UNPROVEN', 'Lock or reload state changed before arming; nothing was changed.');
         return;
       }
-      let failed = false;
+      armedAt = Date.now();
+      // Sending a timer request makes its state unknown until the readback proves ownership.
+      setRollback(false, true);
+      const arm = await run(`do reload in ${minutes} ${reason}`, 'system', 'Y');
+      const scheduled = await run('do show reload');
+      const ownsTimer = ownedReload(scheduled);
+      setRollback(ownsTimer, !noReload(scheduled));
+      if (arm.failed || !ownsTimer) {
+        stop(
+          'SCHEDULE_FAILED',
+          'No configuration step ran; reload ownership or arming is unproven.',
+        );
+        return;
+      }
       for (const command of exec.steps) {
-        if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
-          await run('end');
-          rolledBack('DEADLINE', 'The time budget of the change ran out; the device reloads.');
+        if (!(await lock())) {
+          stop('LOCK_LOST', 'Exclusive ownership was lost; reload completion is unverified.');
           return;
         }
         if ((await run(command, 'step')).failed) {
-          failed = true;
-          break;
+          stop(
+            'STEP_FAILED',
+            'A step failed; the owned reload remains pending, restoration is unverified.',
+          );
+          return;
         }
       }
-      const ended = await run('end');
-      if (failed || ended.failed) {
-        rolledBack(
-          'STEP_FAILED',
-          'A step failed; the device reloads into the saved configuration.',
+      if (!(await lock()) || !(await backupConfig('post'))) {
+        stop('BACKUP_FAILED', 'Post-change backup or lock proof failed; reload remains pending.');
+        return;
+      }
+      // The separate SSH connection is read-only; the original stays in configuration mode.
+      budget(VERIFY_TIMEOUT_MS);
+      const verified = await verifyNewSession();
+      budget();
+      if (!verified) {
+        stop('VERIFY_FAILED', 'Fresh-session verification failed; reload remains pending.');
+        return;
+      }
+      if (!(await lock())) {
+        stop('LOCK_LOST', 'Exclusive ownership was lost before confirmation.');
+        return;
+      }
+      if (!ownedReload(await run('do show reload'))) {
+        setRollback(false, true);
+        stop('RELOAD_UNPROVEN', 'The owned timer is no longer provable; it was not cancelled.');
+        return;
+      }
+      // Explicit confirmation boundary. Never infer success from sending cancellation.
+      confirming = true;
+      setRollback(false, true);
+      const cancel = await run('do reload cancel');
+      const afterCancel = await run('do show reload');
+      setRollback(ownedReload(afterCancel), !noReload(afterCancel));
+      if (
+        cancel.failed || !/^\*+\s*\n\*+ --- SHUTDOWN ABORTED ---\s*\n\*+$/.test(cancel.output) ||
+        !noReload(afterCancel)
+      ) {
+        stop(
+          'CANCEL_FAILED',
+          'Reload cancellation outcome is not fully confirmed; no startup save was attempted.',
         );
         return;
       }
-      r = await run(
-        `copy running-config flash:${backup}-post.cfg`,
+      confirmed = true;
+      if (!(await lock())) {
+        stop(
+          'SAVE_FAILED',
+          'Verified running change is confirmed, but lock ownership and persistence are unproven; rollback is unarmed.',
+        );
+        return;
+      }
+      const saved = await run(
+        'do copy running-config startup-config',
         'system',
         'Y',
         EXPORT_TIMEOUT_MS,
       );
-      if (r.failed || !/bytes copied/i.test(r.output)) {
-        rolledBack('BACKUP_FAILED', 'The post-change backup failed; the device reloads.');
-        return;
-      }
-      if (!(await verifyNewSession())) {
-        rolledBack('VERIFY_FAILED', 'The verification failed; the device reloads.');
-        return;
-      }
-      if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
-        rolledBack('DEADLINE', 'The time budget of the change ran out; the device reloads.');
-        return;
-      }
-      // Persist only what the gateway applied: a foreign pending change must not be saved.
-      r = await run(
-        'show archive config differences nvram:startup-config system:running-config',
-        'system',
-        'N',
-        EXPORT_TIMEOUT_MS,
-      );
-      if (r.failed || !diffIsOurs(r.output)) {
-        rolledBack('FOREIGN_CHANGE', 'The configuration holds changes the gateway did not make.');
-        return;
-      }
-      if (!(await cancelReload())) {
-        rolledBack('CANCEL_FAILED', 'The scheduled reload could not be cancelled; it may revert.');
-        return;
-      }
-      armed = false;
-      setRollback(false, false);
-      r = await run('copy running-config startup-config', 'system', 'Y', EXPORT_TIMEOUT_MS);
-      if (r.failed || !/\[OK\]|bytes copied/i.test(r.output)) {
-        stop('SAVE_FAILED', 'The change is running but was not saved; the reload is not armed.');
+      if (
+        saved.failed || !/\[OK\]|\b\d+ bytes copied\b/.test(saved.output) ||
+        !(await lock()) || !(await sameConfig('nvram:startup-config', 'system:running-config'))
+      ) {
+        stop(
+          'SAVE_FAILED',
+          'Verified running change was confirmed but persistence failed or is unproven; rollback is unarmed.',
+        );
         return;
       }
       conn.end();
       emit('applied');
     } catch (error) {
-      if (armed) {
-        // Nothing was confirmed: the pending reload returns the device to the saved configuration.
-        conn.end();
-        setRollback(true, true);
-        if (error instanceof ExecAbort) {
-          emit('rolled_back', {
-            code: 'EXEC_ABORTED',
-            message: 'The request ended before the save.',
-          });
-        } else {
-          emit('rolled_back', {
-            code: 'CONNECTION_LOST',
-            message: 'The connection was lost before the save.',
-          });
-          return;
-        }
-      } else conn.destroy();
-      throw error;
+      conn.destroy();
+      emit('failed', {
+        code: confirmed
+          ? 'SAVE_FAILED'
+          : confirming
+          ? 'CONFIRMATION_UNKNOWN'
+          : error instanceof ExecAbort
+          ? 'EXEC_ABORTED'
+          : error instanceof ExecFail
+          ? error.code
+          : 'CONNECTION_LOST',
+        message: confirmed
+          ? 'Verified running change was confirmed; persistence is unproven and rollback is unarmed.'
+          : 'The operation ended without confirmed completion; timer and restoration require observation.',
+      });
     }
   };
 

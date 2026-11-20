@@ -25,6 +25,16 @@ export interface CliDeviceOptions {
   banner?: string;
   // --- ios
   userMode?: boolean;
+  lockUnsupported?: boolean;
+  lockOutput?: string;
+  loseLockAfterStep?: boolean;
+  unknownBaseline?: boolean;
+  backupCollision?: boolean;
+  saveReadbackMismatch?: boolean;
+  cancelLostAck?: boolean;
+  cancelUnknownAck?: boolean;
+  saveLostAck?: boolean;
+  foreignTimerAfterArm?: boolean;
   dirtyBaseline?: boolean;
   reloadPending?: boolean;
   failBackup?: boolean;
@@ -108,6 +118,8 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
   };
   let junosBefore = [...base];
   let exclusiveOwner: unknown = null;
+  let reloadReason = 'foreign-maintenance';
+  const savedFiles = new Map<string, string[]>();
   const diff = (from: string[], to: string[]) => [
     ...to.filter((l) => !from.includes(l)).map((l) => `+${l}`),
     ...from.filter((l) => !to.includes(l)).map((l) => `-${l}`),
@@ -151,31 +163,66 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
       if (exclusiveOwner === client) exclusiveOwner = null;
     });
 
-    const iosLine = (cmd: string) => {
-      if (mode === 'config') {
+    const iosLine = (input: string) => {
+      const operational = mode === 'config' && input.startsWith('do ');
+      const cmd = operational ? input.slice(3) : input;
+      if (cmd === 'show configuration lock') {
+        if (options.lockOutput) return done(options.lockOutput);
+        return done(
+          `Parser Configure Lock\n------------------------------------------------------------\nOwner PID : 3\nUser : support\nTTY : 1\nType : EXCLUSIVE\nState : ${
+            exclusiveOwner === client ? 'LOCKED' : 'UNLOCKED'
+          }\nClass : EXPOSED\nCount : 1\nPending Requests : 0`,
+        );
+      }
+      if (cmd === 'configure terminal lock') {
+        if (options.lockUnsupported || exclusiveOwner && exclusiveOwner !== client) {
+          return done(IOS_ERR);
+        }
+        exclusiveOwner = client;
+        mode = 'config';
+        device.events.push('lock-acquired');
+        return done(
+          'Configuration mode locked exclusively. The lock will be cleared once you exit out of configuration mode using end/exit\nEnter configuration commands, one per line. End with CNTL/Z.',
+        );
+      }
+      if (mode === 'config' && !operational) {
         if (cmd === 'end') {
           mode = 'exec';
-          if (options.foreignAfterApply) device.running.push('ntp server 203.0.113.9');
+          exclusiveOwner = null;
           return done();
         }
+        if (exclusiveOwner !== client) return done('% Configuration lock lost');
         if (options.badStep && cmd.includes(options.badStep)) return done(IOS_ERR);
         if (cmd === 'no shutdown') device.running = device.running.filter((l) => l !== 'shutdown');
         else device.running.push(cmd);
+        if (options.loseLockAfterStep) exclusiveOwner = null;
         return done();
       }
       if (cmd === 'terminal length 0') return done();
       if (cmd === 'show reload') {
         return done(
           device.reloadScheduled
-            ? 'Reload scheduled in 5 minutes by support'
+            ? `Reload scheduled in 5 minutes by support\nReload reason: ${reloadReason}`
             : 'No reload is scheduled.',
         );
       }
       if (/^show archive config differences/.test(cmd)) {
         if (options.noDiffCommand) return done('% Archive feature is not enabled');
-        const d = diff(device.startup, device.running);
+        if (options.unknownBaseline) return done('No changes were found\nUNKNOWN CONTEXT');
+        const file = /^show archive config differences flash:(\S+)/.exec(cmd)?.[1];
+        const baseline = file ? savedFiles.get(file) : device.startup;
+        if (!baseline) return done('%Error missing backup');
+        const d = diff(baseline, device.running);
         return done(
           d.length ? `!Contextual Config Diffs:\n${d.join('\n')}` : 'No changes were found',
+        );
+      }
+      const directory = /^dir flash:(\S+)$/.exec(cmd);
+      if (directory) {
+        return done(
+          options.backupCollision || savedFiles.has(directory[1])
+            ? 'Directory of flash:/\n123 -rw- 1024 existing-file'
+            : `%Error opening flash:${directory[1]} (No such file or directory)`,
         );
       }
       const copy = /^copy running-config flash:(\S+)$/.exec(cmd);
@@ -184,6 +231,7 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
         return ask(`Destination filename [${copy[1]}]? `, (answer) => {
           device.answers.push(`dest:${answer}`);
           device.files.push(copy[1]);
+          savedFiles.set(copy[1], [...device.running]);
           done('!!\n1024 bytes copied in 0.2 secs (5120 bytes/sec)');
         });
       }
@@ -191,12 +239,16 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
         return ask('Destination filename [startup-config]? ', (answer) => {
           device.answers.push(`dest:${answer}`);
           if (options.failSave) return done('%Error writing nvram: busy');
-          device.startup = [...device.running];
+          device.startup = options.saveReadbackMismatch ? [...base] : [...device.running];
           device.events.push('saved');
+          if (options.saveLostAck) {
+            client.end();
+            return;
+          }
           done('Building configuration...\n[OK]');
         });
       }
-      const reload = /^reload in (\d+)$/.exec(cmd);
+      const reload = /^reload in (\d+)(?: (MNSCloud:[A-Za-z0-9-]+))?$/.exec(cmd);
       if (reload) {
         if (options.refuseReload) return done(IOS_ERR);
         const proceed = () =>
@@ -205,6 +257,7 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
             (a) => {
               device.answers.push(`reload:${a}`);
               device.reloadScheduled = true;
+              reloadReason = options.foreignTimerAfterArm ? 'foreign-maintenance' : reload[2] ?? '';
               device.events.push('reload-armed');
               done();
             },
@@ -223,11 +276,23 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
           device.reloadScheduled = false;
           device.events.push('reload-cancelled');
         }
-        return done('***\n*** --- SHUTDOWN ABORTED ---\n***');
+        if (options.cancelLostAck) {
+          client.end();
+          return;
+        }
+        return done(
+          options.cancelUnknownAck
+            ? 'Unknown acknowledgement'
+            : '***\n*** --- SHUTDOWN ABORTED ---\n***',
+        );
       }
       if (cmd === 'configure terminal') {
         mode = 'config';
         return done('Enter configuration commands, one per line.  End with CNTL/Z.');
+      }
+      if (index > 0 && options.foreignAfterApply) {
+        if (exclusiveOwner) device.events.push('foreign-write-refused');
+        else device.running.push('ntp server 203.0.113.9');
       }
       if (index > 0 && options.failVerify?.test(cmd)) return done(IOS_ERR);
       if (cmd === 'show version') {
