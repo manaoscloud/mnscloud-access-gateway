@@ -5,7 +5,20 @@
 import type { CommandClass } from '../shared/framing.ts';
 import type { ShellDialect } from '../shared/ipc.ts';
 
-export const DIALECTS: readonly ShellDialect[] = ['routeros', 'linux', 'proxmox', 'vrp', 'other'];
+export const DIALECTS: readonly ShellDialect[] = [
+  'routeros',
+  'linux',
+  'proxmox',
+  'vrp',
+  'other',
+  'ios',
+  'junos',
+  'fortios',
+  'bsd',
+  'vsol',
+  'dmos',
+  'windows',
+];
 const CLASSES: readonly CommandClass[] = [
   'read',
   'write_low',

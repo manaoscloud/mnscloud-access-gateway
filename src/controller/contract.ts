@@ -3,7 +3,7 @@
 
 import { parseAddress, parseCidr } from '../shared/ip.ts';
 import { type ExecPayload, ExecPayloadError, parseExecPayload } from '../shared/exec.ts';
-import type { ShellDialect, SupportLevel } from '../shared/ipc.ts';
+import type { DeviceProtocol, ShellDialect, SupportLevel } from '../shared/ipc.ts';
 import { DIALECTS } from '../worker/rules.ts';
 
 export interface GatewayConfig {
@@ -24,7 +24,7 @@ export interface GatewayConfig {
 export interface Assignment {
   connectionUUID: string;
   mode: 'console' | 'test' | 'exec';
-  protocol: 'ssh' | 'routeros_api';
+  protocol: DeviceProtocol;
   path: 'public' | 'connector' | 'mgmt_vpn';
   /**
    * `connector`: the worker has no network; the stream goes through the tenant connector.
@@ -302,7 +302,8 @@ function parseExec(v: Record<string, any>, transport: Assignment['transport']): 
     if (v.exec !== undefined && v.exec !== null) throw new ContractError('Invalid exec');
     return null;
   }
-  if (v.protocol !== 'ssh') throw new ContractError('protocol_refused');
+  // Exec runs over SSH, or over WinRM for the (read-only) Windows dialect; never mixed.
+  if (v.protocol !== 'ssh' && v.protocol !== 'winrm') throw new ContractError('protocol_refused');
   try {
     const exec = parseExecPayload(v.exec, v.shellDialect, v.connectionUUID);
     // A change verifies in a second SSH connection; the connector bridge carries only one.
@@ -328,13 +329,21 @@ export function parseAssignment(value: unknown): Assignment {
   if (v.mode !== 'console' && v.mode !== 'test' && v.mode !== 'exec') {
     throw new ContractError('Invalid mode');
   }
-  if (v.protocol !== 'ssh' && v.protocol !== 'routeros_api') {
+  if (v.protocol !== 'ssh' && v.protocol !== 'routeros_api' && v.protocol !== 'winrm') {
     throw new ContractError('protocol_refused');
   }
   const route = parseRoute(v);
   const address = parseAddress(v.target?.address);
   if (!address) throw new ContractError('Invalid target address');
   if (!DIALECTS.includes(v.shellDialect)) throw new ContractError('Invalid shellDialect');
+  // Windows is reached natively over WinRM only (never routed to SSH), and WinRM speaks only
+  // to the Windows dialect. Plain HTTP (5985) is never used.
+  if ((v.protocol === 'winrm') !== (v.shellDialect === 'windows')) {
+    throw new ContractError('protocol_refused');
+  }
+  if (v.protocol === 'winrm' && v.target?.port === 5985) {
+    throw new ContractError('protocol_refused');
+  }
   if (
     typeof v.username !== 'string' || !v.username || v.username.length > 128 ||
     /[\r\n\0]/.test(v.username)
@@ -352,7 +361,10 @@ export function parseAssignment(value: unknown): Assignment {
     mode: v.mode,
     protocol: v.protocol,
     ...route,
-    target: { address: address.text, port: int(v.target.port, 1, 65535, 'port') },
+    target: {
+      address: address.text,
+      port: int(v.protocol === 'winrm' ? v.target.port ?? 5986 : v.target.port, 1, 65535, 'port'),
+    },
     shellDialect: v.shellDialect,
     username: v.username,
     level: v.level,

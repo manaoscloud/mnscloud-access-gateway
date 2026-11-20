@@ -23,6 +23,7 @@ import { runExec } from './exec.ts';
 import { InputGate } from './input_gate.ts';
 import { Redactor } from './redaction.ts';
 import { connectApiSsl, RouterOsApi, RouterOsApiError } from './routeros_api.ts';
+import { winrmConsole, winrmExec, winrmTest } from './winrm_session.ts';
 import { DIALECTS, loadRules } from './rules.ts';
 import { OutputLimiter, TerminalSanitizer } from './terminal.ts';
 
@@ -30,6 +31,8 @@ import { OutputLimiter, TerminalSanitizer } from './terminal.ts';
 const { Client } = ssh2 as any;
 
 export const REFUSED_PORTS = new Set([23, 8728]);
+/** WinRM over plain HTTP: the credential would travel in clear text. */
+export const WINRM_PLAIN_PORT = 5985;
 const FLUSH_MS = 50;
 
 export interface WorkerIO {
@@ -50,13 +53,21 @@ export function validateInit(value: unknown): WorkerInit {
   const v = value as WorkerInit;
   const ok = v && v.t === 'init' && /^[0-9a-f-]{36}$/.test(v.connectionUUID) &&
     (v.mode === 'console' || v.mode === 'test' || v.mode === 'exec') &&
-    (v.protocol === 'ssh' || v.protocol === 'routeros_api') &&
+    (v.protocol === 'ssh' || v.protocol === 'routeros_api' || v.protocol === 'winrm') &&
     parseAddress(v.target?.address) !== null && Number.isInteger(v.target?.port) &&
     v.target.port >= 1 && v.target.port <= 65535 && DIALECTS.includes(v.shellDialect) &&
     typeof v.username === 'string' && v.username.length <= 128 && !/[\r\n\0]/.test(v.username) &&
     ['n1', 'n2', 'n3'].includes(v.level) && v.terminal && v.limits;
   if (!ok) throw new WorkerExit('refused', 'invalid_assignment');
   if (REFUSED_PORTS.has(v.target.port)) throw new WorkerExit('refused', 'protocol_refused');
+  // Windows is native WinRM over HTTPS only: never SSH, never plain HTTP, and WinRM never serves
+  // another dialect.
+  if ((v.protocol === 'winrm') !== (v.shellDialect === 'windows')) {
+    throw new WorkerExit('refused', 'protocol_refused');
+  }
+  if (v.protocol === 'winrm' && v.target.port === WINRM_PLAIN_PORT) {
+    throw new WorkerExit('refused', 'protocol_refused');
+  }
   if (
     v.transport === 'connector'
       ? !validBridgePath(v.bridge) || !/^[0-9a-f]{64}$/.test(String(v.bridgeSecret))
@@ -70,7 +81,7 @@ export function validateInit(value: unknown): WorkerInit {
   if (v.mode === 'exec') {
     // The sha256 is recomputed here too: the worker trusts nothing it did not check.
     try {
-      if (v.protocol !== 'ssh') throw new Error('protocol');
+      if (v.protocol !== 'ssh' && v.protocol !== 'winrm') throw new Error('protocol');
       v.exec = parseExecPayload(v.exec, v.shellDialect, v.connectionUUID);
     } catch {
       throw new WorkerExit('refused', 'invalid_assignment');
@@ -222,7 +233,29 @@ export async function runWorker(io: WorkerIO): Promise<Exit> {
 
   {
     let exit: Exit;
-    if (init.mode === 'exec') {
+    if (init.protocol === 'winrm') {
+      const winrm = {
+        init,
+        rules,
+        redactor,
+        verifyKey,
+        requestCredential: () => requestCredential(),
+        send: (message: WorkerToController) => io.send(message),
+        control,
+        finish,
+        onClose: (handler: (reason: string) => void) => mailbox.onClose(handler),
+        onMessage: (handler: (message: ControllerToWorker) => void) => mailbox.onMessage(handler),
+        counters: {
+          in: (n: number) => (bytesIn += n),
+          out: (n: number) => (bytesOut += n),
+        },
+      };
+      exit = init.mode === 'test'
+        ? await winrmTest(winrm)
+        : init.mode === 'exec'
+        ? await winrmExec(winrm)
+        : await winrmConsole(winrm);
+    } else if (init.mode === 'exec') {
       exit = await runExec({
         init,
         rules,

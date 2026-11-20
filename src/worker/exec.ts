@@ -19,12 +19,18 @@ import {
 import type { CommandClass } from '../shared/framing.ts';
 import type {
   CredentialRole,
+  ShellDialect,
   WorkerCredential,
   WorkerInit,
   WorkerToController,
 } from '../shared/ipc.ts';
 import { Classifier } from './classifier.ts';
-import { deadlineExceeded, disarmsRollback, readProblem } from './exec_policy.ts';
+import {
+  changeGrammarProblem,
+  deadlineExceeded,
+  disarmsRollback,
+  readProblem,
+} from './exec_policy.ts';
 import { decide } from './policy.ts';
 import { type Redactor, stripAnsi } from './redaction.ts';
 import type { DialectRules } from './rules.ts';
@@ -102,6 +108,77 @@ const VRP_PROMPT = /(?:^|\n)[<[][^\s<>[\]]{1,64}[>\]]\s*$/;
 const PAGER = /-- \[Q quit\|D dump\|down\]/;
 const YES_NO = /\[Y\/N\]\s*:?\s*$/i;
 
+/**
+ * Prompt, error, pager and confirmation shapes of the prompt-driven CLIs of the second wave. A
+ * pattern that does not match fails closed: no prompt means PROMPT_TIMEOUT, an error pattern in
+ * the output of a command means the command failed, an unexpected confirmation is declined.
+ */
+interface CliProfile {
+  prompt: RegExp;
+  error: RegExp;
+  /** Session-only commands that switch the pager off (best effort, never a configuration). */
+  setup: string[];
+  pager: RegExp | null;
+  confirm: RegExp;
+  /** Text typed for a question the gateway accepts (`accept`) or declines. */
+  reply(question: string, accept: boolean): string;
+}
+
+const IOS_PROMPT = /(?:^|\n)[A-Za-z0-9._/:-]{1,64}(?:\([A-Za-z0-9._ /:-]{1,40}\))?[>#]\s*$/;
+const MORE = /--More--|<--- More --->/;
+
+export const CLI: Partial<Record<ShellDialect, CliProfile>> = {
+  ios: {
+    prompt: IOS_PROMPT,
+    error:
+      /^\s*%\s*(?:Invalid|Incomplete|Ambiguous|Unrecognized|Unknown|Bad |Error|Cannot|Command rejected|Access denied|Authorization|Duplicate|Overlaps|Please|Not |No such|Illegal|Failed)/im,
+    setup: ['terminal length 0'],
+    pager: MORE,
+    confirm:
+      /(?:\[confirm\]|\[yes\/no\]:?|\[y\/n\]:?|\(y\/n\)\??|Destination filename \[[^\]\r\n]*\]\?)\s*$/i,
+    reply: (question, accept) => {
+      // Never save (it would commit foreign changes) and never overwrite a file.
+      if (/\bSave\?/i.test(question) || /over ?write/i.test(question)) return 'no';
+      if (/\[confirm\]|Destination filename/i.test(question)) return accept ? '' : 'n';
+      return accept ? 'yes' : 'no';
+    },
+  },
+  junos: {
+    prompt: /(?:^|\n)[A-Za-z0-9._-]{1,64}@[A-Za-z0-9._-]{1,64}[>#]\s*$/,
+    error:
+      /^(?:error:|\s*syntax error|\s*unknown command|\s*missing argument|\s*invalid |\s*unrecognized|\s*warning: statement not found|\s*commit failed)/im,
+    setup: ['set cli screen-length 0'],
+    pager: MORE,
+    confirm: /\[yes,no\]\s*$/i,
+    reply: (_question, accept) => accept ? 'yes' : 'no',
+  },
+  fortios: {
+    prompt: /(?:^|\n)[A-Za-z0-9._-]{1,64}(?: \([A-Za-z0-9._ -]{1,40}\))? [#$]\s*$/,
+    error:
+      /(?:Unknown action|Command fail|command parse error|Parsing error|value parse error|node_check_object fail|Return code -?\d+)/i,
+    setup: [],
+    pager: MORE,
+    confirm: /\(y\/n\)\s*$/i,
+    reply: (_question, accept) => accept ? 'y' : 'n',
+  },
+  vsol: {
+    prompt: IOS_PROMPT,
+    error: /^\s*(?:%|Error|Invalid|Unknown command|Incomplete|Ambiguous|Unrecognized)/im,
+    setup: [],
+    pager: MORE,
+    confirm: /\[(?:y\/n|yes\/no|confirm)\]:?\s*$/i,
+    reply: (_question, accept) => accept ? 'y' : 'n',
+  },
+  dmos: {
+    prompt: IOS_PROMPT,
+    error: /^\s*(?:syntax error|Error:|%|unknown command|-+\^)/im,
+    setup: [],
+    pager: MORE,
+    confirm: /\[(?:yes,no|y\/n|yes\/no)\]:?\s*$/i,
+    reply: (_question, accept) => accept ? 'yes' : 'no',
+  },
+};
+
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -110,6 +187,16 @@ const lastLineOf = (text: string) => text.slice(text.lastIndexOf('\n') + 1);
 
 // ---------------------------------------------------------------------------------------------
 // Pre-classification
+
+/** Dialects with a proven automatic change (vendor rollback); every other one is read only. */
+export const CHANGE_DIALECTS: readonly ShellDialect[] = [
+  'routeros',
+  'vrp',
+  'linux',
+  'proxmox',
+  'ios',
+  'junos',
+];
 
 export interface PlannedCommand {
   phase: ExecPhase;
@@ -146,6 +233,7 @@ export function planExec(
       const c = classifier.classify(command);
       classifier.commit(c);
       let allowed: boolean;
+      let rule = c.rule;
       if (mode === 'read') {
         allowed = c.class === 'read' && !c.unknown &&
           readProblem(rules.dialect, command, c.rule) === null;
@@ -153,11 +241,14 @@ export function planExec(
         allowed = false;
       } else if (disarmsRollback(rules.dialect, command, c.rule)) {
         allowed = false;
+      } else if (changeGrammarProblem(rules.dialect, command) !== null) {
+        // ios and junos: a flat, explicit grammar (no save, commit, reboot, shell or auth).
+        allowed = false;
+        rule = 'change_grammar';
       } else {
         const decision = decide(level, c.class);
         allowed = decision === 'allow' || decision === 'confirm';
       }
-      let rule = c.rule;
       // Autonomous runbook step: only read and write_low, never an unknown line.
       if (allowed && autonomous && !(c.class === 'read' || c.class === 'write_low')) {
         allowed = false;
@@ -173,6 +264,17 @@ export function planExec(
       });
     }
   };
+  if (exec.kind !== 'read' && !CHANGE_DIALECTS.includes(rules.dialect)) {
+    // fortios, bsd, vsol, dmos and windows have no automatic change (no proven rollback).
+    items.push({
+      phase: 'system',
+      command: 'automatic change',
+      class: 'write_risky',
+      rule: 'change_unsupported',
+      unknown: false,
+      verdict: 'blocked',
+    });
+  }
   if (exec.kind === 'read') {
     classify(exec.steps, 'step', 'read', false);
   } else if (exec.kind === 'rotate') {
@@ -201,13 +303,19 @@ export function planExec(
 // Output hygiene
 
 /** Redacted, ANSI-free, capped text of a device output. */
-function cleanOutput(redactor: Redactor, raw: string, truncated: boolean): string {
+export function cleanOutput(redactor: Redactor, raw: string, truncated: boolean): string {
   let text = raw;
   // A cut output loses its last (possibly partial) line before redaction: no secret half.
   if (truncated) text = text.slice(0, text.lastIndexOf('\n') + 1);
   const safe = new TerminalSanitizer().push(text);
   const plain = stripAnsi(safe).text.replace(/\r\n/g, '\n').replace(/\r/g, '');
-  return redactor.redactText(plain.replace(/-- \[Q quit\|D dump\|down\]\s*/g, ''));
+  return redactor.redactText(
+    plain.replace(/-- \[Q quit\|D dump\|down\]\s*/g, '').replace(
+      // deno-lint-ignore no-control-regex
+      /(?: *--More-- *| *<--- More ---> *)[\x08 \r]*/g,
+      '',
+    ),
+  );
 }
 
 /** Shrinks outputs until the serialized result fits the IPC line and the API body cap. */
@@ -307,9 +415,15 @@ class Shell {
   #waiter: (() => void) | null = null;
   #pagerAnswered = false;
   closed = false;
+  /** The prompt line seen when the shell became ready (privilege level, mode). */
+  firstPrompt = '';
 
-  // deno-lint-ignore no-explicit-any
-  constructor(private readonly stream: any, readonly promptOf: (line: string) => boolean) {
+  constructor(
+    // deno-lint-ignore no-explicit-any
+    private readonly stream: any,
+    readonly promptOf: (line: string) => boolean,
+    private readonly pager: { test: RegExp; reply: string } = { test: PAGER, reply: 'D' },
+  ) {
     const onData = (chunk: Uint8Array) => this.#push(chunk);
     stream.on('data', onData);
     stream.stderr?.on('data', onData);
@@ -325,8 +439,8 @@ class Shell {
     else this.#truncated = true;
     this.#tail = (this.#tail + text).slice(-4096);
     // RouterOS pager: ask for the rest of the output at once instead of paging.
-    const paged = PAGER.test(lastLineOf(this.#view()));
-    if (paged && !this.#pagerAnswered) this.stream.write('D');
+    const paged = this.pager.test.test(lastLineOf(this.#view()));
+    if (paged && !this.#pagerAnswered) this.stream.write(this.pager.reply);
     this.#pagerAnswered = paged;
     this.#waiter?.();
   }
@@ -398,11 +512,22 @@ export interface ShellRun {
 }
 
 /** Sends `command`, answers `[Y/N]` questions as told, and returns the output up to the prompt. */
+interface ShellOptions {
+  confirm: RegExp;
+  reply(question: string, accept: boolean): string;
+}
+
+const defaultShellOptions: ShellOptions = {
+  confirm: YES_NO,
+  reply: (_question, accept) => accept ? 'Y' : 'N',
+};
+
 async function runInShell(
   shell: Shell,
   command: string,
   timeoutMs: number,
   answer: 'Y' | 'N' | null,
+  options: ShellOptions = defaultShellOptions,
 ): Promise<ShellRun> {
   shell.take();
   shell.send(command + '\r');
@@ -410,7 +535,7 @@ async function runInShell(
   let truncated = false;
   let unexpectedConfirm = false;
   const deadline = Date.now() + timeoutMs;
-  const atEnd = (view: string) => shell.atPrompt(view) || YES_NO.test(lastLineOf(view));
+  const atEnd = (view: string) => shell.atPrompt(view) || options.confirm.test(lastLineOf(view));
   for (;;) {
     const view = await shell.waitFor(atEnd, Math.max(1, deadline - Date.now()));
     const part = shell.take();
@@ -425,11 +550,15 @@ async function runInShell(
         closed: shell.closed,
       };
     }
-    if (!shell.atPrompt(view) && YES_NO.test(lastLineOf(view))) {
-      if (answer === 'Y') shell.send('Y\r');
+    if (!shell.atPrompt(view) && options.confirm.test(lastLineOf(view))) {
+      const question = lastLineOf(view);
+      // The question text decides: a prompt that must never be accepted (save, overwrite) is
+      // declined even when the caller accepts questions.
+      const text = options.reply(question, answer === 'Y');
+      if (answer === 'Y' && text !== options.reply(question, false)) shell.send(text + '\r');
       else {
         unexpectedConfirm = true;
-        shell.send('N\r');
+        shell.send(options.reply(question, false) + '\r');
       }
       continue;
     }
@@ -717,6 +846,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     client: any,
     prompt: (line: string) => boolean,
     cols = 500,
+    pager?: RegExp | null,
   ): Promise<Shell> =>
     new Promise((resolve, reject) => {
       client.shell(
@@ -724,10 +854,27 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         // deno-lint-ignore no-explicit-any
         (error: Error | undefined, stream: any) => {
           if (error || !stream) reject(new ExecFail('SHELL_REFUSED', 'failed', 'shell_refused'));
-          else resolve(new Shell(stream, prompt));
+          else resolve(new Shell(stream, prompt, pager ? { test: pager, reply: ' ' } : undefined));
         },
       );
     });
+
+  /** A shell of a second-wave CLI at its first prompt, with the pager switched off. */
+  const openCli = async (client: unknown, profile: CliProfile): Promise<Shell> => {
+    const shell = await openShell(
+      client,
+      (view) => profile.prompt.test('\n' + lastLineOf(view)),
+      500,
+      profile.pager,
+    );
+    const first = await guard(shell.waitPrompt(PROMPT_TIMEOUT_MS));
+    if (!first) throw new ExecFail('PROMPT_TIMEOUT');
+    shell.firstPrompt = lastLineOf(first).trim();
+    for (const command of profile.setup) {
+      await runInShell(shell, command, COMMAND_TIMEOUT_MS, null, profile);
+    }
+    return shell;
+  };
 
   /** One command over an exec channel, recorded. */
   const runChannel = async (
@@ -762,9 +909,10 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     timeoutMs: number,
     answer: 'Y' | 'N' | null,
     display = command,
+    options?: ShellOptions,
   ) => {
     const started = Date.now();
-    const run = await guard(runInShell(shell, command, timeoutMs, answer));
+    const run = await guard(runInShell(shell, command, timeoutMs, answer, options));
     let output = cleanOutput(redactor, shellBody(run, command), run.truncated);
     let truncated = run.truncated;
     if (output.length > OUTPUT_CAP_BYTES) {
@@ -825,6 +973,23 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         for (const command of exec.verify) {
           const { run, output } = await runShell(shell, 'verify', command, COMMAND_TIMEOUT_MS, 'N');
           if (run.timedOut || run.unexpectedConfirm || VRP_ERROR.test(output)) return false;
+        }
+        return true;
+      }
+      const profile = CLI[dialect];
+      if (profile) {
+        const shell = await openCli(client, profile);
+        for (const command of exec.verify) {
+          const { run, output } = await runShell(
+            shell,
+            'verify',
+            command,
+            COMMAND_TIMEOUT_MS,
+            'N',
+            command,
+            profile,
+          );
+          if (run.timedOut || run.unexpectedConfirm || profile.error.test(output)) return false;
         }
         return true;
       }
@@ -1701,16 +1866,453 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
     }
   };
 
+  // --- second wave: read flows ----------------------------------------------------------------
+
+  /** Reads on a prompt-driven CLI (ios, junos, fortios, vsol, dmos): one command at a time. */
+  const readCli = async () => {
+    const profile = CLI[dialect]!;
+    const conn = await connectFirst('');
+    const shell = await openCli(raw(conn), profile);
+    for (const command of exec.steps) {
+      const { run, output } = await runShell(
+        shell,
+        'step',
+        command,
+        COMMAND_TIMEOUT_MS,
+        'N',
+        command,
+        profile,
+      );
+      const problem = run.timedOut
+        ? { code: 'COMMAND_TIMEOUT', message: 'A command did not return to the prompt.' }
+        : run.unexpectedConfirm
+        ? { code: 'UNEXPECTED_CONFIRMATION', message: 'The device asked for a confirmation.' }
+        : profile.error.test(output)
+        ? { code: 'DEVICE_ERROR', message: 'The device refused a command.' }
+        : null;
+      if (problem) {
+        // Fail closed: stop at the first problem, never run the rest on a confused prompt.
+        conn.destroy();
+        emit('failed', problem);
+        return;
+      }
+    }
+    conn.end();
+    emit('ok');
+  };
+
+  /** BSD (POSIX exec channels): a non-zero exit status or a timeout ends the request. */
+  const readBsd = async () => {
+    const conn = await connectFirst('');
+    const client = raw(conn);
+    for (const command of exec.steps) {
+      const r = await runChannel(client, 'step', command);
+      if (r.exitCode !== 0) {
+        conn.destroy();
+        emit('failed', {
+          code: r.exitCode === 124 ? 'COMMAND_TIMEOUT' : 'COMMAND_FAILED',
+          message: 'A command did not finish successfully.',
+        });
+        return;
+      }
+    }
+    conn.end();
+    emit('ok');
+  };
+
+  // --- Cisco IOS / IOS-XE: `reload in` ---------------------------------------------------------
+
+  /** True when the IOS configuration diff holds only lines the steps explain (fail closed). */
+  const diffIsOurs = (output: string): boolean => {
+    const ours = new Set(exec.steps.map((step) => step.trim()));
+    const words = new Set(exec.steps.map((step) => step.trim().replace(/^no /, '').split(' ')[0]));
+    for (const line of output.replace(/\r/g, '').split('\n')) {
+      const m = /^([+-])(.*)$/.exec(line);
+      const text = m?.[2].trim();
+      if (!m || !text) continue;
+      if (m[1] === '+' ? !ours.has(text) : !words.has(text.replace(/^no /, '').split(' ')[0])) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const iosChange = async () => {
+    const profile = CLI.ios!;
+    const backup = exec.backupName!;
+    const minutes = Math.ceil(exec.rollbackSeconds / 60);
+    const conn = await connectFirst('');
+    let armed = false;
+    let armedAt = 0;
+    const setRollback = (isArmed: boolean, pendingReboot: boolean) => {
+      result.rollback = {
+        method: 'scheduled_reload',
+        armed: isArmed,
+        fired: false,
+        pendingReboot,
+      };
+    };
+    try {
+      const shell = await openCli(raw(conn), profile);
+      const run = async (
+        command: string,
+        phase: ExecPhase = 'system',
+        answer: 'Y' | 'N' | null = 'N',
+        timeout = STEP_TIMEOUT_MS,
+      ) => {
+        const r = await runShell(shell, phase, command, timeout, answer, command, profile);
+        const failed = r.run.timedOut || r.run.unexpectedConfirm || profile.error.test(r.output);
+        return { ...r, failed };
+      };
+      const stop = (code: string, message: string) => {
+        conn.end();
+        emit('failed', { code, message });
+      };
+      const rolledBack = (code: string, message: string) => {
+        // The device reloads into the saved startup configuration when the timer ends.
+        conn.end();
+        setRollback(true, true);
+        emit('rolled_back', { code, message });
+      };
+      const cancelReload = async () => {
+        await run('reload cancel');
+        const c = await run('show reload');
+        return !c.failed && /No reload is scheduled/i.test(c.output);
+      };
+      // Undo what the gateway armed when nothing was applied, else let the timer revert.
+      const abandon = async (code: string, message: string) => {
+        if (await cancelReload()) {
+          armed = false;
+          setRollback(false, false);
+          stop(code, message + ' Nothing was changed.');
+        } else rolledBack(code, message);
+      };
+
+      if (!/#\s*$/.test(shell.firstPrompt)) {
+        stop('PRIVILEGE_REQUIRED', 'Privileged EXEC mode is required; nothing was changed.');
+        return;
+      }
+      let r = await run('show reload');
+      if (r.failed || !/No reload is scheduled/i.test(r.output)) {
+        stop('RELOAD_PENDING', 'A reload is scheduled or unknown; nothing was changed.');
+        return;
+      }
+      // The reload returns to the startup configuration: it must equal the running one now, and
+      // saving later must not commit anybody else's pending change.
+      r = await run(
+        'show archive config differences nvram:startup-config system:running-config',
+        'system',
+        'N',
+        EXPORT_TIMEOUT_MS,
+      );
+      if (r.failed || !/No changes were found/i.test(r.output)) {
+        stop(
+          'BASELINE_UNSAFE',
+          'The running configuration is not provably saved; nothing was changed.',
+        );
+        return;
+      }
+      r = await run(
+        `copy running-config flash:${backup}-pre.cfg`,
+        'system',
+        'Y',
+        EXPORT_TIMEOUT_MS,
+      );
+      if (r.failed || !/bytes copied/i.test(r.output)) {
+        stop('BACKUP_FAILED', 'The configuration backup failed; nothing was changed.');
+        return;
+      }
+      armedAt = Date.now(); // the delay starts when the device accepts the command
+      r = await run(`reload in ${minutes}`, 'system', 'Y');
+      armed = true;
+      setRollback(true, false);
+      const dirty = /configuration has been modified/i.test(r.output) || r.run.unexpectedConfirm;
+      const shown = await run('show reload');
+      if (r.failed || dirty || shown.failed || !/Reload scheduled/i.test(shown.output)) {
+        await abandon(
+          dirty ? 'BASELINE_CHANGED' : 'SCHEDULE_FAILED',
+          'The rollback reload could not be armed on a saved baseline.',
+        );
+        return;
+      }
+      if ((await run('configure terminal')).failed) {
+        await run('end');
+        await abandon('CONFIG_MODE_FAILED', 'Configuration mode could not be entered.');
+        return;
+      }
+      let failed = false;
+      for (const command of exec.steps) {
+        if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+          await run('end');
+          rolledBack('DEADLINE', 'The time budget of the change ran out; the device reloads.');
+          return;
+        }
+        if ((await run(command, 'step')).failed) {
+          failed = true;
+          break;
+        }
+      }
+      const ended = await run('end');
+      if (failed || ended.failed) {
+        rolledBack(
+          'STEP_FAILED',
+          'A step failed; the device reloads into the saved configuration.',
+        );
+        return;
+      }
+      r = await run(
+        `copy running-config flash:${backup}-post.cfg`,
+        'system',
+        'Y',
+        EXPORT_TIMEOUT_MS,
+      );
+      if (r.failed || !/bytes copied/i.test(r.output)) {
+        rolledBack('BACKUP_FAILED', 'The post-change backup failed; the device reloads.');
+        return;
+      }
+      if (!(await verifyNewSession())) {
+        rolledBack('VERIFY_FAILED', 'The verification failed; the device reloads.');
+        return;
+      }
+      if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+        rolledBack('DEADLINE', 'The time budget of the change ran out; the device reloads.');
+        return;
+      }
+      // Persist only what the gateway applied: a foreign pending change must not be saved.
+      r = await run(
+        'show archive config differences nvram:startup-config system:running-config',
+        'system',
+        'N',
+        EXPORT_TIMEOUT_MS,
+      );
+      if (r.failed || !diffIsOurs(r.output)) {
+        rolledBack('FOREIGN_CHANGE', 'The configuration holds changes the gateway did not make.');
+        return;
+      }
+      if (!(await cancelReload())) {
+        rolledBack('CANCEL_FAILED', 'The scheduled reload could not be cancelled; it may revert.');
+        return;
+      }
+      armed = false;
+      setRollback(false, false);
+      r = await run('copy running-config startup-config', 'system', 'Y', EXPORT_TIMEOUT_MS);
+      if (r.failed || !/\[OK\]|bytes copied/i.test(r.output)) {
+        stop('SAVE_FAILED', 'The change is running but was not saved; the reload is not armed.');
+        return;
+      }
+      conn.end();
+      emit('applied');
+    } catch (error) {
+      if (armed) {
+        // Nothing was confirmed: the pending reload returns the device to the saved configuration.
+        conn.end();
+        setRollback(true, true);
+        if (error instanceof ExecAbort) {
+          emit('rolled_back', {
+            code: 'EXEC_ABORTED',
+            message: 'The request ended before the save.',
+          });
+        } else {
+          emit('rolled_back', {
+            code: 'CONNECTION_LOST',
+            message: 'The connection was lost before the save.',
+          });
+          return;
+        }
+      } else conn.destroy();
+      throw error;
+    }
+  };
+
+  // --- Juniper Junos: exclusive candidate and `commit confirmed` -------------------------------
+
+  const junosChange = async () => {
+    const profile = CLI.junos!;
+    const backup = exec.backupName!;
+    const minutes = Math.ceil(exec.rollbackSeconds / 60);
+    const conn = await connectFirst('');
+    let armed = false;
+    let armedAt = 0;
+    const setRollback = (isArmed: boolean, fired = false) => {
+      result.rollback = {
+        method: 'confirmed_commit',
+        armed: isArmed,
+        fired,
+        pendingReboot: false,
+      };
+    };
+    try {
+      const shell = await openCli(raw(conn), profile);
+      const run = async (
+        command: string,
+        phase: ExecPhase = 'system',
+        answer: 'Y' | 'N' | null = 'N',
+        timeout = STEP_TIMEOUT_MS,
+      ) => {
+        const r = await runShell(shell, phase, command, timeout, answer, command, profile);
+        const failed = r.run.timedOut || r.run.unexpectedConfirm || profile.error.test(r.output);
+        return { ...r, failed };
+      };
+      const stop = (code: string, message: string) => {
+        conn.end();
+        emit('failed', { code, message });
+      };
+      /** Leaves configuration mode discarding the candidate (our own exclusive copy). */
+      const discard = async () => {
+        await run('rollback 0');
+        await run('exit configuration-mode', 'system', 'Y');
+      };
+      const pendingTimer = (output: string) => /rollback in \d+ ?mins?/i.test(output);
+      const complete = (output: string) => /commit complete/i.test(output);
+      const wrote = (output: string) => /Wrote \d+ lines? of configuration/i.test(output);
+
+      if (!/>\s*$/.test(shell.firstPrompt)) {
+        stop('PROMPT_UNSUPPORTED', 'Operational CLI mode is required; nothing was changed.');
+        return;
+      }
+      // A confirmed commit of somebody else is pending: our confirmation would confirm it too.
+      let r = await run('show system commit');
+      if (r.failed || pendingTimer(r.output)) {
+        stop('COMMIT_PENDING', 'A confirmed commit is pending or unknown; nothing was changed.');
+        return;
+      }
+      r = await run('configure exclusive');
+      if (r.failed || !/Entering configuration mode/i.test(r.output)) {
+        stop(
+          'CONFIG_LOCKED',
+          'The exclusive configuration lock was not obtained; nothing was changed.',
+        );
+        return;
+      }
+      // The exclusive candidate must be the committed configuration: nobody else's edits.
+      r = await run('show | compare');
+      const diff = r.output.split('\n').map((l) => l.trim()).filter((l) => l && l !== '[edit]');
+      if (r.failed || diff.length) {
+        await discard();
+        stop('CANDIDATE_DIRTY', 'The candidate holds other changes; nothing was changed.');
+        return;
+      }
+      r = await run(`save /var/tmp/${backup}-pre.conf`, 'system', 'N', EXPORT_TIMEOUT_MS);
+      if (r.failed || !wrote(r.output)) {
+        await discard();
+        stop('BACKUP_FAILED', 'The configuration backup failed; nothing was changed.');
+        return;
+      }
+      for (const command of exec.steps) {
+        if ((await run(command, 'step')).failed) {
+          await discard();
+          stop('STEP_FAILED', 'A step failed; the candidate was discarded, nothing was committed.');
+          return;
+        }
+      }
+      r = await run('show | compare');
+      if (r.failed || !r.output.split('\n').some((l) => /^[+-]/.test(l.trim()))) {
+        await discard();
+        stop('NO_CHANGE', 'The steps changed nothing; nothing was committed.');
+        return;
+      }
+      r = await run(`save /var/tmp/${backup}-post.conf`, 'system', 'N', EXPORT_TIMEOUT_MS);
+      if (r.failed || !wrote(r.output)) {
+        await discard();
+        stop('BACKUP_FAILED', 'The post-change backup failed; nothing was committed.');
+        return;
+      }
+      r = await run('commit check', 'system', 'N', EXPORT_TIMEOUT_MS);
+      if (r.failed || !/configuration check succeeds/i.test(r.output)) {
+        await discard();
+        stop('COMMIT_CHECK_FAILED', 'The commit check failed; nothing was committed.');
+        return;
+      }
+      armedAt = Date.now();
+      armed = true; // from here on the device may have the confirmed commit pending
+      setRollback(true);
+      r = await run(`commit confirmed ${minutes}`, 'system', 'N', EXPORT_TIMEOUT_MS);
+      if (r.failed || !complete(r.output)) {
+        // Unknown outcome: if it went through, the device rolls back by itself.
+        stop(
+          'COMMIT_UNKNOWN',
+          'The confirmed commit did not answer cleanly; the timer reverts it.',
+        );
+        return;
+      }
+      /** Reverts at once with the previous commit when possible; the timer stays the fallback. */
+      const revertNow = async (code: string, message: string) => {
+        const back = await run('rollback 1');
+        const done = back.failed ? null : await run('commit', 'system', 'N', EXPORT_TIMEOUT_MS);
+        if (done && !done.failed && complete(done.output)) {
+          armed = false;
+          setRollback(false, true);
+          await run('exit configuration-mode', 'system', 'Y');
+          conn.end();
+          emit('rolled_back', { code, message: message + ' The previous configuration is back.' });
+          return;
+        }
+        conn.end();
+        setRollback(true);
+        emit('rolled_back', { code, message: message + ' The timer reverts the change.' });
+      };
+      if (!(await verifyNewSession())) {
+        await revertNow('VERIFY_FAILED', 'The verification failed.');
+        return;
+      }
+      if (deadlineExceeded(armedAt, Date.now(), exec.rollbackSeconds)) {
+        await revertNow('DEADLINE', 'The time budget of the change ran out.');
+        return;
+      }
+      // Confirm in the original exclusive context: the same candidate, the same lock.
+      r = await run('commit', 'system', 'N', EXPORT_TIMEOUT_MS);
+      // Still in configuration mode: `run` executes the operational command.
+      const check = r.failed ? null : await run('run show system commit');
+      if (r.failed || !complete(r.output) || !check || check.failed || pendingTimer(check.output)) {
+        stop('CONFIRM_FAILED', 'The commit was not confirmed; the timer reverts the change.');
+        return;
+      }
+      armed = false;
+      setRollback(false);
+      await run('exit configuration-mode', 'system', 'Y');
+      conn.end();
+      emit('applied');
+    } catch (error) {
+      if (armed) {
+        // The confirmed commit reverts by itself when its timer ends: no further action needed.
+        conn.destroy();
+        setRollback(true);
+        emit('failed', {
+          code: error instanceof ExecAbort ? 'EXEC_ABORTED' : 'CONNECTION_LOST',
+          message: 'The request ended before the confirmation; the timer reverts the change.',
+        });
+        if (error instanceof ExecAbort) throw error;
+        return;
+      }
+      conn.destroy();
+      throw error;
+    }
+  };
+
   // --- dispatch --------------------------------------------------------------------------------
 
   let finish: Exit | null = null;
   try {
+    if (rotation && !['routeros', 'vrp', 'linux', 'proxmox'].includes(dialect)) {
+      // No rotation template exists for the other dialects: refuse, never approximate.
+      throw new ExecFail('ROTATION_UNSUPPORTED');
+    }
     if (exec.kind === 'read') {
       if (dialect === 'vrp') await readShell();
-      else await readExecChannel();
-    } else if (exec.safeChange === 'routeros_safe_mode') await routerosChange();
-    else if (exec.safeChange === 'vrp5_schedule_reboot') await vrpChange();
-    else await linuxChange();
+      else if (CLI[dialect]) await readCli();
+      else if (dialect === 'bsd') await readBsd();
+      else if (dialect === 'routeros' || dialect === 'linux' || dialect === 'proxmox') {
+        await readExecChannel();
+      } else throw new ExecFail('DIALECT_UNSUPPORTED');
+    } else if (exec.safeChange === 'routeros_safe_mode' && dialect === 'routeros') {
+      await routerosChange();
+    } else if (exec.safeChange === 'vrp5_schedule_reboot' && dialect === 'vrp') await vrpChange();
+    else if (
+      exec.safeChange === 'systemd_deadman' && (dialect === 'linux' || dialect === 'proxmox')
+    ) await linuxChange();
+    else if (exec.safeChange === 'reload_in' && dialect === 'ios') await iosChange();
+    else if (exec.safeChange === 'commit_confirmed' && dialect === 'junos') await junosChange();
+    else throw new ExecFail('CHANGE_UNSUPPORTED');
     await settle();
     finish = h.finish('closed', 'exec_done');
   } catch (error) {

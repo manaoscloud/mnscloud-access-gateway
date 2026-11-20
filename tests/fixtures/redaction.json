@@ -1,24 +1,39 @@
 {
   "routeros": [
-    ["/ppp secret add name=u1 password=Sup3rS3cret! service=pppoe\r\n", "Sup3rS3cret!"],
+    [
+      "/ppp secret add name=u1 password=Sup3rS3cret! service=pppoe\r\n",
+      "Sup3rS3cret!"
+    ],
     [
       "set [ find default-name=wlan1 ] wpa2-pre-shared-key=\"wifi pass 123\" ssid=x\r\n",
       "wifi pass 123"
     ],
-    ["/ip ipsec identity add peer=p1 secret=ipsecS3cret\r\n", "ipsecS3cret"],
-    ["/radius add address=192.0.2.9 secret=radSecret99 service=ppp\r\n", "radSecret99"],
+    [
+      "/ip ipsec identity add peer=p1 secret=ipsecS3cret\r\n",
+      "ipsecS3cret"
+    ],
+    [
+      "/radius add address=192.0.2.9 secret=radSecret99 service=ppp\r\n",
+      "radSecret99"
+    ],
     [
       "/interface wireguard add private-key=\"aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8=\"\r\n",
       "aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8="
     ],
-    ["\u001b[m\u001b[36mpassword\u001b[m=\u001b[33mcolored123\u001b[m\r\n", "colored123"]
+    [
+      "\u001b[m\u001b[36mpassword\u001b[m=\u001b[33mcolored123\u001b[m\r\n",
+      "colored123"
+    ]
   ],
   "linux": [
     [
       "root:$6$saltsalt$Zx9yQ1w2e3r4t5y6u7i8o9p0aSdFgHjKlZxCvBnM.:19000:0:99999:7:::\n",
       "$6$saltsalt$Zx9yQ1w2e3r4t5y6u7i8o9p0aSdFgHjKlZxCvBnM."
     ],
-    ["DB_PASSWORD=hunter2hunter2\n", "hunter2hunter2"],
+    [
+      "DB_PASSWORD=hunter2hunter2\n",
+      "hunter2hunter2"
+    ],
     [
       "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACDX\n-----END OPENSSH PRIVATE KEY-----\n",
       "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW"
@@ -27,18 +42,99 @@
       "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\n",
       "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
     ],
-    ["remote: https://deploy:tok3nValue@git.example.com/repo.git\n", "tok3nValue"]
+    [
+      "remote: https://deploy:tok3nValue@git.example.com/repo.git\n",
+      "tok3nValue"
+    ]
   ],
   "vrp": [
     [
       " local-user admin password irreversible-cipher %^%#abcDEF123ghiJKL%^%#\r\n",
       "abcDEF123ghiJKL"
     ],
-    [" snmp-agent community read cipher %^%#Q2NhbXB1cw==%^%#\r\n", "Q2NhbXB1cw=="],
-    [" pre-shared-key cipher %^%#xyzXYZ789%^%#\r\n", "xyzXYZ789"]
+    [
+      " snmp-agent community read cipher %^%#Q2NhbXB1cw==%^%#\r\n",
+      "Q2NhbXB1cw=="
+    ],
+    [
+      " pre-shared-key cipher %^%#xyzXYZ789%^%#\r\n",
+      "xyzXYZ789"
+    ]
   ],
   "other": [
-    ["enable secret 5 $1$mERr$hx5rVt7rPNoS4wqbXKX7m0\r\n", "hx5rVt7rPNoS4wqbXKX7m0"],
-    ["username admin password 7 0822455D0A16\r\n", "0822455D0A16"]
+    [
+      "enable secret 5 $1$mERr$hx5rVt7rPNoS4wqbXKX7m0\r\n",
+      "hx5rVt7rPNoS4wqbXKX7m0"
+    ],
+    [
+      "username admin password 7 0822455D0A16\r\n",
+      "0822455D0A16"
+    ]
+  ],
+  "ios": [
+    [
+      "username admin privilege 15 secret 9 $9$abcDEF123ghiJKL\r\n",
+      "$9$abcDEF123ghiJKL"
+    ],
+    [
+      "snmp-server community Sup3rComm RO\r\n",
+      "Sup3rComm"
+    ],
+    [
+      "enable password 7 094F471A1A0A\r\n",
+      "094F471A1A0A"
+    ]
+  ],
+  "junos": [
+    [
+      "encrypted-password \"$6$saltsalt$AbCdEf0123456789\";\r\n",
+      "$6$saltsalt$AbCdEf0123456789"
+    ],
+    [
+      "authentication-key \"$9$qfT3AuOREyl\";\r\n",
+      "$9$qfT3AuOREyl"
+    ]
+  ],
+  "fortios": [
+    [
+      "set password ENC SH2abcdefghijklmnopqrstuvwx\r\n",
+      "SH2abcdefghijklmnopqrstuvwx"
+    ],
+    [
+      "set psk MyPresharedKey99\r\n",
+      "MyPresharedKey99"
+    ]
+  ],
+  "bsd": [
+    [
+      "<bcrypt-hash>$2y$10$abcdefghijklmnopqrstuuAbCdEfGh</bcrypt-hash>\r\n",
+      "$2y$10$abcdefghijklmnopqrstuuAbCdEfGh"
+    ],
+    [
+      "<password>plainSecret77</password>\r\n",
+      "plainSecret77"
+    ]
+  ],
+  "vsol": [
+    [
+      "password Sup3rS3cret!\r\n",
+      "Sup3rS3cret!"
+    ]
+  ],
+  "dmos": [
+    [
+      "password Sup3rS3cret!\r\n",
+      "Sup3rS3cret!"
+    ]
+  ],
+  "windows": [
+    [
+      "net use z: \\\\srv\\x /password:Sup3rS3cret!\r\n",
+      "Sup3rS3cret!"
+    ],
+    [
+      "DB_PASSWORD=hunter2hunter2\r\n",
+      "hunter2hunter2"
+    ]
   ]
 }

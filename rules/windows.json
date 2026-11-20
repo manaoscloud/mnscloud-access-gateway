@@ -1,0 +1,63 @@
+{
+  "dialect": "windows",
+  "description": "Windows command shell (cmd.exe) over WinRM/WinRS. Only the exact commands ver, hostname, systeminfo, ipconfig /all and route print are read. Command chaining (& | ^ > <), PowerShell, interpreters and unknown lines are write_risky or worse (fail-closed).",
+  "syntax": "plain",
+  "flags": "i",
+  "clearKeys": [
+    "\u0003"
+  ],
+  "untrackable": [
+    "?"
+  ],
+  "cancelLine": "\u0015",
+  "rules": [
+    {
+      "id": "win-secret",
+      "class": "secret_read",
+      "pattern": "^(?:reg (?:save|export)|ntdsutil|vssadmin|mimikatz|vaultcmd|cmdkey|netsh wlan show profile.*key=clear|type .*(?:sam|system|security|\\.kdbx|\\.pfx|\\.pem|\\.key|id_rsa)|certutil .*-(?:exportpfx|privatekey)|reg query .*(?:sam|security|winlogon|password))\\b|^set$",
+      "hint": "Secrets and credential stores are never shown in the console."
+    },
+    {
+      "id": "win-read",
+      "class": "read",
+      "pattern": "^(?:ver|hostname|systeminfo|ipconfig /all|route print)$"
+    },
+    {
+      "id": "win-pivot",
+      "class": "pivot",
+      "pattern": "^(?:powershell|pwsh|cmd|command|wmic|wsl|bash|telnet|ssh|scp|ftp|tftp|curl|wget|bitsadmin|certutil|mstsc|psexec|winrs|wscript|cscript|mshta|rundll32|regsvr32|python[0-9.]*|perl|start|call|runas|msiexec|schtasks|at|sc|net use|net view)\\b"
+    },
+    {
+      "id": "win-destructive",
+      "class": "destructive",
+      "pattern": "^(?:format|diskpart|del|erase|rd|rmdir|cipher /w|bcdedit|reg delete|shutdown|vssadmin delete|wevtutil cl|fsutil|takeown|icacls|sfc|chkdsk /[fr])\\b"
+    },
+    {
+      "id": "win-risky",
+      "class": "write_risky",
+      "pattern": "^(?:net (?:user|localgroup|group|accounts|stop|start|share)|reg (?:add|import|load|unload|copy)|netsh|taskkill|move|copy|xcopy|robocopy|ren|rename|mkdir|md|echo|type|attrib|setx|route (?:add|delete|change|-f)|ipconfig /(?:release|renew|flushdns|registerdns)|dism|gpupdate|logoff|tsdiscon|cd|chdir|pushd|popd|set)\\b"
+    },
+    {
+      "id": "empty",
+      "class": "read",
+      "pattern": "^$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "win-cred",
+      "flags": "gi",
+      "pattern": "(?<key>(?:/p(?:ass(?:word)?)?[: ]|-password )\\s*)(?<value>\\S+)"
+    },
+    {
+      "id": "kw-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key-string|pre-shared-key|psk|community|enable secret|enable password|passphrase|auth-password|priv-password)\\s+(?:\\d\\s+)?)(?<value>\\S+)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    }
+  ]
+}

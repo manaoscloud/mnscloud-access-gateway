@@ -1,0 +1,63 @@
+{
+  "dialect": "vsol",
+  "description": "V-SOL OLT CLI (Cisco-like). Only exact full-word show commands run without confirmation; abbreviations, inline help and unknown lines are write_risky (fail-closed). Command names are unverified on real firmware.",
+  "syntax": "plain",
+  "flags": "i",
+  "clearKeys": [
+    "\u0003"
+  ],
+  "untrackable": [
+    "?"
+  ],
+  "cancelLine": "\u0015",
+  "rules": [
+    {
+      "id": "vsol-secret",
+      "class": "secret_read",
+      "pattern": "^(?:s|sh|sho|show|display)\\s+(?:run|star|conf|key|snmp|aaa|tacacs|radius|ssh|secret|password|user|login|crypto|tech|cfg|current-config|startup)\\w*|^more\\b",
+      "hint": "Configuration dumps and keys are never shown in the console."
+    },
+    {
+      "id": "vsol-redirect",
+      "class": "write_risky",
+      "pattern": "\\||>|\\btee\\b"
+    },
+    {
+      "id": "vsol-destructive",
+      "class": "destructive",
+      "pattern": "^(?:reboot|reload|restart|reset|erase|format|delete|del|factory|default|write erase|clear (?:config|onu|olt)|upgrade|firmware|restore)\\b"
+    },
+    {
+      "id": "vsol-pivot",
+      "class": "pivot",
+      "pattern": "^(?:telnet|ssh|ftp|tftp|sftp|scp|shell|linux|start-shell|debug-shell|root)\\b"
+    },
+    {
+      "id": "vsol-read",
+      "class": "read",
+      "pattern": "^(?:show (?:version|clock|uptime|system|interface brief|onu info|onu state|olt|pon (?:power|status)|alarm)|ping \\S+|exit|quit|logout)$"
+    },
+    {
+      "id": "vsol-risky",
+      "class": "write_risky",
+      "pattern": "^(?:configure|conf|config|enable|username|user|password|aaa|snmp|snmp-server|crypto|key|copy|write|save|commit|boot|service|ip|interface|vlan|onu|olt|pon|no|set|undo|shutdown|clear|debug|ntp|logging|banner|hostname)\\b"
+    },
+    {
+      "id": "empty",
+      "class": "read",
+      "pattern": "^$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "kw-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key-string|pre-shared-key|psk|community|enable secret|enable password|passphrase|auth-password|priv-password)\\s+(?:\\d\\s+)?)(?<value>\\S+)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    }
+  ]
+}

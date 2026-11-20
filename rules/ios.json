@@ -1,0 +1,73 @@
+{
+  "dialect": "ios",
+  "description": "Cisco IOS and IOS-XE CLI. Full keywords only: abbreviations, inline help (?) and unknown lines are write_risky (fail-closed); configuration dumps and anything that can show a secret are secret_read.",
+  "syntax": "plain",
+  "flags": "i",
+  "clearKeys": [
+    "\u0003"
+  ],
+  "untrackable": [
+    "?"
+  ],
+  "cancelLine": "\u0015",
+  "rules": [
+    {
+      "id": "ios-secret",
+      "class": "secret_read",
+      "pattern": "^(?:s|sh|sho|show)\\s+(?:run|star|tech|conf|key|cry|snmp|aaa|tacacs|radius|ssh|archive|vtp pass|ip ssh|secret|password|users|privilege|login|crypto)\\w*|^more\\b|^dir\\b.*(?:config|nvram)|^(?:type|copy)\\b.*(?:running|startup)-config",
+      "hint": "Configuration dumps and keys are never shown in the console."
+    },
+    {
+      "id": "ios-redirect",
+      "class": "write_risky",
+      "pattern": "\\|\\s*(?:redirect|tee|append|section\\s+(?:username|enable|snmp|key))\\b|>"
+    },
+    {
+      "id": "ios-destructive",
+      "class": "destructive",
+      "pattern": "^(?:reload|erase|format|delete|del|squeeze|fsck|write erase|license|clear (?:crypto|configuration)|archive (?:tar|download-sw))\\b"
+    },
+    {
+      "id": "ios-pivot",
+      "class": "pivot",
+      "pattern": "^(?:telnet|ssh|rlogin|connect|resume|tclsh|guestshell|do|ftp|tftp|scp|rcp)\\b"
+    },
+    {
+      "id": "ios-risky",
+      "class": "write_risky",
+      "pattern": "^(?:configure|conf|enable|disable|username|aaa|line|snmp-server|crypto|key|copy|write|wr|archive|event|boot|service|access-list|ip access-list|router|ip route|ip address|shutdown|no|clear|debug|undebug|terminal monitor|ntp|logging|banner|hostname|spanning-tree|ip ssh|ip domain)\\b"
+    },
+    {
+      "id": "ios-write",
+      "class": "write_low",
+      "pattern": "^(?:interface|description|switchport (?:mode|access vlan|trunk allowed vlan|trunk native vlan)|vlan \\d{1,4}|name)\\b"
+    },
+    {
+      "id": "ios-read",
+      "class": "read",
+      "pattern": "^(?:show\\b[^?]*|ping\\b[^?]*|traceroute\\b[^?]*|terminal (?:length|width) \\d+|exit|end|logout|quit)$"
+    },
+    {
+      "id": "empty",
+      "class": "read",
+      "pattern": "^$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "ios-type7",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key|username \\S+ (?:password|secret))\\s+(?:0|5|7|8|9)\\s+)(?<value>\\S+)"
+    },
+    {
+      "id": "kw-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key-string|pre-shared-key|psk|community|enable secret|enable password|passphrase|auth-password|priv-password)\\s+(?:\\d\\s+)?)(?<value>\\S+)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    }
+  ]
+}

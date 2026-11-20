@@ -77,6 +77,57 @@ export function vrpReadProblem(command: string): string | null {
   return null;
 }
 
+// --- second wave: exact reads (no generic show/get allowlist) ------------------------------------
+
+const JUNOS_IF = '(?:[a-z]{2,3}-\\d{1,2}/\\d{1,2}/\\d{1,3}|ae\\d{1,3})';
+const IOS_IF = '[A-Za-z]{2,}[0-9]+(?:/[0-9]+){0,3}(?:\\.[0-9]+)?';
+const BSD_IF = '[a-z]{2,}[0-9]{1,3}(?:\\.[0-9]{1,4})?';
+
+/**
+ * The only commands an AI read may run on these dialects. Each entry is matched against the exact
+ * command text: one space between words, no abbreviation, no inline help, no pipe, no redirection
+ * and no composition (the expressions cannot match any of those characters). A secret-bearing
+ * command (running/startup configuration, `show configuration`, `show full-configuration`) is
+ * deliberately not here.
+ */
+const EXACT_READS: Partial<Record<ShellDialect, RegExp[]>> = {
+  ios: [
+    /^show (?:version|clock|inventory|reload|ip route|ip arp|mac address-table|vlan brief)$/,
+    /^show (?:ip interface brief|interfaces|interfaces status|cdp neighbors|lldp neighbors)$/,
+    /^show (?:processes cpu|memory statistics|environment all|ntp status|ip ospf neighbor)$/,
+    /^show ip bgp summary$/,
+    new RegExp(`^show interfaces ${IOS_IF}$`),
+  ],
+  junos: [
+    /^show (?:version|system (?:uptime|information|alarms|storage|commit)|chassis (?:alarms|hardware|environment))$/,
+    /^show (?:interfaces (?:terse|brief|descriptions)|route summary|arp no-resolve|bgp summary)$/,
+    /^show (?:ospf neighbor|lldp neighbors|vlans|ethernet-switching table)$/,
+  ],
+  fortios: [
+    /^get (?:system (?:status|performance status|interface physical|arp|ha status)|hardware status)$/,
+    /^get router info routing-table all$/,
+  ],
+  bsd: [
+    /^(?:uname -a|uname -srm|uptime|hostname|date|ifconfig -a|netstat -rn|netstat -i|df -h)$/,
+    /^(?:sysctl (?:hw\.model|hw\.ncpu|hw\.physmem|kern\.version|kern\.boottime)|freebsd-version|swapinfo -h)$/,
+    /^pfctl -s (?:info|rules|nat|Interfaces)$/,
+    new RegExp(`^ifconfig ${BSD_IF}$`),
+    /^ping -c [1-9] (?:\d{1,3}\.){3}\d{1,3}$/,
+  ],
+  vsol: [/^show (?:version|clock|system)$/],
+  dmos: [/^show (?:system|alarm|inventory)$/],
+  windows: [/^(?:ver|hostname|systeminfo|ipconfig \/all|route print)$/],
+};
+
+/** Reads on the second-wave dialects: an exact match or a refusal. */
+export function exactReadProblem(dialect: ShellDialect, command: string): string | null {
+  const list = EXACT_READS[dialect];
+  if (!list) return 'dialect not supported';
+  // Anything but printable ASCII (control characters, Tab, newline, `?`) is refused before matching.
+  if (!/^[\x20-\x7e]{1,200}$/.test(command) || command.includes('?')) return 'unsafe character';
+  return list.some((re) => re.test(command)) ? null : 'not an allowed read command';
+}
+
 export function readProblem(
   dialect: ShellDialect,
   command: string,
@@ -85,7 +136,48 @@ export function readProblem(
   if (dialect === 'routeros') return rosReadProblem(command, rule);
   if (dialect === 'linux' || dialect === 'proxmox') return linuxReadProblem(command);
   if (dialect === 'vrp') return vrpReadProblem(command);
-  return 'dialect not supported';
+  return exactReadProblem(dialect, command);
+}
+
+// --- second wave: the limited configuration grammar of automatic changes -------------------------
+
+const TEXT = '[A-Za-z0-9 ._:/,-]{1,64}';
+const IP4 = '(?:\\d{1,3}\\.){3}\\d{1,3}';
+const VLAN = '(?:[1-9]\\d{0,2}|[1-3]\\d{3}|40[0-8]\\d|409[0-4])';
+
+/**
+ * What an automatic change may type in configuration mode. A flat grammar: it has no `exit`,
+ * `end`, `do`, `reload`, `write`, `copy`, `commit`, `rollback`, `request`, `run`, `load`, `edit`,
+ * no user, key, AAA, SNMP, line or service statement, so no step can save, commit, cancel the
+ * rollback, reboot, run a shell or change who may log in.
+ */
+const CHANGE_GRAMMAR: Partial<Record<ShellDialect, RegExp[]>> = {
+  ios: [
+    new RegExp(`^interface ${IOS_IF}$`),
+    new RegExp(`^description ${TEXT}$`),
+    /^(?:no )?shutdown$/,
+    /^switchport mode (?:access|trunk)$/,
+    new RegExp(`^switchport access vlan ${VLAN}$`),
+    new RegExp(`^switchport trunk allowed vlan (?:(?:add|remove) )?${VLAN}(?:[,-]${VLAN})*$`),
+    new RegExp(`^ip address ${IP4} ${IP4}$`),
+    new RegExp(`^vlan ${VLAN}$`),
+    /^name [A-Za-z0-9_-]{1,32}$/,
+  ],
+  junos: [
+    new RegExp(`^set interfaces ${JUNOS_IF} description (?:"${TEXT}"|[A-Za-z0-9._:/-]{1,64})$`),
+    new RegExp(`^(?:set|delete) interfaces ${JUNOS_IF} disable$`),
+    new RegExp(`^set vlans [A-Za-z0-9_-]{1,32} vlan-id ${VLAN}$`),
+    new RegExp(`^set interfaces ${JUNOS_IF} unit \\d{1,4} family inet address ${IP4}/\\d{1,2}$`),
+  ],
+};
+
+/** Null when the line is inside the change grammar of the dialect (or the dialect has none yet). */
+export function changeGrammarProblem(dialect: ShellDialect, command: string): string | null {
+  if (dialect !== 'ios' && dialect !== 'junos') return null;
+  if (!/^[\x20-\x7e]{1,200}$/.test(command) || command.includes('?')) return 'unsafe character';
+  return CHANGE_GRAMMAR[dialect]!.some((re) => re.test(command))
+    ? null
+    : 'not in the change grammar';
 }
 
 // --- changes: no command may disarm its own rollback --------------------------------------------
@@ -97,6 +189,14 @@ export function disarmsRollback(dialect: ShellDialect, command: string, rule: st
     return /^(?:sa|sav|save|undo\s+sch\w*|sch\w*|schedule|startup|commit|reboot|quit)\b/i.test(
       text,
     );
+  }
+  if (dialect === 'ios') {
+    return /^(?:reload|write|wr|copy|end|exit|do|archive|configure|conf|enable|username|no (?:reload|archive))\b/i
+      .test(text);
+  }
+  if (dialect === 'junos') {
+    return /^(?:commit|rollback|request|run|load|exit|quit|top|up|edit|save|delete system|set system)\b/i
+      .test(text);
   }
   if (dialect === 'routeros') {
     if (rule === 'ros-script-exec') return true;

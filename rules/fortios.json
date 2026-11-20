@@ -1,0 +1,63 @@
+{
+  "dialect": "fortios",
+  "description": "Fortinet FortiOS CLI. `get` commands that cannot show a secret are read; `show` and `show full-configuration` dumps are secret_read; configuration edits and execute actions need N3 or are blocked.",
+  "syntax": "plain",
+  "flags": "i",
+  "clearKeys": [
+    "\u0003"
+  ],
+  "untrackable": [
+    "?"
+  ],
+  "cancelLine": "\u0015",
+  "rules": [
+    {
+      "id": "fortios-secret",
+      "class": "secret_read",
+      "pattern": "^(?:show\\b.*|get (?:system (?:admin|global|snmp|central-management|api-user)|vpn|user)\\b.*|get .*\\b(?:password|psk|passwd|secret|token|private|full-configuration)\\b.*|diagnose debug config-error-log.*|execute (?:backup|restore)\\b.*)$",
+      "hint": "Configuration dumps and secrets are never shown in the console."
+    },
+    {
+      "id": "fortios-destructive",
+      "class": "destructive",
+      "pattern": "^execute (?:factory-reset\\S*|formatlogdisk|erase-disk|shutdown|reboot|update-now|firmware|restore|disk|set-next-reboot|batch)\\b"
+    },
+    {
+      "id": "fortios-pivot",
+      "class": "pivot",
+      "pattern": "^execute (?:ssh|telnet|tac-report|sniffer|enter|router|ftp|tftp|scp)\\b"
+    },
+    {
+      "id": "fortios-read",
+      "class": "read",
+      "pattern": "^(?:get \\S[^?]*|execute (?:ping|ping6|traceroute|ping-options|date|time)\\b[^?]*|abort|exit)$"
+    },
+    {
+      "id": "fortios-risky",
+      "class": "write_risky",
+      "pattern": "^(?:config|edit|set|unset|append|select|unselect|delete|purge|rename|clone|move|end|next|execute|diagnose|exec)\\b"
+    },
+    {
+      "id": "empty",
+      "class": "read",
+      "pattern": "^$"
+    }
+  ],
+  "redact": [
+    {
+      "id": "fortios-enc",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w-]*(?:password|passwd|psk|secret|key|community)\\s+(?:ENC\\s+)?)(?<value>\\\"[^\\\"]*\\\"|\\S+)"
+    },
+    {
+      "id": "kw-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b(?:password|secret|key-string|pre-shared-key|psk|community|enable secret|enable password|passphrase|auth-password|priv-password)\\s+(?:\\d\\s+)?)(?<value>\\S+)"
+    },
+    {
+      "id": "kv-secret",
+      "flags": "gi",
+      "pattern": "(?<key>\\b[\\w.-]*(?:password|passwd|secret|psk|passphrase|token)\\s*[=:]\\s*)(?<value>\\S+)"
+    }
+  ]
+}
