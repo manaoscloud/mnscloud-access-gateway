@@ -20,7 +20,8 @@
     "proseWrap": "preserve",
     "exclude": [
       "node_modules",
-      "releases"
+      "releases",
+      "tests/fixtures/junos"
     ]
   },
   "lint": {
