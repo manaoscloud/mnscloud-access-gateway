@@ -184,7 +184,7 @@ and never downloads. Update them with `deno install` and commit the result.
 A Junos change (`safeChange: commit_confirmed`) runs over the NETCONF subsystem of the already
 pinned and authenticated SSH connection: candidate lock without discarding a foreign candidate, device-local
 `/var/tmp/<backupName>-pre.conf` and `-post.conf` backups (never overwritten), a native
-non-persistent confirmed commit, verification in a new pinned SSH connection, and one confirming
+non-persistent confirmed commit (the backups hold the full configuration and are retained for audit), verification in a new pinned SSH connection, and one confirming
 commit. It refuses before any lock when a capability, the lock monitoring or a documented reply
 shape is missing. Only a proven confirmation is `applied`; every other ending is `failed` with a
 fixed `JUNOS_*` code, and `rolled_back` is never reported because the device-side reversal is not

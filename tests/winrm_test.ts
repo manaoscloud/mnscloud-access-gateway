@@ -769,7 +769,7 @@ Deno.test({
       await browser.waitFor(() => browser.output().includes('SRV leaks'));
       assertNotIncludes(browser.output(), PASSWORD);
       assertEquals(h.mock.commands, ['hostname']);
-      // composition and pivots are classified, not run: n3 needs a confirmation each
+      // composition is at least destructive (cmd.exe gets the raw line): never run unconfirmed
       browser.type('hostname & shutdown /s\r');
       await browser.waitFor(() => browser.controls().some((c) => c.type === 'verdict'));
       const verdict = browser.controls().find((c) => c.type === 'verdict') as unknown as {
@@ -777,7 +777,7 @@ Deno.test({
         class: string;
         unknown: boolean;
       };
-      assertEquals([verdict.class, verdict.unknown], ['write_risky', true]);
+      assertEquals([verdict.class, verdict.unknown], ['destructive', false]);
       await new Promise((r) => setTimeout(r, 200));
       assertEquals(h.mock.commands, ['hostname'], 'nothing runs before the confirmation');
       browser.frame(`4:${JSON.stringify({ type: 'deny', id: verdict.id })}`);

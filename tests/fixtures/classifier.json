@@ -861,6 +861,42 @@
     [
       "",
       "read"
+    ],
+    [
+      "ping 192.0.2.1 count 1",
+      "read"
+    ],
+    [
+      "traceroute 192.0.2.1 | match ms",
+      "read"
+    ],
+    [
+      "ping 192.0.2.1 count 1 | save /var/tmp/x",
+      "write_risky"
+    ],
+    [
+      "traceroute 192.0.2.1 | save /config/juniper.conf.gz",
+      "write_risky"
+    ],
+    [
+      "ping 192.0.2.1 | request message all x",
+      "write_risky"
+    ],
+    [
+      "ping 192.0.2.1 | append /var/tmp/x",
+      "write_risky"
+    ],
+    [
+      "traceroute 192.0.2.1 | tee /var/tmp/x",
+      "write_risky"
+    ],
+    [
+      "ping 192.0.2.1 > /var/tmp/x",
+      "write_risky"
+    ],
+    [
+      "ping 192.0.2.1; request system reboot",
+      "write_risky"
     ]
   ],
   "fortios": [
@@ -1099,23 +1135,19 @@
     ],
     [
       "ver & del x",
-      "write_risky",
-      true
+      "destructive"
     ],
     [
       "ver > x",
-      "write_risky",
-      true
+      "destructive"
     ],
     [
       "ipconfig /all | findstr x",
-      "write_risky",
-      true
+      "destructive"
     ],
     [
       "hostname && shutdown /s",
-      "write_risky",
-      true
+      "destructive"
     ],
     [
       "powershell -c whoami",
@@ -1152,6 +1184,62 @@
     ],
     [
       "",
+      "read"
+    ],
+    [
+      "hostname & reg save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "@reg save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "reg.exe save HKLM\\SAM c:\\s",
+      "secret_read"
+    ],
+    [
+      "@shutdown /r",
+      "destructive"
+    ],
+    [
+      "C:\\Windows\\System32\\shutdown.exe /r",
+      "destructive"
+    ],
+    [
+      "\"C:\\Windows\\System32\\shutdown.exe\" /r",
+      "destructive"
+    ],
+    [
+      "hostname & shutdown /r",
+      "destructive"
+    ],
+    [
+      "more C:\\x\\id_rsa",
+      "secret_read"
+    ],
+    [
+      "hostname | findstr x",
+      "destructive"
+    ],
+    [
+      "hostname > c:\\x.txt",
+      "destructive"
+    ],
+    [
+      "shu^tdown /r",
+      "destructive"
+    ],
+    [
+      "echo %COMSPEC%",
+      "destructive"
+    ],
+    [
+      "hostname",
+      "read"
+    ],
+    [
+      "ipconfig /all",
       "read"
     ]
   ]

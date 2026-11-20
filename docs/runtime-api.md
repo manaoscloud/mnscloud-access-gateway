@@ -429,7 +429,10 @@ credential) and runs a bounded NETCONF state machine:
    the fixed internal command `show configuration | save <file>` must answer `Wrote N lines of
    configuration to '<file>'`. Files are `/var/tmp/<backupName>-pre.conf` (before the load) and
    `-post.conf` (after the unconfirmed commit, before the verification); they are kept for audit
-   and recovery, never deleted. The result records the two commands with the proof output
+   and recovery, never deleted. They contain the FULL device configuration (including secret
+   material the device stores in it): the path is under `/var/tmp` and the gateway changes no
+   permission, so treat them as sensitive and prune them under the operator's retention policy. The
+   result records the two commands with the proof output
    withheld.
 5. Verification runs in a NEW pinned SSH connection (read commands only) while the NETCONF session
    and its lock stay open; an abort closes that connection. Ownership, pending state and the
@@ -439,10 +442,10 @@ credential) and runs a bounded NETCONF state machine:
 Result semantics: only a proven confirmation is `applied` (`rollback`: `confirmed_commit`,
 `armed` false). Every other ending is `failed` with a fixed `error.code` `JUNOS_<reason>` and a
 fixed message, never device text, XML, RPC error-info or configuration. `rollback.armed` is `true`
-only when a confirmed commit may be pending: the NETCONF session is then closed, which makes the
+only when a read-back proved a pending confirmed commit owned by this session: the NETCONF session is then closed, which makes the
 device revert a nonpersistent confirmed commit; that reversal is NOT observed, so the gateway never
 emits `rolled_back` for Junos. A lost or unacknowledged final confirmation is `failed` with a
-message saying the outcome is unknown (`armed` false, no success or rollback claimed). A request
+message saying the outcome is unknown (`armed` false, no success or rollback claimed). A commit that was sent but never read back as pending is `failed` / `JUNOS_COMMIT_STATE_UNKNOWN` with `armed` false: its outcome and timer are unknown. RPCs have a 30 s budget, the backup hook 60 s and the verification 30 s, all capped by the confirmed-commit deadline minus a 5 s margin. A request
 cancelled in any phase closes the NETCONF subsystem and the helper channels and sends no
 confirmation.
 

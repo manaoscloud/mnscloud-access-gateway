@@ -29,6 +29,10 @@ export interface CliDeviceOptions {
   banner?: string;
   // --- ios
   userMode?: boolean;
+  /** Real IOS vty forms: `on vty0 (address)`, IOS 15+ lock fields, `flash:/` not-found error. */
+  realisticIos?: boolean;
+  /** The lock output carries a field name that is not on the allowlist. */
+  unknownLockField?: boolean;
   lockUnsupported?: boolean;
   lockOutput?: string;
   loseLockAfterStep?: boolean;
@@ -66,6 +70,10 @@ export interface CliDeviceOptions {
   lostConfirmReply?: boolean;
   /** A verification connection never answers `show version` (to cancel the request there). */
   hangVerify?: boolean;
+  /** A verification connection answers `show version` only after this many milliseconds. */
+  slowVerifyMs?: number;
+  /** The commit history never shows the pending confirmed commit (the arm cannot be proven). */
+  hidePending?: boolean;
 }
 
 export interface CliDevice {
@@ -195,7 +203,11 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
         return done(
           `Parser Configure Lock\n------------------------------------------------------------\nOwner PID : 3\nUser : support\nTTY : 1\nType : EXCLUSIVE\nState : ${
             exclusiveOwner === client ? 'LOCKED' : 'UNLOCKED'
-          }\nClass : EXPOSED\nCount : 1\nPending Requests : 0`,
+          }\nClass : EXPOSED\nCount : 1\nPending Requests : 0${
+            options.realisticIos
+              ? '\nUser debug info : configure lock\nSession idle state : TRUE\nNum. of exec cmds executed : 4\nLast configuration cmd : no shutdown\nLock Expiration timer (in Sec) : Not Set\nLock acquired at : 10:00:01 UTC'
+              : ''
+          }${options.unknownLockField ? '\nSurprise field : 1' : ''}`,
         );
       }
       if (cmd === 'configure terminal lock') {
@@ -226,7 +238,9 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
       if (cmd === 'show reload') {
         return done(
           device.reloadScheduled
-            ? `Reload scheduled in 5 minutes by support\nReload reason: ${reloadReason}`
+            ? `Reload scheduled in 5 minutes by support${
+              options.realisticIos ? ' on vty0 (127.0.0.1)' : ''
+            }\nReload reason: ${reloadReason}`
             : 'No reload is scheduled.',
         );
       }
@@ -246,6 +260,8 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
         return done(
           options.backupCollision || savedFiles.has(directory[1])
             ? 'Directory of flash:/\n123 -rw- 1024 existing-file'
+            : options.realisticIos
+            ? `%Error opening flash:/${directory[1]} (No such file or directory)`
             : `%Error opening flash:${directory[1]} (No such file or directory)`,
         );
       }
@@ -360,6 +376,10 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
       if (index > 0 && options.hangVerify && cmd === 'show version') {
         hung = true;
         device.events.push('verify-hang');
+        return;
+      }
+      if (index > 0 && options.slowVerifyMs && cmd === 'show version') {
+        setTimeout(() => done(`Hostname: fw\nJunos: 21.4R3`), options.slowVerifyMs);
         return;
       }
       if (cmd === 'show version') return done(`Hostname: fw\nJunos: 21.4R3${options.banner ?? ''}`);
@@ -511,7 +531,9 @@ export function startCliDevice(hostKey: string, options: CliDeviceOptions): Prom
         return reply(
           id,
           `<commit-information><commit-history><sequence-number>0</sequence-number><user>support</user><client>netconf</client><configuration-revision>re0-100-${revision}</configuration-revision>${
-            device.confirmTimer ? '<commit-confirmed>rollback pending</commit-confirmed>' : ''
+            device.confirmTimer && !options.hidePending
+              ? '<commit-confirmed>rollback pending</commit-confirmed>'
+              : ''
           }</commit-history></commit-information>`,
         );
       }

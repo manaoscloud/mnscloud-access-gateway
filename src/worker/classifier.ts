@@ -382,6 +382,50 @@ function classifyRouterOs(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Windows cmd.exe
+// ---------------------------------------------------------------------------------------------
+
+const WIN_META = /[&|^<>()%\r\n]/;
+
+/** Strips `@`, separators, quotes, a path prefix and `.exe/.com/.bat/.cmd` from the command word. */
+export function normalizeWindows(segment: string): string {
+  const text = segment.replace(/^[\s@,;=]+/, '');
+  let word: string, rest: string;
+  if (text.startsWith('"')) {
+    const end = text.indexOf('"', 1);
+    word = text.slice(1, end < 0 ? undefined : end);
+    rest = end < 0 ? '' : text.slice(end + 1);
+  } else {
+    const m = /^(\S+)([\s\S]*)$/.exec(text);
+    word = m?.[1] ?? '';
+    rest = m?.[2] ?? '';
+  }
+  word = word.replace(/^.*[\\/]/, '').replace(/\.(?:exe|com|bat|cmd)$/i, '');
+  return (word + rest).trim().replace(/\s+/g, ' ');
+}
+
+function classifyWindows(rules: DialectRules, line: string): Classification {
+  let result: Classification | null = null;
+  for (const segment of line.split(/[&|\r\n]/)) {
+    const text = normalizeWindows(segment);
+    if (!text && result) continue;
+    const r = match(rules.rules, text);
+    result = result ? strictest(result, r) : r;
+  }
+  result ??= match(rules.rules, '');
+  // The raw line goes to cmd.exe: chaining, redirection, escapes and expansion are never reads.
+  if (WIN_META.test(line)) {
+    result = strictest(result, {
+      class: 'destructive',
+      unknown: false,
+      rule: 'win-metachar',
+      normalized: line,
+    });
+  }
+  return { ...result, normalized: line.trim() };
+}
+
+// ---------------------------------------------------------------------------------------------
 
 /** Stateful classifier of one terminal (RouterOS keeps the current menu between lines). */
 export class Classifier {
@@ -400,6 +444,7 @@ export class Classifier {
     }
     const text = line.trim().replace(/\s+/g, ' ');
     if (this.rules.syntax === 'posix') return { ...classifyPosix(this.rules, text), menu: '' };
+    if (this.rules.dialect === 'windows') return { ...classifyWindows(this.rules, text), menu: '' };
     return { ...match(this.rules.rules, text), menu: '' };
   }
 

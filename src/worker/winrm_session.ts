@@ -364,7 +364,7 @@ class LineDevice {
           this.#line = this.#line.slice(0, -1);
           this.emit('\b \b');
         }
-      } else if (ch >= ' ' && ch !== '\x7f') {
+      } else if (ch >= ' ' && ch !== '\x7f' && !(ch >= '\x80' && ch < '\xa0')) {
         if (this.#line.length >= MAX_LINE) this.#dirty = true;
         else {
           this.#line += ch;

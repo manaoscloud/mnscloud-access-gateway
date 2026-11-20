@@ -260,3 +260,40 @@ Deno.test('second wave console N1 never submits clock mutations or configuration
     h.gate.close();
   }
 });
+
+Deno.test('gate: windows Ctrl+U clears the buffered line exactly like the device does', () => {
+  const h = harness('windows', 'n3');
+  h.gate.input('hostname\x15shutdown /r\r');
+  const verdict = h.controls.find((c) => c.type === 'verdict') as Extract<
+    ControlMessage,
+    { type: 'verdict' }
+  >;
+  // The verdict shows what cmd.exe will run (the device also drops `hostname` on Ctrl+U).
+  assertEquals([verdict.line, verdict.class, verdict.requires], [
+    'shutdown /r',
+    'destructive',
+    'double_confirm',
+  ]);
+  h.gate.close();
+});
+
+Deno.test('gate: windows chained or path-qualified lines are never read or one-step writes', () => {
+  for (
+    const [line, cls] of [
+      ['hostname & reg save HKLM\\SAM c:\\s', 'secret_read'],
+      ['@shutdown /r', 'destructive'],
+      ['C:\\Windows\\System32\\shutdown.exe /r', 'destructive'],
+      ['more C:\\x\\id_rsa', 'secret_read'],
+    ]
+  ) {
+    const h = harness('windows', 'n3');
+    h.gate.input(line + '\r');
+    const verdict = h.controls.find((c) => c.type === 'verdict') as
+      | Extract<ControlMessage, { type: 'verdict' }>
+      | undefined;
+    assertEquals(verdict?.class ?? h.events[0]?.class, cls, line);
+    // Nothing reaches the device before the (double) confirmation; a secret read is blocked.
+    assert(!h.device().includes('\r'), line);
+    h.gate.close();
+  }
+});

@@ -4,7 +4,8 @@
   "syntax": "plain",
   "flags": "i",
   "clearKeys": [
-    "\u0003"
+    "\u0003",
+    "\u0015"
   ],
   "untrackable": [
     "?"
@@ -14,7 +15,7 @@
     {
       "id": "win-secret",
       "class": "secret_read",
-      "pattern": "^(?:reg (?:save|export)|ntdsutil|vssadmin|mimikatz|vaultcmd|cmdkey|netsh wlan show profile.*key=clear|type .*(?:sam|system|security|\\.kdbx|\\.pfx|\\.pem|\\.key|id_rsa)|certutil .*-(?:exportpfx|privatekey)|reg query .*(?:sam|security|winlogon|password))\\b|^set$",
+      "pattern": "^(?:reg (?:save|export)|ntdsutil|vssadmin|mimikatz|vaultcmd|cmdkey|netsh wlan show profile.*key=clear|(?:type|more|findstr) .*(?:sam|system|security|\\.kdbx|\\.pfx|\\.pem|\\.key|id_rsa)|certutil .*-(?:exportpfx|privatekey)|reg query .*(?:sam|security|winlogon|password))\\b|^set$",
       "hint": "Secrets and credential stores are never shown in the console."
     },
     {

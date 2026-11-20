@@ -57,6 +57,29 @@ const SETTLE_BUDGET_MS = 10 * 60 * 1000;
 const STEP_TIMEOUT_MS = 30000;
 const EXPORT_TIMEOUT_MS = 60000;
 
+const IOS_LOCK_REQUIRED = new Set([
+  'Owner PID',
+  'User',
+  'TTY',
+  'Type',
+  'State',
+  'Class',
+  'Count',
+  'Pending Requests',
+]);
+const IOS_LOCK_EXTRA = new Set([
+  'User debug info',
+  'Session idle state',
+  'Num of exec cmds in exec mode',
+  'Num of exec cmds in cfg mode',
+  'Num. of exec cmds executed',
+  'Last exec cmd',
+  'Last configuration cmd',
+  'Lock Expiration timer (in Sec)',
+  'Lock acquired at',
+]);
+const IOS_ADDRESS = /^(?:(?:\d{1,3}\.){3}\d{1,3}|(?=[0-9A-Fa-f:.]*:)[0-9A-Fa-f:.]{2,45})$/;
+
 type Exit = Extract<WorkerToController, { t: 'exit' }>;
 
 export interface ExecHelpers {
@@ -2010,14 +2033,20 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         }
         const fields = new Map<string, string>();
         for (const line of lines) {
-          const m = /^(Owner PID|User|TTY|Type|State|Class|Count|Pending Requests)\s*:\s*(\S+)$/
-            .exec(line);
+          const m = /^([^:]{1,40}?)\s*:\s*(.*)$/.exec(line);
           if (!m || fields.has(m[1])) return false;
+          if (IOS_LOCK_REQUIRED.has(m[1])) {
+            if (!/^\S+$/.test(m[2])) return false;
+          } else if (!IOS_LOCK_EXTRA.has(m[1]) || !/^[\x20-\x7e]{0,80}$/.test(m[2])) {
+            // IOS 15+ adds informational fields; only a fixed allowlist is tolerated.
+            return false;
+          }
           fields.set(m[1], m[2]);
         }
         const user = secrets.credential?.username || init.username;
         if (
-          fields.size !== 8 || fields.get('User') !== user || user === 'unknown' ||
+          ![...IOS_LOCK_REQUIRED].every((name) => fields.has(name)) ||
+          fields.get('User') !== user || user === 'unknown' ||
           fields.get('Type') !== 'EXCLUSIVE' || fields.get('State') !== 'LOCKED' ||
           fields.get('Class') !== 'EXPOSED' || fields.get('Count') !== '1' ||
           fields.get('Pending Requests') !== '0' ||
@@ -2035,9 +2064,16 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         const user = secrets.credential?.username || init.username;
         const lines = r.output.split('\n');
         // Narrow supported profile: explicit operator plus unique reason, not merely "scheduled".
-        return !r.failed && lines.length === 2 &&
-          /^Reload scheduled (?:in|for) [A-Za-z0-9 :,().-]+ by [A-Za-z0-9_.@-]+$/.test(lines[0]) &&
-          lines[0].endsWith(` by ${user}`) && lines[1] === `Reload reason: ${reason}`;
+        // A vty session also prints ` on <line> (<address>)`. The line number is not mapped to the
+        // numeric TTY of the lock proof (IOS numbers vty lines differently), so the shape is
+        // checked, the exact user and the exact unique reason line are what prove ownership.
+        const m =
+          /^Reload scheduled (?:in|for) [A-Za-z0-9 :,().-]+? by ([A-Za-z0-9_.@-]+)(?: on (?:vty|tty|con)\d+ \(([0-9A-Fa-f:.]{2,45})\))?$/
+            .exec(lines[0] ?? '');
+        const address = m?.[2];
+        return !r.failed && lines.length === 2 && m !== null && m[1] === user &&
+          (address === undefined || IOS_ADDRESS.test(address)) &&
+          lines[1] === `Reload reason: ${reason}`;
       };
       const sameConfig = async (left: string, right: string) => {
         const r = await run(
@@ -2051,9 +2087,11 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
       const backupConfig = async (suffix: string) => {
         const file = `flash:${backup}-${suffix}.cfg`;
         const exists = await run(`do dir ${file}`);
-        if (
-          !exists.complete || exists.output !== `%Error opening ${file} (No such file or directory)`
-        ) return false;
+        const missing = [
+          `%Error opening ${file} (No such file or directory)`,
+          `%Error opening flash:/${backup}-${suffix}.cfg (No such file or directory)`,
+        ];
+        if (!exists.complete || !missing.includes(exists.output)) return false;
         const copy = await run(`do copy running-config ${file}`, 'system', 'Y', EXPORT_TIMEOUT_MS);
         return !copy.failed && /\b\d+ bytes copied\b/.test(copy.output) &&
           await sameConfig(file, 'system:running-config');
@@ -2201,6 +2239,7 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
           ? 'Verified running change was confirmed; persistence is unproven and rollback is unarmed.'
           : 'The operation ended without confirmed completion; timer and restoration require observation.',
       });
+      if (error instanceof ExecAbort) throw error;
     }
   };
 
@@ -2280,6 +2319,8 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         backupName: exec.backupName!,
         rollbackSeconds: exec.rollbackSeconds,
         signal: control.signal,
+        requestTimeoutMs: STEP_TIMEOUT_MS,
+        hookTimeoutMs: { backup: EXPORT_TIMEOUT_MS, verify: VERIFY_TIMEOUT_MS },
         hooks: { backup, verify: (signal) => verifyNewSession(signal) },
       });
       const code = /^[A-Z0-9_]{1,40}$/.test(change.code) ? change.code : 'FAILED';
@@ -2290,15 +2331,20 @@ export async function runExec(h: ExecHelpers): Promise<Exit> {
         // `rollback_pending`: a confirmed commit may be pending on the device; the NETCONF session
         // is closed, which reverts it. That reversal is NOT observed here. `unknown`: the final
         // confirmation was sent and its outcome is not proven either way.
-        setRollback(change.state === 'rollback_pending');
+        // Armed only when a read-back proved the pending commit; a commit that was sent but never
+        // observed leaves the outcome and the timer unknown.
+        const unobserved = change.state === 'rollback_pending' && !change.armObserved;
+        setRollback(change.state === 'rollback_pending' && change.armObserved);
         emit('failed', {
-          code: `JUNOS_${code}`,
+          code: unobserved ? 'JUNOS_COMMIT_STATE_UNKNOWN' : `JUNOS_${code}`,
           message: change.state === 'refused'
             ? 'The device or request is not eligible; nothing was changed.'
             : change.state === 'failed'
             ? 'The candidate load did not complete; nothing was committed.'
+            : unobserved
+            ? 'The confirmed commit was sent but its outcome and timer are unknown; nothing is claimed.'
             : change.state === 'rollback_pending'
-            ? 'A confirmed commit may be pending; the closed session lets the device revert it, which is not observed.'
+            ? 'A confirmed commit is pending; the closed session lets the device revert it, which is not observed.'
             : 'The confirmation outcome is unknown; no rollback or success is claimed.',
         });
       }

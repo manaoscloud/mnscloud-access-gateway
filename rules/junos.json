@@ -14,7 +14,7 @@
     {
       "id": "junos-simple-read",
       "class": "read",
-      "pattern": "^(?:ping [^?]*|traceroute [^?]*|set cli (?:screen-length|screen-width) \\d+)$"
+      "pattern": "^(?:(?:ping|traceroute) [^?|;<>&`$]*(?: \\| (?:match|except|count|no-more|last|find)\\b[^|;<>&`$?]*)*|set cli (?:screen-length|screen-width) \\d+)$"
     },
     {
       "id": "junos-read",
@@ -26,6 +26,12 @@
       "class": "secret_read",
       "pattern": "^(?:show(?: configuration| system login| system root-authentication| snmp| security (?:ike|ipsec|keychain|pki)| groups)?(?: .*)?|run show configuration.*|file (?:show|archive|copy)\\b.*|request system configuration rescue\\b.*|save\\b.*)$",
       "hint": "Configuration dumps and secrets are never shown in the console."
+    },
+    {
+      "id": "junos-redirect",
+      "class": "write_risky",
+      "pattern": "\\|\\s*(?:save|request|append|tee|redirect|file|load|start|run|commit)\\b|[>;]",
+      "hint": "Output pipes that write files or run commands are not reads."
     },
     {
       "id": "junos-destructive",

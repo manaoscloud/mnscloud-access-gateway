@@ -31,6 +31,8 @@ export interface Options {
   hooks: Hooks;
   now?: () => number;
   requestTimeoutMs?: number;
+  /** Budget of each hook (default: requestTimeoutMs); still capped by the commit deadline. */
+  hookTimeoutMs?: { backup?: number; verify?: number };
 }
 export interface Result {
   state: 'refused' | 'failed' | 'rollback_pending' | 'confirmed' | 'unknown';
@@ -39,6 +41,8 @@ export interface Result {
   candidateTouched: boolean;
   commitSent: boolean;
   confirmationSent: boolean;
+  /** True once a read-back proved a pending confirmed commit owned by this session. */
+  armObserved: boolean;
   backupPre: string | null;
   backupPost: string | null;
 }
@@ -52,6 +56,8 @@ export async function change(
   const observer = new JunosObserver();
   const observe = hooks.observe ?? observer.observe.bind(observer);
   const requestMs = options.requestTimeoutMs ?? 10000;
+  const backupMs = options.hookTimeoutMs?.backup ?? requestMs;
+  const verifyMs = options.hookTimeoutMs?.verify ?? requestMs;
   const r: Result = {
     state: 'refused',
     code: 'PRECONDITION',
@@ -59,6 +65,7 @@ export async function change(
     candidateTouched: false,
     commitSent: false,
     confirmationSent: false,
+    armObserved: false,
     backupPre: null,
     backupPost: null,
   };
@@ -71,13 +78,14 @@ export async function change(
     options.rollbackSeconds < 120 || options.rollbackSeconds > 900
   ) return r;
   let nc: Netconf | null = null, locked = false, deadline = Infinity;
-  const remaining = () => Math.min(requestMs, deadline - now() - 5000);
+  const remaining = (cap = requestMs) => Math.min(cap, deadline - now() - 5000);
   const check = () => {
     if (signal.aborted) throw new ProtocolError('CANCELLED');
     if (remaining() <= 0) throw new ProtocolError('DEADLINE');
   };
   const bounded = async <T>(
     call: (s: AbortSignal) => Promise<T>,
+    cap = requestMs,
   ): Promise<T> => {
     check();
     const ctl = new AbortController();
@@ -88,7 +96,7 @@ export async function change(
       timer = setTimeout(() => {
         ctl.abort();
         reject(new ProtocolError('TIMEOUT'));
-      }, remaining());
+      }, remaining(cap));
       ctl.signal.addEventListener(
         'abort',
         () => reject(new ProtocolError(signal.aborted ? 'CANCELLED' : 'TIMEOUT')),
@@ -136,7 +144,7 @@ export async function change(
     }
     r.phase = 'backup-pre';
     const pre = `/var/tmp/${options.backupName}-pre.conf`;
-    await bounded((s) => hooks.backup('pre', pre, s));
+    await bounded((s) => hooks.backup('pre', pre, s), backupMs);
     r.backupPre = pre;
     r.phase = 'load';
     r.candidateTouched = true;
@@ -160,13 +168,14 @@ export async function change(
     if (!pending.lockHeld || pending.pending !== 'ours') {
       throw new ProtocolError('COMMIT_OWNERSHIP_UNKNOWN');
     }
+    r.armObserved = true;
     // Running now contains the unconfirmed candidate. Operational show configuration | save is valid here.
     r.phase = 'backup-post';
     const post = `/var/tmp/${options.backupName}-post.conf`;
-    await bounded((s) => hooks.backup('post', post, s));
+    await bounded((s) => hooks.backup('post', post, s), backupMs);
     r.backupPost = post;
     r.phase = 'verify';
-    if (!await bounded((s) => hooks.verify(s))) {
+    if (!await bounded((s) => hooks.verify(s), verifyMs)) {
       throw new ProtocolError('VERIFY_FAILED');
     }
     r.phase = 'before-confirm';

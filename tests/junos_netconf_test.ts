@@ -571,3 +571,59 @@ Deno.test('official documentation fixtures parse with the strict profile (proven
     (await configDigest(parseXml(bytes(read(sources.configurationXnm.fixture))))).length === 64,
   );
 });
+
+Deno.test('armObserved is true only after the pending commit was read back as ours', async () => {
+  // Verification failure comes after the pending observation: armed.
+  const m = new Mock();
+  const o = options();
+  o.hooks.verify = () => Promise.resolve(false);
+  const failed = await change(m, o);
+  assertEquals([failed.state, failed.code, failed.armObserved], [
+    'rollback_pending',
+    'VERIFY_FAILED',
+    true,
+  ]);
+  // The commit was sent but the read-back did not prove it: unknown, never armed.
+  const n = new Mock();
+  const p = options();
+  p.hooks.observe = (_nc, phase) =>
+    Promise.resolve({
+      lockHeld: true,
+      pending: phase === 'pending' ? 'none' : phase === 'before-confirm' ? 'ours' : 'none',
+      baselineRestored: false,
+    });
+  const unseen = await change(n, p);
+  assertEquals([unseen.state, unseen.code, unseen.armObserved], [
+    'rollback_pending',
+    'COMMIT_OWNERSHIP_UNKNOWN',
+    false,
+  ]);
+  assert(!n.calls.includes('<commit/>'));
+});
+
+Deno.test('hook budgets: a slow verification needs its own budget, never beyond the commit deadline', async () => {
+  const slow = async () => {
+    await new Promise((r) => setTimeout(r, 150));
+    return true;
+  };
+  const tight = options({ requestTimeoutMs: 50 });
+  tight.hooks.verify = slow;
+  assertEquals((await change(new Mock(), tight)).code, 'TIMEOUT');
+  const budget = options({ requestTimeoutMs: 50, hookTimeoutMs: { verify: 2000 } });
+  budget.hooks.verify = slow;
+  assertEquals((await change(new Mock(), budget)).state, 'confirmed');
+  // The per-hook budget is still capped by the confirmed-commit deadline minus its margin.
+  let now = 0;
+  const capped = options({
+    requestTimeoutMs: 50,
+    hookTimeoutMs: { verify: 2000 },
+    now: () => now,
+  });
+  capped.hooks.verify = async () => {
+    now = 119000;
+    await new Promise((r) => setTimeout(r, 150));
+    return true;
+  };
+  const r = await change(new Mock(), capped);
+  assert(r.state === 'rollback_pending' && !(r.code === 'CONFIRMED'));
+});

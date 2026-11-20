@@ -861,6 +861,39 @@ Deno.test('ios change: lock retained through baseline, fresh verification, confi
   secretFree(result);
 });
 
+Deno.test('ios change: real vty forms (reload `on vty0 (address)`, IOS 15+ lock fields, flash:/ error) are owned', async () => {
+  const { result, device } = await run('ios', iosChange(), { realisticIos: true });
+  assertEquals(result.status, 'applied', JSON.stringify(result.error));
+  assertEquals(device.events, ['lock-acquired', 'reload-armed', 'reload-cancelled', 'saved']);
+  secretFree(result);
+});
+
+Deno.test('ios change: a cancelled request ends as a cancellation, not as a finished exec', async () => {
+  let session: Session | null = null;
+  const fake = await startCliDevice(generateHostKey(), {
+    kind: 'ios',
+    hang: /^show ip interface brief$/,
+  });
+  try {
+    const watcher = (async () => {
+      const until = Date.now() + 30000;
+      while (!fake.lines.includes('1:show ip interface brief') && Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      session!.close('controller_gone');
+    })();
+    const { api, result } = await runSession('ios', fake.port, iosChange(), 'n2', CLI_PASSWORD, {
+      started: (s) => session = s,
+    });
+    await watcher;
+    assertEquals(result.status, 'failed');
+    assertEquals(result.error?.code, 'EXEC_ABORTED');
+    assertEquals(api.finished?.reason, 'controller_gone');
+  } finally {
+    await fake.close();
+  }
+});
+
 Deno.test('ios change: unsupported lock, malformed proof, dirty baseline and backup collisions refuse before mutation', async () => {
   const cases: [Omit<CliDeviceOptions, 'kind'>, string][] = [
     [{ lockUnsupported: true }, 'LOCK_UNPROVEN'],
@@ -872,6 +905,7 @@ Deno.test('ios change: unsupported lock, malformed proof, dirty baseline and bac
     [{ reloadPending: true }, 'RELOAD_PENDING'],
     [{ failBackup: true }, 'BACKUP_FAILED'],
     [{ backupCollision: true }, 'BACKUP_FAILED'],
+    [{ unknownLockField: true }, 'LOCK_UNPROVEN'],
   ];
   for (const [options, code] of cases) {
     const { result, device } = await run('ios', iosChange(), options);
@@ -1111,6 +1145,22 @@ Deno.test('junos change: a lost confirming reply is unknown, never applied or ro
   assertMatch(result.error!.message, /unknown/);
   assertEquals(result.rollback.armed, false);
   assertEquals(device.netconf.filter((b) => b === '<commit/>').length, 1);
+  assert(!device.netconf.some((b) => FORBIDDEN_RPC.test(b)));
+});
+
+Deno.test('junos change: a verification slower than 10 s but within its budget still confirms', async () => {
+  const { result, device } = await run('junos', junosChange(), { slowVerifyMs: 11000 });
+  assertEquals(result.status, 'applied', JSON.stringify(result.error));
+  assertEquals(device.netconf.filter((b) => b === '<commit/>').length, 1);
+});
+
+Deno.test('junos change: a confirmed commit whose arm was never observed is not reported armed', async () => {
+  const { result, device } = await run('junos', junosChange(), { hidePending: true });
+  assertEquals(result.status, 'failed');
+  assertEquals(result.error?.code, 'JUNOS_COMMIT_STATE_UNKNOWN');
+  assertMatch(result.error!.message, /unknown/);
+  assertEquals(result.rollback.armed, false);
+  assert(!device.netconf.includes('<commit/>'));
   assert(!device.netconf.some((b) => FORBIDDEN_RPC.test(b)));
 });
 
